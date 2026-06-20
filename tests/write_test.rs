@@ -2005,3 +2005,43 @@ fn pnm_round_trip_gray8() {
     let readback = round_trip("test.pgm", &meta, &data);
     assert_eq!(readback, data);
 }
+
+#[test]
+fn pnm_writer_emits_raw_p5_p6_readable_by_pnm_reader() {
+    let mut gray_meta = ImageMetadata::default();
+    gray_meta.size_x = 2;
+    gray_meta.size_y = 1;
+    gray_meta.pixel_type = PixelType::Uint16;
+    gray_meta.size_c = 1;
+    gray_meta.image_count = 1;
+
+    let gray = [0x34, 0x12, 0xff, 0xff];
+    let gray_path = temp_path("raw_p5_uint16.pgm");
+    ImageWriter::save(&gray_path, &gray_meta, &[gray.to_vec()]).unwrap();
+    let gray_file = std::fs::read(&gray_path).unwrap();
+    assert!(gray_file.starts_with(b"P5\n2 1\n65535\n"));
+    let mut gray_reader = bioformats::formats::raster::pnm_reader();
+    gray_reader.set_id(&gray_path).unwrap();
+    assert_eq!(gray_reader.metadata().pixel_type, PixelType::Uint16);
+    assert_eq!(gray_reader.open_bytes(0).unwrap(), gray);
+
+    let mut rgb_meta = ImageMetadata::default();
+    rgb_meta.size_x = 2;
+    rgb_meta.size_y = 1;
+    rgb_meta.pixel_type = PixelType::Uint8;
+    rgb_meta.size_c = 3;
+    rgb_meta.is_rgb = true;
+    rgb_meta.is_interleaved = true;
+    rgb_meta.image_count = 1;
+
+    let rgb = [1, 2, 3, 4, 5, 6];
+    let rgb_path = temp_path("raw_p6_rgb.ppm");
+    ImageWriter::save(&rgb_path, &rgb_meta, &[rgb.to_vec()]).unwrap();
+    let rgb_file = std::fs::read(&rgb_path).unwrap();
+    assert!(rgb_file.starts_with(b"P6\n2 1\n255\n"));
+    let mut rgb_reader = bioformats::formats::raster::pnm_reader();
+    rgb_reader.set_id(&rgb_path).unwrap();
+    assert_eq!(rgb_reader.metadata().size_c, 3);
+    assert!(rgb_reader.metadata().is_rgb);
+    assert_eq!(rgb_reader.open_bytes(0).unwrap(), rgb);
+}

@@ -1354,14 +1354,20 @@ impl FormatReader for InveonReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
         // Inveon .hdr files can conflict with Analyze; Java keeps suffix
         // detection non-sufficient and checks for the header marker.
-        let ext = path
+        let hdr_path = if path
             .extension()
             .and_then(|e| e.to_str())
-            .map(|e| e.to_ascii_lowercase());
-        if !matches!(ext.as_deref(), Some("hdr")) {
-            return false;
-        }
-        std::fs::read_to_string(path)
+            .map(|e| e.eq_ignore_ascii_case("hdr"))
+            .unwrap_or(false)
+        {
+            path.to_path_buf()
+        } else {
+            let stem = path.file_stem().unwrap_or_default();
+            path.parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(format!("{}.hdr", stem.to_string_lossy()))
+        };
+        std::fs::read_to_string(hdr_path)
             .map(|s| s.contains(INVEON_HEADER_MARKER))
             .unwrap_or(false)
     }

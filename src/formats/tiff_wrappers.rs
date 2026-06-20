@@ -1048,12 +1048,24 @@ impl LeicaScnReader {
         let tags = xml_scan_tags(xml);
         let mut images: Vec<ScnImage> = Vec::new();
         let mut current: Option<ScnImage> = None;
+        let mut current_end: Option<usize> = None;
         for tag in &tags {
+            if let Some(end) = current_end {
+                if tag.start_offset > end {
+                    if let Some(img) = current.take() {
+                        images.push(img);
+                    }
+                    current_end = None;
+                }
+            }
             match tag.name.as_str() {
                 "image" => {
                     if let Some(img) = current.take() {
                         images.push(img);
                     }
+                    current_end = xml[tag.body_start..]
+                        .find("</image>")
+                        .map(|end| tag.body_start + end);
                     current = Some(ScnImage {
                         name: tag.attrs.get("name").cloned().unwrap_or_default(),
                         ..ScnImage::default()
@@ -1124,10 +1136,8 @@ impl LeicaScnReader {
                             ifd,
                             ..Default::default()
                         });
-                        // A supplemental image interrupts the current image.
-                        if let Some(cur) = current.take() {
-                            images.push(cur);
-                        }
+                        // Java's SAX handler adds supplemental images directly
+                        // to the image map without closing the active <image>.
                         images.push(img);
                     }
                 }
@@ -11616,6 +11626,46 @@ mod ndpi_offset64_tests {
         ));
         // Offset left untouched (low 32 bits only).
         assert_eq!(ifd.get(tag::STRIP_OFFSETS).unwrap().as_vec_u64(), vec![100]);
+    }
+}
+
+#[cfg(test)]
+mod leica_scn_tests {
+    use super::*;
+
+    #[test]
+    fn scn_supplemental_image_does_not_close_active_image() {
+        let xml = r#"
+<scn xmlns="http://www.leica-microsystems.com/scn/2010/10/01">
+  <collection name="c">
+    <image name="main">
+      <pixels>
+        <dimension r="0" z="0" c="0" sizeX="4" sizeY="3" ifd="0"/>
+        <dimension r="1" z="0" c="0" sizeX="2" sizeY="1" ifd="1"/>
+      </pixels>
+      <objective>20</objective>
+    </image>
+    <supplementalImage type="barcode" ifd="2"/>
+  </collection>
+</scn>"#;
+
+        let images = LeicaScnReader::parse_scn_xml(xml);
+
+        assert_eq!(images.len(), 2);
+        assert_eq!(images[0].name, "main");
+        assert_eq!(images[0].size_r, 2);
+        assert_eq!(
+            images[0].dims.iter().map(|d| d.ifd).collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert_eq!(images[0].obj_mag.as_deref(), Some("20"));
+
+        assert_eq!(images[1].name, "barcode");
+        assert_eq!(images[1].size_r, 1);
+        assert_eq!(
+            images[1].dims.iter().map(|d| d.ifd).collect::<Vec<_>>(),
+            vec![2]
+        );
     }
 }
 

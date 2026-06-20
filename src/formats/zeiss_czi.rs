@@ -2070,6 +2070,12 @@ impl FormatReader for ZeissCziReader {
         let bps = parse_component_bit_count(&parsed.meta_xml).unwrap_or(storage_bps);
         let is_rgb = parsed.spp >= 3;
         let czi_channels = build_czi_channels(&parsed.meta_xml);
+        // Java decode12BitCamera flips the core endian flag after unpacking
+        // camera-specific 12-bit payloads (compression 104/504).
+        let camera_packed_12bit = parsed
+            .entries
+            .iter()
+            .any(|entry| matches!(entry.compression, 104 | 504));
         let is_indexed = !is_rgb
             && czi_channels
                 .first()
@@ -2107,7 +2113,7 @@ impl FormatReader for ZeissCziReader {
             is_rgb,
             is_interleaved: is_rgb,
             is_indexed,
-            is_little_endian: true,
+            is_little_endian: !camera_packed_12bit,
             resolution_count: init_res_count as u32,
             thumbnail: false,
             series_metadata,
@@ -3167,6 +3173,20 @@ mod tests {
         reader.set_id(&path).unwrap();
 
         assert_eq!(reader.open_bytes(0).unwrap(), vec![0, 0]);
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn czi_camera_12bit_reports_big_endian_like_java() {
+        let entry = with_compression(directory_entry_dims(1, 0, 0, 0, 0, 1, 1, 0), 504);
+        let path =
+            write_synthetic_czi_entries("camera_12bit_endian", vec![(entry, vec![0x01, 0x20])]);
+        let mut reader = ZeissCziReader::new();
+        reader.set_id(&path).unwrap();
+
+        assert!(!reader.metadata().is_little_endian);
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![0x00, 0x12]);
 
         fs::remove_file(path).unwrap();
     }

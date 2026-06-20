@@ -1503,7 +1503,7 @@ impl FormatReader for MetamorphReader {
             .and_then(|e| e.to_str())
             .map(|e| {
                 let e = e.to_ascii_lowercase();
-                e == "stk" || e == "nd" || e == "scan"
+                e == "stk" || e == "nd" || e == "scan" || e == "tif" || e == "tiff"
             })
             .unwrap_or(false)
     }
@@ -2110,6 +2110,17 @@ mod tests {
             Some(MetadataValue::String(s)) => Some(s.as_str()),
             _ => None,
         }
+    }
+
+    #[test]
+    fn metamorph_name_detection_includes_java_tiff_suffixes() {
+        let reader = MetamorphReader::new();
+        assert!(reader.is_this_type_by_name(Path::new("classic.stk")));
+        assert!(reader.is_this_type_by_name(Path::new("classic.tif")));
+        assert!(reader.is_this_type_by_name(Path::new("classic.tiff")));
+        assert!(reader.is_this_type_by_name(Path::new("dataset.nd")));
+        assert!(reader.is_this_type_by_name(Path::new("dataset.scan")));
+        assert!(!reader.is_this_type_by_name(Path::new("plain.png")));
     }
 
     #[test]

@@ -876,13 +876,12 @@ impl FormatReader for SpiderReader {
         if header.len() < 52 {
             return false;
         }
-        // Spider header: check NSLICE (word 1) and NSAM (word 12) are non-zero float32s
-        // and IFORM (word 5) is a valid type code
+        // Java records IFORM as metadata but byte detection only requires
+        // plausible positive dimensions.
         let little_endian = (r_f32_le_w(header, 0) as i32) > 0;
-        let iform = r_f32_w(header, 16, little_endian) as i32;
         let nsam = r_f32_w(header, 44, little_endian);
         let nrow = r_f32_w(header, 4, little_endian);
-        matches!(iform, 1 | 3 | -1 | -3 | 11 | -11 | -21 | -22) && nsam > 0.0 && nrow > 0.0
+        nsam > 0.0 && nrow > 0.0
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {

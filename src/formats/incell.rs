@@ -120,6 +120,7 @@ struct InCellMeta {
     plate_map: Vec<Vec<bool>>,
     // exclude[row][col] = this well is explicitly excluded via <Exclude>
     exclude: Vec<Vec<bool>>,
+    has_exclude: bool,
     // imageFiles[well][field][t][index]
     image_files: Vec<Vec<Vec<Vec<Option<ImagePlane>>>>>,
     total_images: usize,
@@ -270,6 +271,7 @@ fn parse_incell_xml(path: &Path) -> Result<InCellMeta> {
                         // Java InCellReader.java:897-901: <Exclude row=… col=…>,
                         // attributes are 1-indexed (subtract 1) and mark a well
                         // to be dropped from the series list.
+                        m.has_exclude = true;
                         if m.exclude.is_empty() {
                             m.exclude = vec![vec![false; m.well_cols]; m.well_rows];
                         }
@@ -622,8 +624,34 @@ fn parse_incell_xml(path: &Path) -> Result<InCellMeta> {
     if m.total_images == 0 {
         synthesize_incell_image_files(&mut m, &dir);
     }
+    trim_empty_trailing_timepoints(&mut m);
 
     Ok(m)
+}
+
+fn trim_empty_trailing_timepoints(m: &mut InCellMeta) {
+    let Some(first_well) = m.image_files.first() else {
+        return;
+    };
+    let Some(first_field) = first_well.first() else {
+        return;
+    };
+
+    for t in (0..first_field.len()).rev() {
+        let all_null = m.image_files.iter().all(|well| {
+            well.iter().all(|field| {
+                field
+                    .get(t)
+                    .map(|timepoint| timepoint.iter().all(|plane| plane.is_none()))
+                    .unwrap_or(true)
+            })
+        });
+        if all_null && m.size_t > 0 {
+            // Java InCellReader.initFile decrements SizeT for each trailing
+            // timepoint where every well/field/plane slot is null.
+            m.size_t -= 1;
+        }
+    }
 }
 
 /// Allocate the imageFiles[well][field][t][channels*z] structure.
@@ -862,18 +890,52 @@ impl InCellReader {
         };
         let one_timepoint_per_series = channels_per_timepoint.windows(2).any(|w| w[0] != w[1]);
 
-        // Number of (well, field) combinations.
+        // Number of (well, field) combinations. Java primarily derives this
+        // from the number of <Image> entries, so sparse plate maps do not
+        // create extra blank series.
         let well_field_count = plate_wells.len() * field_count;
         // sizeT used for the channelsPerTimepoint index space. When timepoints
         // differ, Java indexes by channelsPerTimepoint.size(); otherwise sizeT.
         let cpt_len = channels_per_timepoint.len().max(1);
-        let series_count = if one_timepoint_per_series {
+        let mut series_count = if one_timepoint_per_series {
             // Java: seriesCount = (totalImages / imageCount) * sizeT, where the
             // (totalImages/imageCount) factor is the number of well/field combos.
             well_field_count * size_t as usize
         } else {
             well_field_count
         };
+        if m.total_images > 0 && (one_timepoint_per_series || !m.variable_z || !m.has_exclude) {
+            let expected = if one_timepoint_per_series {
+                let image_count: usize = channels_per_timepoint
+                    .iter()
+                    .map(|&c| c.max(1) as usize * size_z as usize)
+                    .sum();
+                if image_count > 0 {
+                    (m.total_images / image_count) * size_t as usize
+                } else {
+                    0
+                }
+            } else {
+                let image_count = (size_z as usize)
+                    .saturating_mul(size_c as usize)
+                    .saturating_mul(size_t as usize);
+                if image_count > 0 {
+                    m.total_images / image_count
+                } else {
+                    0
+                }
+            };
+            if expected > 0 {
+                series_count = series_count.min(expected);
+            }
+        }
+        let active_wells = if series_count == 0 {
+            0
+        } else {
+            let per_well = field_count * if one_timepoint_per_series { cpt_len } else { 1 };
+            series_count.div_ceil(per_well.max(1))
+        };
+        plate_wells.truncate(active_wells.max(1).min(plate_wells.len()));
 
         // Determine pixel parameters from the first available TIFF plane.
         let mut size_x = m.image_width;
@@ -1111,8 +1173,8 @@ impl FormatReader for InCellReader {
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
-        let snippet = std::str::from_utf8(&header[..header.len().min(512)]).unwrap_or("");
-        snippet.contains("<InCell") || snippet.contains("xdce")
+        let snippet = std::str::from_utf8(&header[..header.len().min(2048)]).unwrap_or("");
+        snippet.contains("IN Cell Analyzer") || snippet.contains("Cytell")
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
@@ -1607,6 +1669,116 @@ mod tests {
     }
 
     #[test]
+    fn incell_sparse_plate_map_does_not_create_extra_blank_series() {
+        let dir = temp_dir("sparse_plate_series");
+        std::fs::write(dir.join("plane.im"), []).unwrap();
+        let path = dir.join("plate.xdce");
+        std::fs::write(
+            &path,
+            r#"<InCell>
+                <Plate rows="1" columns="2"/>
+                <Size width="2" height="1"/>
+                <Wavelength fusion_wave="false" imaging_mode="2-D"/>
+                <PlateMap>
+                    <Row number="1"><Column number="1"/><Column number="2"/></Row>
+                </PlateMap>
+                <Image filename="plane.im">
+                    <Identifier field_index="0" z_index="0" wave_index="0" time_index="0"/>
+                </Image>
+            </InCell>"#,
+        )
+        .unwrap();
+
+        let meta = parse_incell_xml(&path).unwrap();
+        let mut reader = InCellReader::new();
+        reader.build(meta).unwrap();
+
+        assert_eq!(reader.series_count(), 1);
+        assert_eq!(reader.plate_wells, vec![(0, 0)]);
+    }
+
+    #[test]
+    fn incell_variable_z_keeps_java_series_count_despite_plane_count_cap() {
+        let mut meta = InCellMeta {
+            well_rows: 1,
+            well_cols: 2,
+            field_count: 1,
+            size_z: 2,
+            size_c: 2,
+            size_t: 1,
+            image_width: 1,
+            image_height: 1,
+            plate_map: vec![vec![true, true]],
+            image_files: vec![
+                vec![vec![vec![
+                    Some(ImagePlane::default()),
+                    None,
+                    Some(ImagePlane::default()),
+                    None,
+                ]]],
+                vec![vec![vec![
+                    Some(ImagePlane::default()),
+                    None,
+                    Some(ImagePlane::default()),
+                    None,
+                ]]],
+            ],
+            total_images: 4,
+            channels_per_timepoint: vec![2],
+            variable_z: true,
+            has_exclude: true,
+            ..Default::default()
+        };
+        meta.total_channels = meta.size_c;
+
+        let mut reader = InCellReader::new();
+        reader.build(meta).unwrap();
+
+        assert_eq!(reader.series_count(), 2);
+        assert_eq!(reader.plate_wells, vec![(0, 0), (0, 1)]);
+    }
+
+    #[test]
+    fn incell_variable_z_without_exclude_uses_java_image_count_series() {
+        let mut meta = InCellMeta {
+            well_rows: 1,
+            well_cols: 2,
+            field_count: 1,
+            size_z: 2,
+            size_c: 2,
+            size_t: 1,
+            image_width: 1,
+            image_height: 1,
+            plate_map: vec![vec![true, true]],
+            image_files: vec![
+                vec![vec![vec![
+                    Some(ImagePlane::default()),
+                    None,
+                    Some(ImagePlane::default()),
+                    None,
+                ]]],
+                vec![vec![vec![
+                    Some(ImagePlane::default()),
+                    None,
+                    Some(ImagePlane::default()),
+                    None,
+                ]]],
+            ],
+            total_images: 4,
+            channels_per_timepoint: vec![2],
+            variable_z: true,
+            ..Default::default()
+        };
+        meta.total_channels = meta.size_c;
+
+        let mut reader = InCellReader::new();
+        reader.build(meta).unwrap();
+
+        assert_eq!(reader.series_count(), 1);
+        assert_eq!(reader.plate_wells, vec![(0, 0)]);
+    }
+
+    #[test]
     fn incell_parses_acquisition_environment_and_detector_fields() {
         // Mirrors the Java InCellHandler element parsing for the newly captured
         // data fields: Creation date, ObjectiveCalibration (refractive index +
@@ -1692,6 +1864,9 @@ mod tests {
         // Java SAX calls both startElement and endElement for <TimePoint/>.
         // quick-xml reports Event::Empty, so the parser must still append a
         // channelsPerTimepoint entry for each self-closing timepoint.
+        let dir = temp_dir("empty_timepoints");
+        std::fs::write(dir.join("plane0.tif"), []).unwrap();
+        std::fs::write(dir.join("plane1.tif"), []).unwrap();
         let xml = r#"<InCell>
             <Plate rows="1" columns="1"/>
             <Wavelength fusion_wave="false" imaging_mode="2-D"/>
@@ -1700,16 +1875,68 @@ mod tests {
                 <TimePoint/>
                 <TimePoint/>
             </Times>
-            <Row number="1"><Column number="1"/></Row>
+            <PlateMap><Row number="1"><Column number="1"/></Row></PlateMap>
+            <Image filename="plane0.tif">
+                <Identifier field_index="0" z_index="0" wave_index="0" time_index="0"/>
+            </Image>
+            <Image filename="plane1.tif">
+                <Identifier field_index="0" z_index="0" wave_index="0" time_index="1"/>
+            </Image>
         </InCell>"#;
-        let m = {
-            let dir = temp_dir("empty_timepoints");
-            let path = dir.join("plate.xdce");
-            std::fs::write(&path, xml).unwrap();
-            parse_incell_xml(&path).unwrap()
-        };
+        let path = dir.join("plate.xdce");
+        std::fs::write(&path, xml).unwrap();
+        let m = parse_incell_xml(&path).unwrap();
 
         assert_eq!(m.size_t, 2);
         assert_eq!(m.channels_per_timepoint, vec![2, 2]);
+    }
+
+    #[test]
+    fn incell_trims_trailing_empty_timepoints_like_java() {
+        let dir = temp_dir("trim_timepoints");
+        let image = dir.join("plane.tif");
+        std::fs::write(&image, []).unwrap();
+        let path = dir.join("plate.xdce");
+        std::fs::write(
+            &path,
+            r#"<InCell>
+                <Plate rows="1" columns="1"/>
+                <Wavelength fusion_wave="false" imaging_mode="2-D"/>
+                <Times>
+                    <TimePoint><AcqWave/></TimePoint>
+                    <TimePoint><AcqWave/></TimePoint>
+                </Times>
+                <PlateMap><Row number="1"><Column number="1"/></Row></PlateMap>
+                <Image filename="plane.tif">
+                    <Identifier field_index="0" z_index="0" wave_index="0" time_index="0"/>
+                </Image>
+            </InCell>"#,
+        )
+        .unwrap();
+
+        let m = parse_incell_xml(&path).unwrap();
+
+        assert_eq!(m.size_t, 1);
+        assert_eq!(m.channels_per_timepoint, vec![1, 1]);
+    }
+
+    #[test]
+    fn incell_byte_detection_matches_java_magic_window() {
+        let reader = InCellReader::new();
+
+        let mut header = vec![b' '; 700];
+        header.extend_from_slice(b"IN Cell Analyzer");
+        assert!(reader.is_this_type_by_bytes(&header));
+
+        let mut cytell = vec![b' '; 1800];
+        cytell.extend_from_slice(b"Cytell");
+        assert!(reader.is_this_type_by_bytes(&cytell));
+
+        let mut too_late = vec![b' '; 2048];
+        too_late.extend_from_slice(b"IN Cell Analyzer");
+        assert!(!reader.is_this_type_by_bytes(&too_late));
+
+        assert!(!reader.is_this_type_by_bytes(b"<InCell Width=\"2\" Height=\"2\"/>"));
+        assert!(!reader.is_this_type_by_bytes(b"xdce"));
     }
 }

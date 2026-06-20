@@ -5848,6 +5848,7 @@ fn inveon_uses_java_header_marker_file_name_pointer_and_time_frames() {
 
     let reader_probe = bioformats::formats::clinical::InveonReader::new();
     assert!(reader_probe.is_this_type_by_name(&hdr));
+    assert!(reader_probe.is_this_type_by_name(&dir.join("scan")));
     assert!(reader_probe
         .is_this_type_by_bytes(b"Header file for data file\nx_dimension 2\ny_dimension 1\n"));
     let analyze_like = dir.join("analyze_like.hdr");
@@ -6504,6 +6505,276 @@ fn zip_primary_entry_strips_mixed_case_zip_suffix() {
 }
 
 #[test]
+fn zip_primary_entry_uses_local_header_order_like_java_stream() {
+    fn push_u16(out: &mut Vec<u8>, value: u16) {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+    fn push_u32(out: &mut Vec<u8>, value: u32) {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+    fn crc32(bytes: &[u8]) -> u32 {
+        let mut crc = flate2::Crc::new();
+        crc.update(bytes);
+        crc.sum()
+    }
+    fn local_file(out: &mut Vec<u8>, name: &str, data: &[u8]) -> u32 {
+        let offset = out.len() as u32;
+        push_u32(out, 0x0403_4b50);
+        push_u16(out, 20);
+        push_u16(out, 0);
+        push_u16(out, 0);
+        push_u16(out, 0);
+        push_u16(out, 0);
+        push_u32(out, crc32(data));
+        push_u32(out, data.len() as u32);
+        push_u32(out, data.len() as u32);
+        push_u16(out, name.len() as u16);
+        push_u16(out, 0);
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(data);
+        offset
+    }
+    fn central_file(out: &mut Vec<u8>, name: &str, data: &[u8], local_offset: u32) {
+        push_u32(out, 0x0201_4b50);
+        push_u16(out, 20);
+        push_u16(out, 20);
+        push_u16(out, 0);
+        push_u16(out, 0);
+        push_u16(out, 0);
+        push_u16(out, 0);
+        push_u32(out, crc32(data));
+        push_u32(out, data.len() as u32);
+        push_u32(out, data.len() as u32);
+        push_u16(out, name.len() as u16);
+        push_u16(out, 0);
+        push_u16(out, 0);
+        push_u16(out, 0);
+        push_u16(out, 0);
+        push_u32(out, 0);
+        push_u32(out, local_offset);
+        out.extend_from_slice(name.as_bytes());
+    }
+
+    let dir = isolated_tmp_dir("zip_local_header_order");
+    let mut meta = ImageMetadata::default();
+    meta.size_x = 1;
+    meta.size_y = 1;
+    meta.pixel_type = PixelType::Uint8;
+    meta.image_count = 1;
+
+    let local_first_tiff = dir.join("local_first.tif");
+    ImageWriter::save(&local_first_tiff, &meta, &[vec![13]]).unwrap();
+    let local_first_bytes = std::fs::read(&local_first_tiff).unwrap();
+
+    let central_first_tiff = dir.join("central_first.tif");
+    ImageWriter::save(&central_first_tiff, &meta, &[vec![24]]).unwrap();
+    let central_first_bytes = std::fs::read(&central_first_tiff).unwrap();
+
+    let mut zip_bytes = Vec::new();
+    let local_first_offset = local_file(&mut zip_bytes, "other.tif", &local_first_bytes);
+    let central_first_offset = local_file(&mut zip_bytes, "sample.tif", &central_first_bytes);
+    let central_start = zip_bytes.len() as u32;
+    central_file(
+        &mut zip_bytes,
+        "sample.tif",
+        &central_first_bytes,
+        central_first_offset,
+    );
+    central_file(
+        &mut zip_bytes,
+        "other.tif",
+        &local_first_bytes,
+        local_first_offset,
+    );
+    let central_size = zip_bytes.len() as u32 - central_start;
+    push_u32(&mut zip_bytes, 0x0605_4b50);
+    push_u16(&mut zip_bytes, 0);
+    push_u16(&mut zip_bytes, 0);
+    push_u16(&mut zip_bytes, 2);
+    push_u16(&mut zip_bytes, 2);
+    push_u32(&mut zip_bytes, central_size);
+    push_u32(&mut zip_bytes, central_start);
+    push_u16(&mut zip_bytes, 0);
+
+    let zip_path = dir.join("bundle.zip");
+    std::fs::write(&zip_path, zip_bytes).unwrap();
+
+    let mut reader = ImageReader::open(&zip_path).unwrap();
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![13]);
+}
+
+#[test]
+fn zip_reads_local_header_stream_without_central_directory_like_java() {
+    fn push_u16(out: &mut Vec<u8>, value: u16) {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+    fn push_u32(out: &mut Vec<u8>, value: u32) {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+    fn crc32(bytes: &[u8]) -> u32 {
+        let mut crc = flate2::Crc::new();
+        crc.update(bytes);
+        crc.sum()
+    }
+    fn local_file(out: &mut Vec<u8>, name: &str, data: &[u8]) {
+        push_u32(out, 0x0403_4b50);
+        push_u16(out, 20);
+        push_u16(out, 0);
+        push_u16(out, 0);
+        push_u16(out, 0);
+        push_u16(out, 0);
+        push_u32(out, crc32(data));
+        push_u32(out, data.len() as u32);
+        push_u32(out, data.len() as u32);
+        push_u16(out, name.len() as u16);
+        push_u16(out, 0);
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(data);
+    }
+
+    let dir = isolated_tmp_dir("zip_local_header_only");
+    let mut meta = ImageMetadata::default();
+    meta.size_x = 1;
+    meta.size_y = 1;
+    meta.pixel_type = PixelType::Uint8;
+    meta.image_count = 1;
+
+    let tiff_src = dir.join("frame.tif");
+    ImageWriter::save(&tiff_src, &meta, &[vec![42]]).unwrap();
+    let tiff_bytes = std::fs::read(&tiff_src).unwrap();
+
+    let mut zip_bytes = Vec::new();
+    local_file(&mut zip_bytes, "frame.tif", &tiff_bytes);
+
+    let zip_path = dir.join("stream.zip");
+    std::fs::write(&zip_path, zip_bytes).unwrap();
+
+    let mut reader = ImageReader::open(&zip_path).unwrap();
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![42]);
+}
+
+#[test]
+fn zip_accepts_absolute_archive_entry_names_like_java_mapping() {
+    use std::io::Write;
+
+    let dir = isolated_tmp_dir("zip_absolute_entry");
+    let mut meta = ImageMetadata::default();
+    meta.size_x = 1;
+    meta.size_y = 1;
+    meta.pixel_type = PixelType::Uint8;
+    meta.image_count = 1;
+
+    let tiff_src = dir.join("frame.tif");
+    ImageWriter::save(&tiff_src, &meta, &[vec![55]]).unwrap();
+    let tiff_bytes = std::fs::read(&tiff_src).unwrap();
+
+    let zip_path = dir.join("absolute.zip");
+    let file = std::fs::File::create(&zip_path).unwrap();
+    let mut zip = zip::ZipWriter::new(file);
+    zip.start_file("/frame.tif", zip::write::SimpleFileOptions::default())
+        .unwrap();
+    zip.write_all(&tiff_bytes).unwrap();
+    zip.finish().unwrap();
+
+    let mut reader = ImageReader::open(&zip_path).unwrap();
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![55]);
+}
+
+#[test]
+fn zip_accepts_parent_directory_archive_entry_names_like_java_mapping() {
+    use std::io::Write;
+
+    let dir = isolated_tmp_dir("zip_parent_entry");
+    let mut meta = ImageMetadata::default();
+    meta.size_x = 1;
+    meta.size_y = 1;
+    meta.pixel_type = PixelType::Uint8;
+    meta.image_count = 1;
+
+    let tiff_src = dir.join("frame.tif");
+    ImageWriter::save(&tiff_src, &meta, &[vec![56]]).unwrap();
+    let tiff_bytes = std::fs::read(&tiff_src).unwrap();
+
+    let zip_path = dir.join("parent.zip");
+    let file = std::fs::File::create(&zip_path).unwrap();
+    let mut zip = zip::ZipWriter::new(file);
+    zip.start_file("../frame.tif", zip::write::SimpleFileOptions::default())
+        .unwrap();
+    zip.write_all(&tiff_bytes).unwrap();
+    zip.finish().unwrap();
+
+    let mut reader = ImageReader::open(&zip_path).unwrap();
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![56]);
+}
+
+#[test]
+fn zip_sanitized_entry_path_collisions_keep_java_exact_name_mapping() {
+    use std::io::Write;
+
+    let dir = isolated_tmp_dir("zip_sanitized_collision");
+    let mut meta = ImageMetadata::default();
+    meta.size_x = 1;
+    meta.size_y = 1;
+    meta.pixel_type = PixelType::Uint8;
+    meta.image_count = 1;
+
+    let first_tiff = dir.join("first.tif");
+    ImageWriter::save(&first_tiff, &meta, &[vec![12]]).unwrap();
+    let first_bytes = std::fs::read(&first_tiff).unwrap();
+
+    let second_tiff = dir.join("second.tif");
+    ImageWriter::save(&second_tiff, &meta, &[vec![34]]).unwrap();
+    let second_bytes = std::fs::read(&second_tiff).unwrap();
+
+    let zip_path = dir.join("bundle.zip");
+    let file = std::fs::File::create(&zip_path).unwrap();
+    let mut zip = zip::ZipWriter::new(file);
+    let options = zip::write::SimpleFileOptions::default();
+    zip.start_file("../frame.tif", options).unwrap();
+    zip.write_all(&first_bytes).unwrap();
+    zip.start_file("frame.tif", options).unwrap();
+    zip.write_all(&second_bytes).unwrap();
+    zip.finish().unwrap();
+
+    let mut reader = ImageReader::open(&zip_path).unwrap();
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![12]);
+}
+
+#[test]
+fn zip_matching_directory_primary_is_rejected_like_java() {
+    use std::io::Write;
+
+    let dir = isolated_tmp_dir("zip_primary_directory");
+    let mut meta = ImageMetadata::default();
+    meta.size_x = 1;
+    meta.size_y = 1;
+    meta.pixel_type = PixelType::Uint8;
+    meta.image_count = 1;
+
+    let tiff_src = dir.join("source.tif");
+    ImageWriter::save(&tiff_src, &meta, &[vec![77]]).unwrap();
+    let tiff_bytes = std::fs::read(&tiff_src).unwrap();
+
+    let zip_path = dir.join("sample.zip");
+    let file = std::fs::File::create(&zip_path).unwrap();
+    let mut zip = zip::ZipWriter::new(file);
+    let options = zip::write::SimpleFileOptions::default();
+    zip.add_directory("sample/", options).unwrap();
+    zip.start_file("sample.tif", options).unwrap();
+    zip.write_all(&tiff_bytes).unwrap();
+    zip.finish().unwrap();
+
+    let err = match ImageReader::open(&zip_path) {
+        Ok(_) => panic!("ZIP with Java-selected directory primary should be rejected"),
+        Err(err) => err,
+    };
+    assert!(
+        matches!(err, BioFormatsError::UnsupportedFormat(_)),
+        "{err:?}"
+    );
+}
+
+#[test]
 fn zip_rejects_when_java_primary_entry_is_not_recognized() {
     use std::io::Write;
 
@@ -6669,6 +6940,21 @@ fn unisoku_dat_entrypoint_uses_companion_hdr() {
     let mut reader = ImageReader::open(&dat).unwrap();
     assert_eq!(reader.metadata().pixel_type, PixelType::Uint8);
     assert_eq!(reader.open_bytes(0).unwrap(), vec![7, 8]);
+}
+
+#[test]
+fn unisoku_name_detection_requires_java_magic() {
+    let dir = isolated_tmp_dir("unisoku_detection_magic");
+    let hdr = dir.join("bad.HDR");
+    let dat = dir.join("bad.DAT");
+    std::fs::write(&hdr, b"XSIZE=1\nYSIZE=1\nBIT=16\n").unwrap();
+    std::fs::write(&dat, [1, 0]).unwrap();
+
+    let reader = bioformats::formats::afm::UnisokuReader::new();
+    assert!(!reader.is_this_type_by_name(&hdr));
+    assert!(!reader.is_this_type_by_name(&dat));
+
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]
@@ -8927,7 +9213,7 @@ fn ics_writer_counts_channel_axis_in_layout_parameters() {
         .unwrap_or_else(|_| String::from_utf8_lossy(&std::fs::read(&path).unwrap()).to_string());
 
     assert!(contents.contains("layout\tparameters\t4"));
-    assert!(contents.contains("layout\torder\tbits x y ch"));
+    assert!(contents.contains("layout\torder\tbits ch x y"));
 }
 
 #[test]
@@ -9497,6 +9783,49 @@ byte skip: 20
 
     let mut reader = ImageReader::open(&path).unwrap();
     assert_eq!(reader.open_bytes(0).unwrap(), vec![5, 6]);
+}
+
+#[test]
+fn nrrd_inline_raw_ignores_line_skip_like_java() {
+    let path = tmp("inline_raw_line_skip.nrrd");
+    let mut bytes = b"NRRD0004
+type: uint8
+dimension: 2
+sizes: 2 1
+kinds: domain domain
+encoding: raw
+line skip: 1
+
+"
+    .to_vec();
+    bytes.extend_from_slice(&[9, b'\n', 5, 6]);
+    std::fs::write(&path, bytes).unwrap();
+
+    let mut reader = ImageReader::open(&path).unwrap();
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![9, b'\n']);
+}
+
+#[test]
+fn nrrd_space_directions_populate_ome_physical_sizes_like_java() {
+    let path = tmp("space_directions_physical_sizes.nrrd");
+    let mut bytes = b"NRRD0004
+type: uint8
+dimension: 3
+sizes: 17 2 2
+space directions: (0.5,0,0) (0,0.75,0) (0,0,1.25)
+encoding: raw
+
+"
+    .to_vec();
+    bytes.extend(0..68u8);
+    std::fs::write(&path, bytes).unwrap();
+
+    let reader = ImageReader::open(&path).unwrap();
+    let ome = reader.ome_metadata().unwrap();
+    let image = &ome.images[0];
+    assert_eq!(image.physical_size_x, Some(0.5));
+    assert_eq!(image.physical_size_y, Some(0.75));
+    assert_eq!(image.physical_size_z, Some(1.25));
 }
 
 // ---- MetaImage (MHA) -------------------------------------------------------
@@ -12236,7 +12565,7 @@ fn dicom_monochrome1_pixels_are_inverted() {
 }
 
 #[test]
-fn dicom_planar_rgb_pixels_are_returned_interleaved() {
+fn dicom_planar_rgb_pixels_remain_non_interleaved_like_java() {
     let path = tmp("planar_rgb.dcm");
     let mut bytes = Vec::new();
 
@@ -12254,8 +12583,12 @@ fn dicom_planar_rgb_pixels_are_returned_interleaved() {
     let mut reader = ImageReader::open(&path).unwrap();
 
     assert!(reader.metadata().is_rgb);
-    assert!(reader.metadata().is_interleaved);
-    assert_eq!(reader.open_bytes(0).unwrap(), vec![10, 30, 50, 20, 40, 60]);
+    assert!(!reader.metadata().is_interleaved);
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![10, 20, 30, 40, 50, 60]);
+    assert_eq!(
+        reader.open_bytes_region(0, 1, 0, 1, 1).unwrap(),
+        vec![20, 40, 60]
+    );
 }
 
 #[test]
@@ -14357,6 +14690,58 @@ fn generic_raster_reader_detection_matches_image_crate_formats() {
 }
 
 #[test]
+fn pnm_plain_pbm_preserves_java_numeric_samples() {
+    let path = tmp("java_numeric_samples.pbm");
+    std::fs::write(&path, b"P1\n# comment\n4 1\n0 1 1 0\n").unwrap();
+
+    let mut reader = bioformats::formats::raster::pnm_reader();
+    reader.set_id(&path).unwrap();
+    let meta = reader.metadata();
+    assert_eq!(meta.size_x, 4);
+    assert_eq!(meta.size_y, 1);
+    assert_eq!(meta.size_c, 1);
+    assert_eq!(meta.pixel_type, PixelType::Uint8);
+    assert!(!meta.is_rgb);
+    assert!(matches!(
+        meta.series_metadata.get("Black and white"),
+        Some(MetadataValue::Bool(true))
+    ));
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![0, 1, 1, 0]);
+    assert_eq!(reader.open_bytes_region(0, 1, 0, 2, 1).unwrap(), vec![1, 1]);
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn pnm_raw_ppm_and_plain_uint16_match_java_pgmreader_metadata() {
+    let ppm = tmp("java_raw_rgb.ppm");
+    std::fs::write(&ppm, b"P6\n2 1\n255\n\x01\x02\x03\x04\x05\x06").unwrap();
+
+    let mut reader = bioformats::formats::raster::pnm_reader();
+    reader.set_id(&ppm).unwrap();
+    let meta = reader.metadata();
+    assert_eq!(meta.size_x, 2);
+    assert_eq!(meta.size_y, 1);
+    assert_eq!(meta.size_c, 3);
+    assert_eq!(meta.pixel_type, PixelType::Uint8);
+    assert!(meta.is_rgb);
+    assert!(meta.is_interleaved);
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 3, 4, 5, 6]);
+
+    let pgm = tmp("java_plain_u16.pgm");
+    std::fs::write(&pgm, b"P2\n2 1\n65535\n4660 65535\n").unwrap();
+    reader.set_id(&pgm).unwrap();
+    let meta = reader.metadata();
+    assert_eq!(meta.size_c, 1);
+    assert_eq!(meta.pixel_type, PixelType::Uint16);
+    assert_eq!(meta.bits_per_pixel, 16);
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![0x34, 0x12, 0xff, 0xff]);
+
+    let _ = std::fs::remove_file(ppm);
+    let _ = std::fs::remove_file(pgm);
+}
+
+#[test]
 fn jpeg_reader_accepts_java_jpe_suffix() {
     let reader = bioformats::formats::jpeg::JpegReader::new();
     assert!(reader.is_this_type_by_name(Path::new("sample.jpe")));
@@ -14851,6 +15236,63 @@ fn write_two_frame_interlaced_apng(path: &Path) {
     std::fs::write(path, bytes).unwrap();
 }
 
+fn write_indexed_apng(path: &Path) {
+    use std::io::Write;
+
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+
+    let mut ihdr = Vec::new();
+    ihdr.extend_from_slice(&2u32.to_be_bytes());
+    ihdr.extend_from_slice(&1u32.to_be_bytes());
+    ihdr.extend_from_slice(&[8, 3, 0, 0, 0]);
+    png_chunk(&mut bytes, b"IHDR", &ihdr);
+    png_chunk(&mut bytes, b"PLTE", &[255, 0, 0, 0, 255, 0, 0, 0, 255]);
+
+    let mut actl = Vec::new();
+    actl.extend_from_slice(&2u32.to_be_bytes());
+    actl.extend_from_slice(&0u32.to_be_bytes());
+    png_chunk(&mut bytes, b"acTL", &actl);
+
+    let mut fctl0 = Vec::new();
+    fctl0.extend_from_slice(&0u32.to_be_bytes());
+    fctl0.extend_from_slice(&2u32.to_be_bytes());
+    fctl0.extend_from_slice(&1u32.to_be_bytes());
+    fctl0.extend_from_slice(&0u32.to_be_bytes());
+    fctl0.extend_from_slice(&0u32.to_be_bytes());
+    fctl0.extend_from_slice(&1u16.to_be_bytes());
+    fctl0.extend_from_slice(&0u16.to_be_bytes());
+    fctl0.push(0);
+    fctl0.push(0);
+    png_chunk(&mut bytes, b"fcTL", &fctl0);
+
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+    encoder.write_all(&[0, 1, 0]).unwrap();
+    png_chunk(&mut bytes, b"IDAT", &encoder.finish().unwrap());
+
+    let mut fctl1 = Vec::new();
+    fctl1.extend_from_slice(&1u32.to_be_bytes());
+    fctl1.extend_from_slice(&1u32.to_be_bytes());
+    fctl1.extend_from_slice(&1u32.to_be_bytes());
+    fctl1.extend_from_slice(&1u32.to_be_bytes());
+    fctl1.extend_from_slice(&0u32.to_be_bytes());
+    fctl1.extend_from_slice(&1u16.to_be_bytes());
+    fctl1.extend_from_slice(&0u16.to_be_bytes());
+    fctl1.push(0);
+    fctl1.push(0);
+    png_chunk(&mut bytes, b"fcTL", &fctl1);
+
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+    encoder.write_all(&[0, 2]).unwrap();
+    let mut fdat = Vec::new();
+    fdat.extend_from_slice(&2u32.to_be_bytes());
+    fdat.extend_from_slice(&encoder.finish().unwrap());
+    png_chunk(&mut bytes, b"fdAT", &fdat);
+
+    png_chunk(&mut bytes, b"IEND", &[]);
+    std::fs::write(path, bytes).unwrap();
+}
+
 fn write_gray16_apng(path: &Path) {
     fn crc(type_: &[u8], data: &[u8]) -> u32 {
         let mut c = flate2::Crc::new();
@@ -14896,6 +15338,90 @@ fn write_gray16_apng(path: &Path) {
     encoder.write_all(&[0, 0x12, 0x34]).unwrap();
     chunk(&mut bytes, b"IDAT", &encoder.finish().unwrap());
     chunk(&mut bytes, b"IEND", &[]);
+    std::fs::write(path, bytes).unwrap();
+}
+
+fn write_gray_alpha16_apng(path: &Path) {
+    fn crc(type_: &[u8], data: &[u8]) -> u32 {
+        let mut c = flate2::Crc::new();
+        c.update(type_);
+        c.update(data);
+        c.sum()
+    }
+    fn chunk(out: &mut Vec<u8>, type_: &[u8; 4], data: &[u8]) {
+        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        out.extend_from_slice(type_);
+        out.extend_from_slice(data);
+        out.extend_from_slice(&crc(type_, data).to_be_bytes());
+    }
+
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+
+    let mut ihdr = Vec::new();
+    ihdr.extend_from_slice(&1u32.to_be_bytes());
+    ihdr.extend_from_slice(&1u32.to_be_bytes());
+    ihdr.extend_from_slice(&[16, 4, 0, 0, 0]);
+    chunk(&mut bytes, b"IHDR", &ihdr);
+
+    let mut actl = Vec::new();
+    actl.extend_from_slice(&1u32.to_be_bytes());
+    actl.extend_from_slice(&0u32.to_be_bytes());
+    chunk(&mut bytes, b"acTL", &actl);
+
+    let mut fctl = Vec::new();
+    fctl.extend_from_slice(&0u32.to_be_bytes());
+    fctl.extend_from_slice(&1u32.to_be_bytes());
+    fctl.extend_from_slice(&1u32.to_be_bytes());
+    fctl.extend_from_slice(&0u32.to_be_bytes());
+    fctl.extend_from_slice(&0u32.to_be_bytes());
+    fctl.extend_from_slice(&1u16.to_be_bytes());
+    fctl.extend_from_slice(&0u16.to_be_bytes());
+    fctl.push(0);
+    fctl.push(0);
+    chunk(&mut bytes, b"fcTL", &fctl);
+
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    use std::io::Write;
+    encoder.write_all(&[0, 0x12, 0x34, 0xab, 0xcd]).unwrap();
+    chunk(&mut bytes, b"IDAT", &encoder.finish().unwrap());
+    chunk(&mut bytes, b"IEND", &[]);
+    std::fs::write(path, bytes).unwrap();
+}
+
+fn write_unsupported_compression_apng(path: &Path) {
+    use std::io::Write;
+
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+
+    let mut ihdr = Vec::new();
+    ihdr.extend_from_slice(&1u32.to_be_bytes());
+    ihdr.extend_from_slice(&1u32.to_be_bytes());
+    ihdr.extend_from_slice(&[8, 0, 1, 0, 0]);
+    png_chunk(&mut bytes, b"IHDR", &ihdr);
+
+    let mut actl = Vec::new();
+    actl.extend_from_slice(&1u32.to_be_bytes());
+    actl.extend_from_slice(&0u32.to_be_bytes());
+    png_chunk(&mut bytes, b"acTL", &actl);
+
+    let mut fctl = Vec::new();
+    fctl.extend_from_slice(&0u32.to_be_bytes());
+    fctl.extend_from_slice(&1u32.to_be_bytes());
+    fctl.extend_from_slice(&1u32.to_be_bytes());
+    fctl.extend_from_slice(&0u32.to_be_bytes());
+    fctl.extend_from_slice(&0u32.to_be_bytes());
+    fctl.extend_from_slice(&1u16.to_be_bytes());
+    fctl.extend_from_slice(&0u16.to_be_bytes());
+    fctl.push(0);
+    fctl.push(0);
+    png_chunk(&mut bytes, b"fcTL", &fctl);
+
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(&[0, 7]).unwrap();
+    png_chunk(&mut bytes, b"IDAT", &encoder.finish().unwrap());
+    png_chunk(&mut bytes, b"IEND", &[]);
     std::fs::write(path, bytes).unwrap();
 }
 
@@ -14976,6 +15502,33 @@ fn animated_gif_reads_all_frames_as_image_stack() {
 }
 
 #[test]
+fn gif_transparent_frame_inherits_previous_plane_like_java() {
+    let path = tmp("transparent_frame.gif");
+    std::fs::write(
+        &path,
+        [
+            b"GIF89a".as_slice(),
+            // Logical screen: 1x1, global table with two colours.
+            b"\x01\x00\x01\x00\x80\x00\x00",
+            b"\x00\x00\x00\xff\x00\x00",
+            // Frame 0: index 1 (red).
+            b",\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02L\x01\x00",
+            // Frame 1: transparent index 0, then index 0 pixel.
+            b"!\xf9\x04\x01\x00\x00\x00\x00",
+            b",\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;",
+        ]
+        .concat(),
+    )
+    .unwrap();
+
+    let mut reader = bioformats::formats::raster::GifReader::new();
+    reader.set_id(&path).unwrap();
+    assert_eq!(reader.metadata().image_count, 2);
+    assert_eq!(reader.open_bytes(1).unwrap(), vec![1]);
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![1]);
+}
+
+#[test]
 fn animated_png_reads_all_frames_as_image_stack() {
     // The APNGReader port reads every APNG frame as a separate timepoint
     // (sizeT == numFrames), compositing each frame onto the default image.
@@ -15019,6 +15572,65 @@ fn apng_reader_preserves_uint16_big_endian_bytes_like_java() {
     assert_eq!(meta.pixel_type, PixelType::Uint16);
     assert!(!meta.is_little_endian);
     assert_eq!(reader.open_bytes(0).unwrap(), vec![0x12, 0x34]);
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn apng_reader_preserves_gray_alpha_uint16_big_endian_bytes_like_java() {
+    let path = tmp("gray_alpha16.apng");
+    write_gray_alpha16_apng(&path);
+
+    let mut reader = bioformats::formats::extended::ApngReader::new();
+    reader.set_id(&path).unwrap();
+    let meta = reader.metadata();
+    assert_eq!(meta.size_c, 2);
+    assert_eq!(meta.pixel_type, PixelType::Uint16);
+    assert!(!meta.is_little_endian);
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![0x12, 0x34, 0xab, 0xcd]);
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn apng_reader_keeps_indexed_samples_and_lookup_table_like_java() {
+    let path = tmp("indexed.apng");
+    write_indexed_apng(&path);
+
+    let mut reader = bioformats::formats::extended::ApngReader::new();
+    reader.set_id(&path).unwrap();
+    let meta = reader.metadata();
+    assert_eq!(meta.size_x, 2);
+    assert_eq!(meta.size_y, 1);
+    assert_eq!(meta.size_c, 1);
+    assert_eq!(meta.bits_per_pixel, 8);
+    assert!(meta.is_indexed);
+    assert!(!meta.is_rgb);
+    assert!(!meta.is_interleaved);
+
+    let lut = reader.lookup_table(0).unwrap().unwrap();
+    assert_eq!(lut.red[0], 255);
+    assert_eq!(lut.green[1], 255);
+    assert_eq!(lut.blue[2], 255);
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 0]);
+    assert_eq!(reader.open_bytes(1).unwrap(), vec![1, 2]);
+    assert_eq!(reader.open_bytes_region(1, 1, 0, 1, 1).unwrap(), vec![2]);
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn apng_reader_rejects_nonzero_compression_like_java() {
+    let path = tmp("bad_compression.apng");
+    write_unsupported_compression_apng(&path);
+
+    let mut reader = bioformats::formats::extended::ApngReader::new();
+    reader.set_id(&path).unwrap();
+    let err = reader.open_bytes(0).unwrap_err();
+    assert!(
+        err.to_string().contains("Compression type 1 not supported"),
+        "unexpected APNG compression error: {err}"
+    );
 
     let _ = std::fs::remove_file(path);
 }
@@ -15256,6 +15868,8 @@ fn spider_rejects_invalid_dimensions_short_payload_and_accepts_unknown_iform_lik
         0.0,
         &[0; 4],
     );
+    let unknown_header = std::fs::read(&unknown_iform).unwrap();
+    assert!(reader.is_this_type_by_bytes(&unknown_header[..52]));
     reader.set_id(&unknown_iform).unwrap();
     assert_eq!(reader.metadata().image_count, 1);
     assert_eq!(reader.open_bytes(0).unwrap(), vec![0; 4]);
@@ -15969,7 +16583,7 @@ fn quicktime_decodes_png_samples() {
 }
 
 #[test]
-fn quicktime_decodes_rpza_samples() {
+fn quicktime_rpza_preserves_java_zero_buffer_behavior() {
     let path = tmp("rpza_codec.mov");
     let rpza = [
         0xe1, 0x00, 0x00, 0x07, // chunk marker and length
@@ -15986,10 +16600,10 @@ fn quicktime_decodes_rpza_samples() {
         reader.metadata().series_metadata.get("quicktime.codec"),
         Some(MetadataValue::String(codec)) if codec == "rpza"
     ));
-    assert_eq!(reader.open_bytes(0).unwrap(), vec![255, 0, 0].repeat(16));
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![0; 4 * 4 * 3]);
     assert_eq!(
         reader.open_bytes_region(0, 1, 1, 2, 2).unwrap(),
-        vec![255, 0, 0].repeat(4)
+        vec![0; 2 * 2 * 3]
     );
     let _ = std::fs::remove_file(path);
 }
@@ -16355,6 +16969,7 @@ fn tga_round_trip() {
     meta.pixel_type = PixelType::Uint8;
     meta.size_c = 3;
     meta.is_rgb = true;
+    meta.is_interleaved = true;
     meta.image_count = 1;
 
     let data: Vec<u8> = (0u8..192).collect(); // 8*8*3

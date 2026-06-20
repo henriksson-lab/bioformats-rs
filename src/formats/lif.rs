@@ -1402,6 +1402,22 @@ fn select_lif_memory_blocks(
     ordered_ids: &[String],
     raw_blocks: &[MemoryBlock],
 ) -> (Vec<MemoryBlock>, LifMemoryMappingStatus) {
+    let group_count = ordered_ids.len();
+    if raw_blocks.len() == group_count {
+        let same_order = ordered_ids
+            .iter()
+            .zip(raw_blocks)
+            .all(|(id, block)| id == &block.id);
+        return (
+            raw_blocks.to_vec(),
+            if same_order && !raw_blocks.is_empty() {
+                LifMemoryMappingStatus::MatchedById
+            } else {
+                LifMemoryMappingStatus::FallbackFileOrder
+            },
+        );
+    }
+
     let mut matched: Vec<MemoryBlock> = Vec::new();
     for id in ordered_ids {
         if let Some(block) = raw_blocks.iter().find(|block| &block.id == id) {
@@ -1412,7 +1428,6 @@ fn select_lif_memory_blocks(
         return (matched, LifMemoryMappingStatus::MatchedById);
     }
 
-    let group_count = ordered_ids.len();
     if raw_blocks.len() <= group_count {
         return (
             raw_blocks.to_vec(),
@@ -1861,7 +1876,6 @@ fn translate_image(dom: &Dom, img: usize) -> Result<SeriesInfo> {
     m.size_t = size_t;
     m.pixel_type = pixel_type;
     m.bits_per_pixel = (pixel_type.bytes_per_sample() * 8) as u8;
-    m.dimension_order = dimension_order_from_bytes(&bytes_per_axis);
     m.is_rgb = is_rgb;
     m.is_interleaved = is_rgb
         && !is_decodable_planar_rgb(
@@ -1927,6 +1941,8 @@ fn translate_image(dom: &Dom, img: usize) -> Result<SeriesInfo> {
         1
     };
     m.image_count = size_z * size_t * effective_size_c;
+    m.dimension_order =
+        dimension_order_from_bytes(&bytes_per_axis, is_rgb, m.size_c, rgb_channel_count);
     m.series_metadata.insert(
         "lif.rgb_samples_per_pixel".to_string(),
         MetadataValue::Int(i64::from(rgb_channel_count)),
@@ -2327,12 +2343,29 @@ fn channel_offsets_are_ordered_non_overlapping(
     Ok(true)
 }
 
-fn dimension_order_from_bytes(bytes_per_axis: &BTreeMap<u64, char>) -> DimensionOrder {
-    let mut axes: Vec<char> = bytes_per_axis
-        .values()
-        .copied()
-        .filter(|axis| matches!(axis, 'C' | 'Z' | 'T'))
-        .collect();
+fn dimension_order_from_bytes(
+    bytes_per_axis: &BTreeMap<u64, char>,
+    is_rgb: bool,
+    size_c: u32,
+    rgb_channel_count: u32,
+) -> DimensionOrder {
+    let mut axes: Vec<char> = Vec::new();
+    // Java LIFReader only uses BytesInc-derived axes for non-RGB data, or for
+    // a single RGB group where the stored samples consume the whole C axis.
+    if !is_rgb || rgb_channel_count == 1 || rgb_channel_count == size_c {
+        if is_rgb && rgb_channel_count > 1 {
+            axes.push('C');
+        }
+        for axis in bytes_per_axis
+            .values()
+            .copied()
+            .filter(|axis| matches!(axis, 'C' | 'Z' | 'T'))
+        {
+            if !axes.contains(&axis) {
+                axes.push(axis);
+            }
+        }
+    }
     // Java LIFReader appends any missing axes in Z, C, T order after the axes
     // inferred from BytesInc values.
     for axis in ['Z', 'C', 'T'] {
@@ -3721,15 +3754,31 @@ mod tests {
     fn dimension_order_appends_missing_axes_in_java_lif_order() {
         let axes = BTreeMap::new();
         assert_eq!(
-            super::dimension_order_from_bytes(&axes),
+            super::dimension_order_from_bytes(&axes, false, 1, 1),
             DimensionOrder::XYZCT
         );
 
         let mut axes = BTreeMap::new();
         axes.insert(8, 'T');
         assert_eq!(
-            super::dimension_order_from_bytes(&axes),
+            super::dimension_order_from_bytes(&axes, false, 1, 1),
             DimensionOrder::XYTZC
+        );
+    }
+
+    #[test]
+    fn dimension_order_ignores_strides_for_multi_group_rgb_like_java() {
+        let mut axes = BTreeMap::new();
+        axes.insert(1, 'C');
+        axes.insert(12, 'Z');
+
+        assert_eq!(
+            super::dimension_order_from_bytes(&axes, true, 6, 3),
+            DimensionOrder::XYZCT
+        );
+        assert_eq!(
+            super::dimension_order_from_bytes(&axes, true, 3, 3),
+            DimensionOrder::XYCZT
         );
     }
 
@@ -3955,6 +4004,30 @@ mod tests {
         bytes
     }
 
+    fn append_lif_memory_block(bytes: &mut Vec<u8>, id: &str, payload: &[u8]) {
+        let id = utf16le(id);
+        bytes.extend_from_slice(&(0x70_i32).to_le_bytes());
+        bytes.extend_from_slice(&0_i32.to_le_bytes());
+        bytes.push(0x2a);
+        bytes.extend_from_slice(&(payload.len() as i32).to_le_bytes());
+        bytes.push(0x2a);
+        bytes.extend_from_slice(&((id.len() / 2) as i32).to_le_bytes());
+        bytes.extend_from_slice(&id);
+        bytes.extend_from_slice(payload);
+    }
+
+    fn synthetic_two_image_swapped_memory_id_lif_bytes() -> Vec<u8> {
+        let xml = r#"<LMSDataContainerHeader><Element Name="Experiment"><Element Name="First"><Memory MemoryBlockID="A"/><Data><Image Name="First Image"><ImageDescription><Channels><ChannelDescription BytesInc="0"/></Channels><Dimensions><DimensionDescription DimID="1" NumberOfElements="2" BytesInc="1"/><DimensionDescription DimID="2" NumberOfElements="2" BytesInc="2"/></Dimensions></ImageDescription></Image></Data></Element><Element Name="Second"><Memory MemoryBlockID="B"/><Data><Image Name="Second Image"><ImageDescription><Channels><ChannelDescription BytesInc="0"/></Channels><Dimensions><DimensionDescription DimID="1" NumberOfElements="2" BytesInc="1"/><DimensionDescription DimID="2" NumberOfElements="2" BytesInc="2"/></Dimensions></ImageDescription></Image></Data></Element></Element></LMSDataContainerHeader>"#;
+        let xml = utf16le(xml);
+
+        let mut bytes = vec![0x70, 0, 0, 0x70, 0, 0, 0, 0, 0x2a];
+        bytes.extend_from_slice(&((xml.len() / 2) as i32).to_le_bytes());
+        bytes.extend_from_slice(&xml);
+        append_lif_memory_block(&mut bytes, "B", &[1, 2, 3, 4]);
+        append_lif_memory_block(&mut bytes, "A", &[5, 6, 7, 8]);
+        bytes
+    }
+
     fn synthetic_lif_with_extra_small_block_before_pixels() -> Vec<u8> {
         let xml = r#"<LMSDataContainerHeader><Element Name="Experiment"><Element Name="Storage Scan"><Memory MemoryBlockID="MissingXmlId"/><Data><Image Name="Storage Image"><ImageDescription><Channels><ChannelDescription BytesInc="0"/></Channels><Dimensions><DimensionDescription DimID="1" NumberOfElements="2" BytesInc="1"/><DimensionDescription DimID="2" NumberOfElements="2" BytesInc="2"/></Dimensions></ImageDescription></Image></Data></Element></Element></LMSDataContainerHeader>"#;
         let xml = utf16le(xml);
@@ -4177,6 +4250,46 @@ mod tests {
                     && value.contains("file order")
         ));
         assert_eq!(reader.open_bytes(0).unwrap(), [1, 2, 3, 4]);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn same_count_memory_blocks_stay_in_file_order_like_java() {
+        let bytes = synthetic_two_image_swapped_memory_id_lif_bytes();
+        let path = temp_lif_path("memory_file_order_same_count");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let mut reader = LifReader::new();
+        reader.set_id(&path).unwrap();
+
+        assert_eq!(reader.series_count(), 2);
+        let meta = reader.metadata();
+        assert!(matches!(
+            meta.series_metadata.get("lif.memory_block.requested_id"),
+            Some(MetadataValue::String(value)) if value == "A"
+        ));
+        assert!(matches!(
+            meta.series_metadata.get("lif.memory_block.resolved_id"),
+            Some(MetadataValue::String(value)) if value == "B"
+        ));
+        assert!(matches!(
+            meta.series_metadata.get("lif.memory_block.status"),
+            Some(MetadataValue::String(value)) if value == "fallback_file_order"
+        ));
+        assert_eq!(reader.open_bytes(0).unwrap(), [1, 2, 3, 4]);
+
+        reader.set_series(1).unwrap();
+        let meta = reader.metadata();
+        assert!(matches!(
+            meta.series_metadata.get("lif.memory_block.requested_id"),
+            Some(MetadataValue::String(value)) if value == "B"
+        ));
+        assert!(matches!(
+            meta.series_metadata.get("lif.memory_block.resolved_id"),
+            Some(MetadataValue::String(value)) if value == "A"
+        ));
+        assert_eq!(reader.open_bytes(0).unwrap(), [5, 6, 7, 8]);
 
         let _ = std::fs::remove_file(path);
     }

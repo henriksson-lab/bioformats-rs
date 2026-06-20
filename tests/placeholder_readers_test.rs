@@ -61,7 +61,7 @@ fn filepattern_reader_delegates_to_stitcher_for_pattern_files() {
 fn file_stitcher_single_file_preserves_wrapped_reader_series() {
     let dir = tmp_dir("single_series");
     std::fs::create_dir_all(&dir).unwrap();
-    let file = dir.join("single&series=3&sizeX=2&sizeY=1.fake");
+    let file = dir.join("single&series=3&sizeX=2&sizeY=12.fake");
     std::fs::write(&file, b"").unwrap();
 
     let mut reader = FileStitcher::open(&file).expect("single-file stitcher open failed");
@@ -71,7 +71,12 @@ fn file_stitcher_single_file_preserves_wrapped_reader_series() {
     assert_eq!(reader.series(), 2);
     assert_eq!(reader.metadata().size_x, 2);
     assert_eq!(reader.metadata().image_count, 1);
-    assert_eq!(reader.open_bytes(0).expect("open bytes failed"), vec![0, 1]);
+    assert_eq!(
+        reader
+            .open_bytes_region(0, 0, 10, 2, 1)
+            .expect("open bytes failed"),
+        vec![0, 1]
+    );
     assert_eq!(
         reader
             .metadata()
@@ -800,7 +805,7 @@ fn filepattern_reader_expands_recursive_directory_globs() {
         std::fs::create_dir_all(&image_dir).unwrap();
         for t in 0..2 {
             std::fs::write(
-                image_dir.join(format!("img_t{t}&sizeX=2&sizeY=1.fake")),
+                image_dir.join(format!("img_t{t}&sizeX=2&sizeY=12.fake")),
                 b"",
             )
             .unwrap();
@@ -808,7 +813,7 @@ fn filepattern_reader_expands_recursive_directory_globs() {
     }
     std::fs::write(dir.join("plate").join("notes.txt"), b"not an image").unwrap();
     let pattern = dir.join("stack.pattern");
-    std::fs::write(&pattern, "plate/**/img_t?&sizeX=2&sizeY=1.fake").unwrap();
+    std::fs::write(&pattern, "plate/**/img_t?&sizeX=2&sizeY=12.fake").unwrap();
 
     let mut reader = FilePatternReader::new();
     reader.set_id(&pattern).unwrap();
@@ -817,7 +822,7 @@ fn filepattern_reader_expands_recursive_directory_globs() {
     assert_eq!(meta.size_c, 1);
     assert_eq!(meta.size_t, 2);
     assert_eq!(meta.image_count, 4);
-    assert_eq!(reader.open_bytes_region(3, 1, 0, 1, 1).unwrap(), vec![0]);
+    assert_eq!(reader.open_bytes_region(3, 1, 10, 1, 1).unwrap(), vec![1]);
 
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -829,11 +834,11 @@ fn filepattern_reader_recursive_glob_matches_zero_or_more_directories() {
     let nested = plate.join("well_A");
     std::fs::create_dir_all(&nested).unwrap();
     for t in 0..2 {
-        std::fs::write(plate.join(format!("img_t{t}&sizeX=2&sizeY=1.fake")), b"").unwrap();
-        std::fs::write(nested.join(format!("img_t{t}&sizeX=2&sizeY=1.fake")), b"").unwrap();
+        std::fs::write(plate.join(format!("img_t{t}&sizeX=2&sizeY=12.fake")), b"").unwrap();
+        std::fs::write(nested.join(format!("img_t{t}&sizeX=2&sizeY=12.fake")), b"").unwrap();
     }
     let pattern = dir.join("stack.pattern");
-    std::fs::write(&pattern, "plate/**/img_t?&sizeX=2&sizeY=1.fake").unwrap();
+    std::fs::write(&pattern, "plate/**/img_t?&sizeX=2&sizeY=12.fake").unwrap();
 
     let mut reader = FilePatternReader::new();
     reader.set_id(&pattern).unwrap();
@@ -842,7 +847,7 @@ fn filepattern_reader_recursive_glob_matches_zero_or_more_directories() {
     assert_eq!(meta.size_c, 1);
     assert_eq!(meta.size_t, 2);
     assert_eq!(meta.image_count, 4);
-    assert_eq!(reader.open_bytes_region(3, 1, 0, 1, 1).unwrap(), vec![0]);
+    assert_eq!(reader.open_bytes_region(3, 1, 10, 1, 1).unwrap(), vec![1]);
 
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -854,11 +859,11 @@ fn filepattern_reader_collapses_adjacent_recursive_globs() {
     let nested = plate.join("well_A").join("site_0");
     std::fs::create_dir_all(&nested).unwrap();
     for t in 0..2 {
-        std::fs::write(plate.join(format!("img_t{t}&sizeX=2&sizeY=1.fake")), b"").unwrap();
-        std::fs::write(nested.join(format!("img_t{t}&sizeX=2&sizeY=1.fake")), b"").unwrap();
+        std::fs::write(plate.join(format!("img_t{t}&sizeX=2&sizeY=12.fake")), b"").unwrap();
+        std::fs::write(nested.join(format!("img_t{t}&sizeX=2&sizeY=12.fake")), b"").unwrap();
     }
     let pattern = dir.join("stack.pattern");
-    std::fs::write(&pattern, "plate/**/**/img_t?&sizeX=2&sizeY=1.fake").unwrap();
+    std::fs::write(&pattern, "plate/**/**/img_t?&sizeX=2&sizeY=12.fake").unwrap();
 
     let mut reader = FilePatternReader::new();
     reader.set_id(&pattern).unwrap();
@@ -871,7 +876,7 @@ fn filepattern_reader_collapses_adjacent_recursive_globs() {
             .to_string(),
         "4"
     );
-    assert_eq!(reader.open_bytes_region(3, 1, 0, 1, 1).unwrap(), vec![1]);
+    assert_eq!(reader.open_bytes_region(3, 1, 10, 1, 1).unwrap(), vec![1]);
 
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -882,10 +887,10 @@ fn filepattern_reader_terminal_recursive_glob_ignores_unreadable_sidecars() {
     let plate = dir.join("plate");
     let nested = plate.join("well_A");
     std::fs::create_dir_all(&nested).unwrap();
-    std::fs::write(plate.join("img_t0&sizeX=2&sizeY=1.fake"), b"").unwrap();
-    std::fs::write(nested.join("img_t1&sizeX=2&sizeY=1.fake"), b"").unwrap();
-    std::fs::write(plate.join("notes.sidecar"), b"not an image").unwrap();
-    std::fs::write(nested.join("acquisition.unreadable"), b"not an image").unwrap();
+    std::fs::write(plate.join("img_t0&sizeX=2&sizeY=12.fake"), b"").unwrap();
+    std::fs::write(nested.join("img_t1&sizeX=2&sizeY=12.fake"), b"").unwrap();
+    std::fs::write(plate.join("notes.pattern"), b"not an image").unwrap();
+    std::fs::write(nested.join("acquisition.pattern"), b"not an image").unwrap();
     let pattern = dir.join("stack.pattern");
     std::fs::write(&pattern, "plate/**").unwrap();
 
@@ -900,7 +905,7 @@ fn filepattern_reader_terminal_recursive_glob_ignores_unreadable_sidecars() {
             .to_string(),
         "2"
     );
-    assert_eq!(reader.open_bytes_region(1, 1, 0, 1, 1).unwrap(), vec![1]);
+    assert_eq!(reader.open_bytes_region(1, 1, 10, 1, 1).unwrap(), vec![1]);
 
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -911,15 +916,16 @@ fn filepattern_reader_terminal_recursive_glob_reports_unsupported_sidecar_only_t
     let plate = dir.join("plate");
     let nested = plate.join("well_A");
     std::fs::create_dir_all(&nested).unwrap();
-    std::fs::write(plate.join("notes.sidecar"), b"not an image").unwrap();
-    std::fs::write(nested.join("acquisition.unreadable"), b"not an image").unwrap();
+    std::fs::write(plate.join("notes.pattern"), b"not an image").unwrap();
+    std::fs::write(nested.join("acquisition.pattern"), b"not an image").unwrap();
     let pattern = dir.join("stack.pattern");
     std::fs::write(&pattern, "plate/**").unwrap();
 
     let mut reader = FilePatternReader::new();
     let err = reader.set_id(&pattern).unwrap_err();
     assert!(
-        matches!(err, BioFormatsError::UnsupportedFormat(message) if message.contains("recursive ** glob matched no supported reader files"))
+        matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("recursive ** glob matched no supported reader files")),
+        "unexpected error: {err:?}"
     );
 
     let _ = std::fs::remove_dir_all(dir);
@@ -1019,10 +1025,10 @@ fn filepattern_reader_supports_confined_parent_traversal_after_directory_glob() 
         std::fs::create_dir_all(dir.join(format!("well_{well}"))).unwrap();
     }
     for t in 0..2 {
-        std::fs::write(dir.join(format!("img_t{t}&sizeX=2&sizeY=1.fake")), b"").unwrap();
+        std::fs::write(dir.join(format!("img_t{t}&sizeX=2&sizeY=12.fake")), b"").unwrap();
     }
     let pattern = dir.join("stack.pattern");
-    std::fs::write(&pattern, "well_?/../img_t<0-1>&sizeX=2&sizeY=1.fake").unwrap();
+    std::fs::write(&pattern, "well_?/../img_t<0-1>&sizeX=2&sizeY=12.fake").unwrap();
 
     let mut reader = FilePatternReader::new();
     reader.set_id(&pattern).unwrap();
@@ -1031,7 +1037,7 @@ fn filepattern_reader_supports_confined_parent_traversal_after_directory_glob() 
     assert_eq!(meta.size_c, 1);
     assert_eq!(meta.size_t, 2);
     assert_eq!(meta.image_count, 2);
-    assert_eq!(reader.open_bytes_region(1, 1, 0, 1, 1).unwrap(), vec![1]);
+    assert_eq!(reader.open_bytes_region(1, 1, 10, 1, 1).unwrap(), vec![1]);
 
     let _ = std::fs::remove_dir_all(dir);
 }

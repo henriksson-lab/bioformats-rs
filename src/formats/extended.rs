@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{
-    DimensionOrder, ImageMetadata, MetadataLevel, MetadataOptions, MetadataValue,
+    DimensionOrder, ImageMetadata, LookupTable, MetadataLevel, MetadataOptions, MetadataValue,
 };
 use crate::common::ome_metadata::{
     create_lsid, OmeChannel, OmeDetector, OmeImage, OmeInstrument, OmeMetadata, OmeObjective,
@@ -12006,6 +12006,7 @@ pub struct ApngReader {
     lut: Option<[[u8; 256]; 3]>,
     color_type: u8,
     bit_depth: u8,
+    compression: u8,
     interlace: u8,
 }
 
@@ -12020,6 +12021,7 @@ impl ApngReader {
             lut: None,
             color_type: 0,
             bit_depth: 0,
+            compression: 0,
             interlace: 0,
         }
     }
@@ -12079,6 +12081,7 @@ impl ApngReader {
         let mut size_c: u32 = 1;
         let mut bits_per_pixel: u8 = 0;
         let mut color_type: u8 = 0;
+        let mut compression: u8 = 0;
         let mut interlace: u8 = 0;
         let mut is_indexed = false;
         let mut lut: Option<[[u8; 256]; 3]> = None;
@@ -12139,7 +12142,7 @@ impl ApngReader {
                     size_y = self.read_be_i32(d + 4)? as u32;
                     bits_per_pixel = self.data[d + 8];
                     color_type = self.data[d + 9];
-                    // d + 10 is the compression method (only 0 is valid).
+                    compression = self.data[d + 10];
                     let filter = self.data[d + 11];
                     interlace = self.data[d + 12];
 
@@ -12185,7 +12188,14 @@ impl ApngReader {
 
         self.color_type = color_type;
         self.bit_depth = bits_per_pixel;
+        self.compression = compression;
         self.interlace = interlace;
+        let lookup_table = lut.as_ref().map(|table| LookupTable {
+            red: table[0].iter().map(|&v| v as u16).collect(),
+            green: table[1].iter().map(|&v| v as u16).collect(),
+            blue: table[2].iter().map(|&v| v as u16).collect(),
+        });
+
         self.lut = lut;
 
         self.meta = Some(ImageMetadata {
@@ -12208,7 +12218,7 @@ impl ApngReader {
             resolution_count: 1,
             thumbnail: false,
             series_metadata: HashMap::new(),
-            lookup_table: None,
+            lookup_table,
             modulo_z: None,
             modulo_c: None,
             modulo_t: None,
@@ -12223,6 +12233,12 @@ impl ApngReader {
     /// fdAT/IDAT chunks describe a sub-PNG of size (width, height).
     fn decode_frame(&self, frame: usize) -> Result<(Vec<u8>, u32, u32)> {
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        if self.compression != 0 {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "Compression type {} not supported",
+                self.compression
+            )));
+        }
 
         let (sub_w, sub_h) = if frame == 0 {
             (meta.size_x, meta.size_y)
@@ -12260,8 +12276,12 @@ impl ApngReader {
             p
         };
 
-        let png = self.build_sub_png(sub_w, sub_h, &payload);
-        let raw = decode_sub_png(&png, meta, sub_w, sub_h)?;
+        let raw = if self.color_type == 3 || (self.color_type == 0 && self.bit_depth < 8) {
+            decode_apng_packed_samples(&payload, sub_w, sub_h, self.bit_depth, self.interlace)?
+        } else {
+            let png = self.build_sub_png(sub_w, sub_h, &payload);
+            decode_sub_png(&png, meta, sub_w, sub_h)?
+        };
         Ok((raw, sub_w, sub_h))
     }
 
@@ -12338,6 +12358,12 @@ fn decode_sub_png(png: &[u8], meta: &ImageMetadata, w: u32, h: u32) -> Result<Ve
             .iter()
             .flat_map(|v| v.to_be_bytes())
             .collect(),
+        (PixelType::Uint16, 2) => img
+            .to_luma_alpha16()
+            .into_raw()
+            .iter()
+            .flat_map(|v| v.to_be_bytes())
+            .collect(),
         (PixelType::Uint16, 3) => img
             .to_rgb16()
             .into_raw()
@@ -12357,6 +12383,161 @@ fn decode_sub_png(png: &[u8], meta: &ImageMetadata, w: u32, h: u32) -> Result<Ve
         }
     };
     Ok(raw)
+}
+
+fn decode_apng_packed_samples(
+    compressed: &[u8],
+    width: u32,
+    height: u32,
+    bit_depth: u8,
+    interlace: u8,
+) -> Result<Vec<u8>> {
+    let mut inflated = Vec::new();
+    flate2::read::ZlibDecoder::new(compressed)
+        .read_to_end(&mut inflated)
+        .map_err(BioFormatsError::Io)?;
+
+    let mut pixels = vec![0u8; width as usize * height as usize];
+    if interlace == 0 {
+        decode_apng_packed_pass(
+            &inflated,
+            width as usize,
+            height as usize,
+            bit_depth,
+            |col, row, value| {
+                pixels[row * width as usize + col] = value;
+            },
+        )?;
+        return Ok(pixels);
+    }
+
+    const ADAM7: [(usize, usize, usize, usize); 7] = [
+        (0, 0, 8, 8),
+        (4, 0, 8, 8),
+        (0, 4, 4, 8),
+        (2, 0, 4, 4),
+        (0, 2, 2, 4),
+        (1, 0, 2, 2),
+        (0, 1, 1, 2),
+    ];
+
+    let mut offset = 0usize;
+    for (x0, y0, x_step, y_step) in ADAM7 {
+        if x0 >= width as usize || y0 >= height as usize {
+            continue;
+        }
+        let pass_width = ((width as usize - x0) + x_step - 1) / x_step;
+        let pass_height = ((height as usize - y0) + y_step - 1) / y_step;
+        let consumed = decode_apng_packed_pass(
+            inflated.get(offset..).unwrap_or_default(),
+            pass_width,
+            pass_height,
+            bit_depth,
+            |col, row, value| {
+                let x = x0 + col * x_step;
+                let y = y0 + row * y_step;
+                pixels[y * width as usize + x] = value;
+            },
+        )?;
+        offset += consumed;
+    }
+    Ok(pixels)
+}
+
+fn decode_apng_packed_pass<F>(
+    inflated: &[u8],
+    width: usize,
+    height: usize,
+    bit_depth: u8,
+    mut set_pixel: F,
+) -> Result<usize>
+where
+    F: FnMut(usize, usize, u8),
+{
+    let row_bits = width * bit_depth as usize;
+    let row_bytes = row_bits.div_ceil(8);
+    let expected = (row_bytes + 1)
+        .checked_mul(height)
+        .ok_or_else(|| BioFormatsError::Format("APNG packed payload overflows".into()))?;
+    if inflated.len() < expected {
+        return Err(BioFormatsError::Format(format!(
+            "APNG packed payload ended after {} bytes, expected at least {}",
+            inflated.len(),
+            expected
+        )));
+    }
+
+    let mut unfiltered = vec![0u8; row_bytes * height];
+    let mut src = 0usize;
+    for row in 0..height {
+        let filter_type = inflated[src];
+        src += 1;
+        let row_start = row * row_bytes;
+        let prev_start = row.checked_sub(1).map(|prev| prev * row_bytes);
+        for col in 0..row_bytes {
+            let raw = inflated[src + col];
+            let left = if col > 0 {
+                unfiltered[row_start + col - 1]
+            } else {
+                0
+            };
+            let up = prev_start.map(|base| unfiltered[base + col]).unwrap_or(0);
+            let up_left = if col > 0 {
+                prev_start
+                    .map(|base| unfiltered[base + col - 1])
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            unfiltered[row_start + col] = match filter_type {
+                0 => raw,
+                1 => raw.wrapping_add(left),
+                2 => raw.wrapping_add(up),
+                3 => raw.wrapping_add(((left as u16 + up as u16) / 2) as u8),
+                4 => raw.wrapping_add(apng_paeth_predictor(left, up, up_left)),
+                _ => {
+                    return Err(BioFormatsError::Format(format!(
+                        "APNG invalid filter type {filter_type}"
+                    )));
+                }
+            };
+        }
+        src += row_bytes;
+    }
+
+    for row in 0..height {
+        let row_data = &unfiltered[row * row_bytes..(row + 1) * row_bytes];
+        for col in 0..width {
+            let value = if bit_depth == 8 {
+                row_data[col]
+            } else {
+                let bit = col * bit_depth as usize;
+                let byte = row_data[bit / 8];
+                let shift = 8 - bit_depth as usize - (bit % 8);
+                (byte >> shift) & ((1u16 << bit_depth) - 1) as u8
+            };
+            set_pixel(col, row, value);
+        }
+    }
+
+    Ok(expected)
+}
+
+fn apng_paeth_predictor(left: u8, up: u8, up_left: u8) -> u8 {
+    let a = left as i32;
+    let b = up as i32;
+    let c = up_left as i32;
+    let p = a + b - c;
+    let pa = (p - a).abs();
+    let pb = (p - b).abs();
+    let pc = (p - c).abs();
+    if pa <= pb && pa <= pc {
+        left
+    } else if pb <= pc {
+        up
+    } else {
+        up_left
+    }
 }
 
 impl Default for ApngReader {
@@ -12401,6 +12582,7 @@ impl FormatReader for ApngReader {
         self.lut = None;
         self.color_type = 0;
         self.bit_depth = 0;
+        self.compression = 0;
         self.interlace = 0;
         Ok(())
     }

@@ -427,6 +427,33 @@ struct ParseNotesResult {
     detectors: DetectorSettings,
 }
 
+#[derive(Default)]
+struct CompanionMetadata {
+    pics: Vec<PathBuf>,
+    used: Vec<PathBuf>,
+    size_z: Option<u32>,
+    size_c: Option<u32>,
+    size_t: Option<u32>,
+    global_meta: Vec<(String, String)>,
+}
+
+fn push_global_meta_list(
+    global_meta: &mut Vec<(String, String)>,
+    key: &str,
+    value: impl Into<String>,
+) {
+    let count = global_meta
+        .iter()
+        .filter(|(k, _)| k == key || k.starts_with(&format!("{key} #")))
+        .count();
+    let stored_key = if count == 0 {
+        key.to_string()
+    } else {
+        format!("{key} #{}", count + 1)
+    };
+    global_meta.push((stored_key, value.into()));
+}
+
 impl ParseNotesResult {
     fn add_global(&mut self, key: impl Into<String>, value: impl Into<String>) {
         self.global_meta.push((key.into(), value.into()));
@@ -435,17 +462,117 @@ impl ParseNotesResult {
     /// Mirrors Java `addGlobalMetaList(key, value)`: appends with a numbered
     /// suffix when the bare key already exists.
     fn add_global_list(&mut self, key: &str, value: impl Into<String>) {
-        let count = self
-            .global_meta
-            .iter()
-            .filter(|(k, _)| k == key || k.starts_with(&format!("{key} #")))
-            .count();
-        let stored_key = if count == 0 {
-            key.to_string()
-        } else {
-            format!("{key} #{}", count + 1)
-        };
-        self.global_meta.push((stored_key, value.into()));
+        push_global_meta_list(&mut self.global_meta, key, value);
+    }
+}
+
+fn scan_biorad_companions(
+    pic_path: &Path,
+    size_z: u32,
+    size_c: u32,
+    size_t: u32,
+    image_count: u32,
+) -> CompanionMetadata {
+    let mut result = CompanionMetadata::default();
+    let Some(parent) = pic_path.parent() else {
+        return result;
+    };
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return result;
+    };
+    let mut files: Vec<PathBuf> = entries.filter_map(|e| e.ok().map(|e| e.path())).collect();
+    files.sort();
+
+    for file in &files {
+        let name = file
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        if name.eq_ignore_ascii_case("lse.xml") {
+            result.used.push(file.clone());
+            apply_biorad_lse_xml(file, &mut result, size_z, size_c, size_t, image_count);
+            for candidate in &files {
+                if candidate
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| e.eq_ignore_ascii_case("pic"))
+                    .unwrap_or(false)
+                {
+                    result.pics.push(candidate.clone());
+                    if !result.used.contains(candidate) {
+                        result.used.push(candidate.clone());
+                    }
+                }
+            }
+        } else if name.eq_ignore_ascii_case("data.raw") {
+            result.used.push(file.clone());
+        }
+    }
+
+    result.pics.sort();
+    result.pics.dedup();
+    result.used.dedup();
+    result
+}
+
+fn apply_biorad_lse_xml(
+    path: &Path,
+    result: &mut CompanionMetadata,
+    size_z: u32,
+    size_c: u32,
+    size_t: u32,
+    image_count: u32,
+) {
+    let Ok(xml) = std::fs::read_to_string(path) else {
+        return;
+    };
+    use quick_xml::events::Event;
+    let mut reader = quick_xml::Reader::from_str(&xml);
+    reader.config_mut().trim_text(false);
+    let decoder = reader.decoder();
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
+                let name = e.local_name();
+                if name.as_ref() == b"Pixels" {
+                    let mut z = 1u32;
+                    let mut c = 1u32;
+                    let mut t = 1u32;
+                    for attr in e.attributes().flatten() {
+                        let key = attr.key.as_ref().to_vec();
+                        let Some(value) = crate::common::xml::decode_xml_attr(attr, decoder) else {
+                            continue;
+                        };
+                        match key.as_slice() {
+                            b"SizeZ" => z = value.parse().unwrap_or(1),
+                            b"SizeC" => c = value.parse().unwrap_or(1),
+                            b"SizeT" => t = value.parse().unwrap_or(1),
+                            _ => {}
+                        }
+                    }
+                    let count = size_z.saturating_mul(size_c).saturating_mul(size_t);
+                    result.size_z = Some(z);
+                    result.size_c = Some(c);
+                    result.size_t = Some(t);
+                    if count < image_count && count > 0 {
+                        result.size_c = Some(image_count / count);
+                    }
+                } else if matches!(name.as_ref(), b"Z" | b"C" | b"T") {
+                    for attr in e.attributes().flatten() {
+                        if attr.key.as_ref() == b"TimeCompleted" {
+                            if let Some(value) = crate::common::xml::decode_xml_attr(attr, decoder)
+                            {
+                                push_global_meta_list(&mut result.global_meta, "Timestamp", value);
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(Event::Eof) => break,
+            Ok(_) => {}
+            Err(_) => break,
+        }
     }
 }
 
@@ -830,6 +957,32 @@ impl FormatReader for BioRadReader {
             size_t = t;
         }
 
+        // Java initFile scans grouped datasets for lse.xml/data.raw. The SAX
+        // BioRadHandler applies <Pixels SizeZ/SizeC/SizeT> and records
+        // TimeCompleted attributes, and lse.xml forces all sibling PIC files
+        // into the grouped series. This happens before Java parseNotes(), so
+        // AXIS notes below can still override XML-derived dimensions.
+        let companion = scan_biorad_companions(&path, size_z, size_c, size_t, npic);
+        if let Some(z) = companion.size_z {
+            size_z = z;
+        }
+        if let Some(c) = companion.size_c {
+            size_c = c;
+        }
+        if let Some(t) = companion.size_t {
+            size_t = t;
+        }
+        for (k, v) in &companion.global_meta {
+            meta_map
+                .entry(k.clone())
+                .or_insert_with(|| MetadataValue::String(v.clone()));
+        }
+        for p in &companion.used {
+            if !used.contains(p) {
+                used.push(p.clone());
+            }
+        }
+
         // parseNotes: AXIS-driven sizeC/sizeZ/sizeT derivation + multiple-files,
         // plus the note-type taxonomy and instrument/acquisition metadata.
         let parsed = parse_notes(&notes.notes, npic, nx, ny);
@@ -884,7 +1037,7 @@ impl FormatReader for BioRadReader {
         // sibling PIC files via a FilePattern over the numbered filename and
         // keep those whose length matches this file's length (Java
         // initFile/FilePattern path). Order by name (Arrays.sort(picFiles)).
-        let mut pics: Vec<PathBuf> = Vec::new();
+        let mut pics: Vec<PathBuf> = companion.pics;
         if multiple_files {
             if let Ok(this_len) = std::fs::metadata(&path).map(|m| m.len()) {
                 if let Ok(pattern) = crate::stitcher::FilePattern::from_file(&path) {
@@ -955,6 +1108,29 @@ impl FormatReader for BioRadReader {
         };
         let lut = if self.broken_notes {
             None
+        } else if pic_files.len() > 1 {
+            let mut tables = Vec::with_capacity(effective_size_c);
+            for channel in 0..effective_size_c {
+                // Java uses getIndex(0, channel, 0) with XYCTZ order; C is
+                // the fastest-varying plane coordinate, so the channel's table
+                // is read from picFiles[channel % nFiles].
+                let file_idx = channel % pic_files.len();
+                let table = File::open(&pic_files[file_idx]).ok().and_then(|mut lf| {
+                    read_lookup_tables(&mut lf, 1, nx, ny, image_count, bpp, lut_n_files)
+                });
+                if let Some(mut one) = table {
+                    if let Some(first) = one.pop() {
+                        tables.push(first);
+                        continue;
+                    }
+                }
+                break;
+            }
+            if !tables.is_empty() {
+                Some(tables)
+            } else {
+                None
+            }
         } else {
             // Java reads each channel's table from picFiles[plane % nFiles];
             // for the common single-file case all tables live in this file.
@@ -1323,13 +1499,18 @@ mod tests {
     /// Build a 1x1, single-plane, 8-bit PIC file: 76-byte header + 1 pixel byte
     /// + the supplied trailing bytes (note block / LUT ramps).
     fn pic_1x1(trailing: &[u8]) -> Vec<u8> {
+        pic_1x1_npic(&[0], trailing)
+    }
+
+    /// Build a 1x1, N-plane, 8-bit PIC file with explicit pixel bytes.
+    fn pic_1x1_npic(pixels: &[u8], trailing: &[u8]) -> Vec<u8> {
         let mut data = vec![0u8; 76];
         data[0..2].copy_from_slice(&1i16.to_le_bytes()); // nx
         data[2..4].copy_from_slice(&1i16.to_le_bytes()); // ny
-        data[4..6].copy_from_slice(&1i16.to_le_bytes()); // npic
+        data[4..6].copy_from_slice(&(pixels.len() as i16).to_le_bytes()); // npic
         data[14..16].copy_from_slice(&1i16.to_le_bytes()); // byte_format != 0 -> uint8
         data[54..56].copy_from_slice(&FILE_ID.to_le_bytes());
-        data.push(0); // one pixel byte
+        data.extend_from_slice(pixels);
         data.extend_from_slice(trailing);
         data
     }
@@ -1338,6 +1519,16 @@ mod tests {
         let mut p = std::env::temp_dir();
         p.push(name);
         std::fs::write(&p, bytes).unwrap();
+        p
+    }
+
+    fn tmp_dir(name: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let p = std::env::temp_dir().join(format!("bioformats_biorad_{name}_{nanos}"));
+        std::fs::create_dir_all(&p).unwrap();
         p
     }
 
@@ -1421,6 +1612,123 @@ mod tests {
         assert_eq!(reader.last_channel, 0);
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn grouped_channel_luts_are_read_from_each_pic_file_like_java() {
+        let dir = tmp_dir("channel_luts");
+        let pic0 = dir.join("series001.pic");
+        let pic1 = dir.join("series002.pic");
+
+        let mut trailing0 = note_record(false, NOTE_TYPE_USER, "AXIS_9 11 0 2");
+        for c in 0..3u8 {
+            trailing0.extend(std::iter::repeat(c + 1).take(LUT_LENGTH));
+        }
+        let mut bytes0 = pic_1x1(&trailing0);
+        bytes0[76] = 10;
+        std::fs::write(&pic0, bytes0).unwrap();
+
+        let mut trailing1 = note_record(false, NOTE_TYPE_USER, "AXIS_9 11 0 2");
+        for c in 0..3u8 {
+            trailing1.extend(std::iter::repeat(c + 11).take(LUT_LENGTH));
+        }
+        let mut bytes1 = pic_1x1(&trailing1);
+        bytes1[76] = 20;
+        std::fs::write(&pic1, bytes1).unwrap();
+
+        let mut reader = BioRadReader::new();
+        reader.set_id(&pic0).unwrap();
+        assert_eq!(reader.metadata().size_c, 2);
+        assert_eq!(reader.metadata().image_count, 2);
+        assert_eq!(reader.used_files().len(), 2);
+
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![10]);
+        let lut0 = reader.eight_bit_lookup_table().expect("channel 0 LUT");
+        assert_eq!(lut0[0][0], 1);
+        assert_eq!(lut0[1][0], 2);
+        assert_eq!(lut0[2][0], 3);
+
+        assert_eq!(reader.open_bytes(1).unwrap(), vec![20]);
+        let lut1 = reader.eight_bit_lookup_table().expect("channel 1 LUT");
+        assert_eq!(lut1[0][0], 11);
+        assert_eq!(lut1[1][0], 12);
+        assert_eq!(lut1[2][0], 13);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lse_xml_companion_groups_sibling_pics_and_sets_dimensions_like_java() {
+        let dir = tmp_dir("lse_group");
+        let pic0 = dir.join("series001.pic");
+        let pic1 = dir.join("series002.pic");
+        let xml = dir.join("lse.xml");
+        let raw = dir.join("data.raw");
+
+        let mut bytes0 = pic_1x1(&note_record(false, NOTE_TYPE_USER, "x"));
+        bytes0[76] = 31;
+        std::fs::write(&pic0, bytes0).unwrap();
+        let mut bytes1 = pic_1x1(&note_record(false, NOTE_TYPE_USER, "x"));
+        bytes1[76] = 47;
+        std::fs::write(&pic1, bytes1).unwrap();
+        std::fs::write(
+            &xml,
+            r#"<Root><Pixels SizeZ="1" SizeC="2" SizeT="1"/><C TimeCompleted="12.5"/><T TimeCompleted="13.5"/></Root>"#,
+        )
+        .unwrap();
+        std::fs::write(&raw, b"raw companion").unwrap();
+
+        let mut reader = BioRadReader::new();
+        reader.set_id(&xml).unwrap();
+        let meta = reader.metadata();
+        assert_eq!(meta.size_z, 1);
+        assert_eq!(meta.size_c, 2);
+        assert_eq!(meta.size_t, 1);
+        assert_eq!(meta.image_count, 2);
+        assert!(matches!(
+            meta.series_metadata.get("Timestamp"),
+            Some(MetadataValue::String(v)) if v == "12.5"
+        ));
+        assert!(matches!(
+            meta.series_metadata.get("Timestamp #2"),
+            Some(MetadataValue::String(v)) if v == "13.5"
+        ));
+
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![31]);
+        assert_eq!(reader.open_bytes(1).unwrap(), vec![47]);
+        assert!(reader.used_files().contains(&xml));
+        assert!(reader.used_files().contains(&raw));
+        assert!(reader.used_files().contains(&pic0));
+        assert!(reader.used_files().contains(&pic1));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn axis_notes_override_lse_xml_dimensions_like_java_parse_order() {
+        let dir = tmp_dir("lse_axis_order");
+        let pic = dir.join("series001.pic");
+        let xml = dir.join("lse.xml");
+
+        let trailing = note_record(false, NOTE_TYPE_USER, "AXIS_4 11 0 0");
+        std::fs::write(&pic, pic_1x1_npic(&[3, 4], &trailing)).unwrap();
+        std::fs::write(
+            &xml,
+            r#"<Root><Pixels SizeZ="1" SizeC="1" SizeT="2"/></Root>"#,
+        )
+        .unwrap();
+
+        let mut reader = BioRadReader::new();
+        reader.set_id(&xml).unwrap();
+        let meta = reader.metadata();
+        assert_eq!(meta.size_z, 1);
+        assert_eq!(meta.size_c, 2);
+        assert_eq!(meta.size_t, 1);
+        assert_eq!(meta.image_count, 2);
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![3]);
+        assert_eq!(reader.open_bytes(1).unwrap(), vec![4]);
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

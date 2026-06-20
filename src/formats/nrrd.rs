@@ -40,6 +40,8 @@ struct NrrdHeader {
     sizes: Vec<u32>,
     kinds: Vec<String>,
     space_directions: Vec<bool>,
+    pixel_sizes: Vec<String>,
+    pixel_size_units: Vec<String>,
     endian: bool, // true = little-endian
     encoding: Encoding,
     data_file: Option<PathBuf>,
@@ -145,6 +147,8 @@ fn parse_nrrd_header(path: &Path) -> Result<NrrdHeader> {
     let mut line_skip = 0usize;
     let mut kinds: Vec<String> = Vec::new();
     let mut space_directions: Vec<bool> = Vec::new();
+    let mut pixel_sizes: Vec<String> = Vec::new();
+    let mut pixel_size_units: Vec<String> = Vec::new();
     let mut extra: HashMap<String, String> = HashMap::new();
     let mut data_file_list = false;
     let parent = path.parent().unwrap_or(Path::new(".")).to_path_buf();
@@ -203,9 +207,19 @@ fn parse_nrrd_header(path: &Path) -> Result<NrrdHeader> {
                         .collect();
                 }
                 "space directions" | "spacedirections" => {
+                    pixel_sizes = val.split_ascii_whitespace().map(str::to_string).collect();
                     space_directions = val
                         .split_ascii_whitespace()
                         .map(|s| !s.eq_ignore_ascii_case("none"))
+                        .collect();
+                }
+                "spacings" => {
+                    pixel_sizes = val.split_ascii_whitespace().map(str::to_string).collect();
+                }
+                "space units" | "spaceunits" => {
+                    pixel_size_units = val
+                        .split_ascii_whitespace()
+                        .map(|s| s.trim_matches('"').to_string())
                         .collect();
                 }
                 "endian" => {
@@ -256,6 +270,8 @@ fn parse_nrrd_header(path: &Path) -> Result<NrrdHeader> {
         sizes,
         kinds,
         space_directions,
+        pixel_sizes,
+        pixel_size_units,
         endian: little_endian,
         encoding,
         data_file,
@@ -347,6 +363,18 @@ fn total_sample_count(sizes: &[u32]) -> Result<usize> {
     })
 }
 
+fn parse_nrrd_pixel_size(value: &str, index: usize) -> Option<f64> {
+    let size = value.trim();
+    if size.starts_with('(') && size.ends_with(')') {
+        let vector = &size[1..size.len() - 1];
+        return vector
+            .split(',')
+            .nth(index)
+            .and_then(|v| v.trim().parse::<f64>().ok());
+    }
+    size.parse::<f64>().ok()
+}
+
 fn data_start_offset(
     path: &Path,
     base_offset: u64,
@@ -372,10 +400,10 @@ fn data_start_offset(
 
     let mut offset = base_offset;
 
-    // Retained for legacy line-skip handling on inline data; Java does not
-    // apply line skip for raw encoding, but keep it to support text/ascii-like
-    // inline payloads where a leading line count is meaningful.
-    if hdr.line_skip > 0 {
+    // Java NRRDReader never applies `line skip` for raw/gzip payloads. Keep it
+    // only for the Rust-only ASCII extension, where skipping text rows is
+    // useful and cannot change Java-supported behavior.
+    if hdr.line_skip > 0 && matches!(hdr.encoding, Encoding::Ascii) {
         let mut f = File::open(path).map_err(BioFormatsError::Io)?;
         f.seek(SeekFrom::Start(offset))
             .map_err(BioFormatsError::Io)?;
@@ -825,6 +853,39 @@ impl FormatReader for NrrdReader {
                 ),
             );
         }
+        if !hdr.pixel_sizes.is_empty() {
+            series_metadata.insert(
+                "nrrd_pixel_sizes".into(),
+                MetadataValue::String(hdr.pixel_sizes.join(" ")),
+            );
+        }
+        if !hdr.pixel_size_units.is_empty() {
+            series_metadata.insert(
+                "nrrd_pixel_size_units".into(),
+                MetadataValue::String(hdr.pixel_size_units.join(" ")),
+            );
+        }
+        if let Some(v) = hdr
+            .pixel_sizes
+            .first()
+            .and_then(|s| parse_nrrd_pixel_size(s, 0))
+        {
+            series_metadata.insert("physical_size_x".into(), MetadataValue::Float(v));
+        }
+        if let Some(v) = hdr
+            .pixel_sizes
+            .get(1)
+            .and_then(|s| parse_nrrd_pixel_size(s, 1))
+        {
+            series_metadata.insert("physical_size_y".into(), MetadataValue::Float(v));
+        }
+        if let Some(v) = hdr
+            .pixel_sizes
+            .get(2)
+            .and_then(|s| parse_nrrd_pixel_size(s, 2))
+        {
+            series_metadata.insert("physical_size_z".into(), MetadataValue::Float(v));
+        }
         if hdr.byte_skip != 0 {
             series_metadata.insert("nrrd_byte_skip".into(), MetadataValue::Int(hdr.byte_skip));
         }
@@ -939,6 +1000,16 @@ impl FormatReader for NrrdReader {
             if let Some(img) = ome.images.get_mut(0) {
                 img.name = Some(name.to_string());
             }
+        }
+        if let Some(img) = ome.images.get_mut(0) {
+            let get_f = |key: &str| match meta.series_metadata.get(key) {
+                Some(MetadataValue::Float(v)) => Some(*v),
+                Some(MetadataValue::Int(v)) => Some(*v as f64),
+                _ => None,
+            };
+            img.physical_size_x = get_f("physical_size_x");
+            img.physical_size_y = get_f("physical_size_y");
+            img.physical_size_z = get_f("physical_size_z");
         }
         Some(ome)
     }

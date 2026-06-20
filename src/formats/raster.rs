@@ -206,6 +206,9 @@ pub struct GifReader {
     meta: Option<ImageMetadata>,
     frames: Vec<Vec<u8>>,
     color_tables: Vec<LookupTable>,
+    planes_read: Vec<bool>,
+    transparency: bool,
+    trans_index: u8,
 }
 
 impl GifReader {
@@ -215,6 +218,9 @@ impl GifReader {
             meta: None,
             frames: Vec::new(),
             color_tables: Vec::new(),
+            planes_read: Vec::new(),
+            transparency: false,
+            trans_index: 0,
         }
     }
 }
@@ -664,6 +670,25 @@ impl FormatReader for GifReader {
         self.meta = Some(meta);
         self.frames = frames;
         self.color_tables = color_tables;
+        self.planes_read = vec![false; self.frames.len()];
+        self.transparency = self
+            .meta
+            .as_ref()
+            .and_then(|m| m.series_metadata.get("Use transparency"))
+            .and_then(|v| match v {
+                MetadataValue::Bool(b) => Some(*b),
+                _ => None,
+            })
+            .unwrap_or(false);
+        self.trans_index = self
+            .meta
+            .as_ref()
+            .and_then(|m| m.series_metadata.get("Transparency index"))
+            .and_then(|v| match v {
+                MetadataValue::Int(i) => u8::try_from(*i).ok(),
+                _ => None,
+            })
+            .unwrap_or(0);
         Ok(())
     }
 
@@ -672,6 +697,9 @@ impl FormatReader for GifReader {
         self.meta = None;
         self.frames.clear();
         self.color_tables.clear();
+        self.planes_read.clear();
+        self.transparency = false;
+        self.trans_index = 0;
         Ok(())
     }
 
@@ -696,11 +724,39 @@ impl FormatReader for GifReader {
     }
 
     fn open_bytes(&mut self, idx: u32) -> Result<Vec<u8>> {
-        let frame = self
-            .frames
-            .get(idx as usize)
-            .ok_or(BioFormatsError::PlaneOutOfRange(idx))?;
-        Ok(frame.clone())
+        let i = idx as usize;
+        if i >= self.frames.len() {
+            return Err(BioFormatsError::PlaneOutOfRange(idx));
+        }
+
+        // Java GIFReader applies transparent pixels lazily when a plane is first
+        // read, inheriting from the preceding plane.
+        if i > 0 && self.transparency && !self.planes_read[i] {
+            let prev = if self.planes_read[i - 1] {
+                self.frames[i - 1].clone()
+            } else {
+                self.open_bytes(idx - 1)?
+            };
+            let lut = self.color_tables.get(i).cloned();
+            let transparent_rgb = if self.trans_index >= 127 {
+                0
+            } else {
+                self.trans_index as u32
+            };
+            if let Some(lut) = lut {
+                for (pixel, prev_pixel) in self.frames[i].iter_mut().zip(prev.iter()) {
+                    let p = *pixel as usize;
+                    let rgb = ((lut.red[p] as u32) << 16)
+                        | ((lut.green[p] as u32) << 8)
+                        | (lut.blue[p] as u32);
+                    if rgb == transparent_rgb {
+                        *pixel = *prev_pixel;
+                    }
+                }
+            }
+        }
+        self.planes_read[i] = true;
+        Ok(self.frames[i].clone())
     }
 
     fn open_bytes_region(&mut self, idx: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
@@ -1170,11 +1226,251 @@ pub fn webp_reader() -> impl FormatReader {
 }
 
 pub fn pnm_reader() -> impl FormatReader {
-    GenericReader::new(
-        &["pbm", "pam", "pgm", "ppm", "pnm"],
-        |h| h.len() >= 2 && h[0] == b'P' && h[1].is_ascii_digit(),
-        RasterBehavior::Still,
-    )
+    PnmReader::new()
+}
+
+struct PnmReader {
+    path: Option<PathBuf>,
+    meta: Option<ImageMetadata>,
+    pixels: Option<Vec<u8>>,
+}
+
+impl PnmReader {
+    fn new() -> Self {
+        Self {
+            path: None,
+            meta: None,
+            pixels: None,
+        }
+    }
+}
+
+fn pnm_is_space(b: u8) -> bool {
+    matches!(b, b' ' | b'\r' | b'\n' | b'\t' | 0x0b | 0x0c)
+}
+
+fn pnm_next_token(data: &[u8], pos: &mut usize) -> Option<String> {
+    loop {
+        while data.get(*pos).copied().is_some_and(pnm_is_space) {
+            *pos += 1;
+        }
+        if data.get(*pos) != Some(&b'#') {
+            break;
+        }
+        while let Some(&b) = data.get(*pos) {
+            *pos += 1;
+            if b == b'\r' || b == b'\n' {
+                break;
+            }
+        }
+    }
+
+    let start = *pos;
+    while data
+        .get(*pos)
+        .copied()
+        .is_some_and(|b| !pnm_is_space(b) && b != b'#')
+    {
+        *pos += 1;
+    }
+    (*pos > start).then(|| String::from_utf8_lossy(&data[start..*pos]).into_owned())
+}
+
+fn pnm_pixel_offset(data: &[u8], mut pos: usize) -> usize {
+    loop {
+        while data.get(pos).copied().is_some_and(pnm_is_space) {
+            pos += 1;
+        }
+        if data.get(pos) != Some(&b'#') {
+            return pos;
+        }
+        while let Some(&b) = data.get(pos) {
+            pos += 1;
+            if b == b'\r' || b == b'\n' {
+                break;
+            }
+        }
+    }
+}
+
+fn pnm_ascii_pixels(data: &[u8], pixel_type: PixelType) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut value = 0u32;
+    let mut in_number = false;
+    for &b in data {
+        if b.is_ascii_digit() {
+            value = value.saturating_mul(10).saturating_add((b - b'0') as u32);
+            in_number = true;
+        } else if in_number {
+            if pixel_type == PixelType::Uint16 {
+                out.extend_from_slice(&(value as u16).to_le_bytes());
+            } else {
+                out.push(value as u8);
+            }
+            value = 0;
+            in_number = false;
+        }
+    }
+    if in_number {
+        if pixel_type == PixelType::Uint16 {
+            out.extend_from_slice(&(value as u16).to_le_bytes());
+        } else {
+            out.push(value as u8);
+        }
+    }
+    out
+}
+
+fn load_pnm(path: &Path) -> Result<(ImageMetadata, Vec<u8>)> {
+    let data = std::fs::read(path)?;
+    if data.len() < 2 || data[0] != b'P' || !data[1].is_ascii_digit() {
+        return Err(BioFormatsError::Format("Not a valid PNM file.".into()));
+    }
+
+    let magic = std::str::from_utf8(&data[..2])
+        .map_err(|_| BioFormatsError::Format("Not a valid PNM file.".into()))?;
+    let raw_bits = matches!(magic, "P4" | "P5" | "P6");
+    let size_c = if matches!(magic, "P3" | "P6") { 3 } else { 1 };
+    let black_and_white = matches!(magic, "P1" | "P4");
+
+    let mut pos = 2usize;
+    let size_x = pnm_next_token(&data, &mut pos)
+        .ok_or_else(|| BioFormatsError::Format("PNM width missing".into()))?
+        .parse::<u32>()
+        .map_err(|_| BioFormatsError::Format("Invalid PNM width".into()))?;
+    let size_y = pnm_next_token(&data, &mut pos)
+        .ok_or_else(|| BioFormatsError::Format("PNM height missing".into()))?
+        .parse::<u32>()
+        .map_err(|_| BioFormatsError::Format("Invalid PNM height".into()))?;
+    let pixel_type = if black_and_white {
+        PixelType::Uint8
+    } else {
+        let max = pnm_next_token(&data, &mut pos)
+            .ok_or_else(|| BioFormatsError::Format("PNM max value missing".into()))?
+            .parse::<u32>()
+            .map_err(|_| BioFormatsError::Format("Invalid PNM max value".into()))?;
+        if max > 255 {
+            PixelType::Uint16
+        } else {
+            PixelType::Uint8
+        }
+    };
+
+    let bytes_per_sample = pixel_type.bytes_per_sample() as usize;
+    let plane_len = (size_x as usize)
+        .checked_mul(size_y as usize)
+        .and_then(|v| v.checked_mul(size_c as usize))
+        .and_then(|v| v.checked_mul(bytes_per_sample))
+        .ok_or_else(|| BioFormatsError::Format("PNM plane size overflow".into()))?;
+
+    let offset = pnm_pixel_offset(&data, pos);
+    let mut pixels = if raw_bits {
+        data.get(offset..).unwrap_or(&[]).to_vec()
+    } else {
+        pnm_ascii_pixels(data.get(offset..).unwrap_or(&[]), pixel_type)
+    };
+    pixels.resize(plane_len, 0);
+    pixels.truncate(plane_len);
+
+    let meta = ImageMetadata {
+        size_x,
+        size_y,
+        size_z: 1,
+        size_c,
+        size_t: 1,
+        pixel_type,
+        bits_per_pixel: (bytes_per_sample as u8) * 8,
+        image_count: 1,
+        dimension_order: DimensionOrder::XYCZT,
+        is_rgb: size_c == 3,
+        is_interleaved: true,
+        is_indexed: false,
+        is_little_endian: true,
+        resolution_count: 1,
+        series_metadata: [(
+            "Black and white".to_string(),
+            MetadataValue::Bool(black_and_white),
+        )]
+        .into_iter()
+        .collect(),
+        ..Default::default()
+    };
+    Ok((meta, pixels))
+}
+
+impl FormatReader for PnmReader {
+    fn is_this_type_by_name(&self, path: &Path) -> bool {
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        matches!(
+            ext.as_deref(),
+            Some("pbm") | Some("pam") | Some("pgm") | Some("ppm") | Some("pnm")
+        )
+    }
+
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        header.len() >= 2 && header[0] == b'P' && header[1].is_ascii_digit()
+    }
+
+    fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.close()?;
+        let (meta, pixels) = load_pnm(path)?;
+        self.path = Some(path.to_path_buf());
+        self.meta = Some(meta);
+        self.pixels = Some(pixels);
+        Ok(())
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.path = None;
+        self.meta = None;
+        self.pixels = None;
+        Ok(())
+    }
+
+    fn series_count(&self) -> usize {
+        usize::from(self.meta.is_some())
+    }
+
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if self.meta.is_none() || s != 0 {
+            Err(BioFormatsError::SeriesOutOfRange(s))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn series(&self) -> usize {
+        0
+    }
+
+    fn metadata(&self) -> &ImageMetadata {
+        self.meta
+            .as_ref()
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
+    }
+
+    fn open_bytes(&mut self, idx: u32) -> Result<Vec<u8>> {
+        if idx != 0 {
+            return Err(BioFormatsError::PlaneOutOfRange(idx));
+        }
+        self.pixels.clone().ok_or(BioFormatsError::NotInitialized)
+    }
+
+    fn open_bytes_region(&mut self, idx: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+        let full = self.open_bytes(idx)?;
+        let meta = self.meta.as_ref().unwrap();
+        crop_full_plane("pnm", &full, meta, meta.size_c as usize, x, y, w, h)
+    }
+
+    fn open_thumb_bytes(&mut self, idx: u32) -> Result<Vec<u8>> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let (tw, th) = (meta.size_x.min(256), meta.size_y.min(256));
+        let (tx, ty) = ((meta.size_x - tw) / 2, (meta.size_y - th) / 2);
+        self.open_bytes_region(idx, tx, ty, tw, th)
+    }
 }
 
 pub fn hdr_reader() -> impl FormatReader {
@@ -1421,45 +1717,10 @@ impl FormatWriter for PnmWriter {
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         let pixels = crate::common::writer::to_interleaved_samples(meta, data)?;
-        let (w, h) = (meta.size_x, meta.size_y);
         let spp = meta.size_c as usize;
-        let img: image::DynamicImage = match (meta.pixel_type, spp) {
-            (PixelType::Uint8, 1) => image::GrayImage::from_raw(w, h, pixels)
-                .map(image::DynamicImage::ImageLuma8)
-                .ok_or_else(|| BioFormatsError::InvalidData("bad length".into()))?,
-            (PixelType::Uint8, 3) => image::RgbImage::from_raw(w, h, pixels)
-                .map(image::DynamicImage::ImageRgb8)
-                .ok_or_else(|| BioFormatsError::InvalidData("bad length".into()))?,
-            (PixelType::Uint16, 1) => {
-                let pixels: Vec<u16> = pixels
-                    .chunks_exact(2)
-                    .map(|c| {
-                        if meta.is_little_endian {
-                            u16::from_le_bytes([c[0], c[1]])
-                        } else {
-                            u16::from_be_bytes([c[0], c[1]])
-                        }
-                    })
-                    .collect();
-                image::ImageBuffer::<image::Luma<u16>, _>::from_raw(w, h, pixels)
-                    .map(image::DynamicImage::ImageLuma16)
-                    .ok_or_else(|| BioFormatsError::InvalidData("bad length".into()))?
-            }
-            (PixelType::Uint16, 3) => {
-                let pixels: Vec<u16> = pixels
-                    .chunks_exact(2)
-                    .map(|c| {
-                        if meta.is_little_endian {
-                            u16::from_le_bytes([c[0], c[1]])
-                        } else {
-                            u16::from_be_bytes([c[0], c[1]])
-                        }
-                    })
-                    .collect();
-                image::ImageBuffer::<image::Rgb<u16>, _>::from_raw(w, h, pixels)
-                    .map(image::DynamicImage::ImageRgb16)
-                    .ok_or_else(|| BioFormatsError::InvalidData("bad length".into()))?
-            }
+        let magic = match spp {
+            1 => "P5",
+            3 => "P6",
             _ => {
                 return Err(BioFormatsError::UnsupportedFormat(format!(
                     "PNM writer: unsupported {:?} spp={}",
@@ -1467,8 +1728,19 @@ impl FormatWriter for PnmWriter {
                 )));
             }
         };
-        img.save(path)
-            .map_err(|e| BioFormatsError::Format(e.to_string()))?;
+        let max = match meta.pixel_type {
+            PixelType::Uint8 => 255,
+            PixelType::Uint16 => 65535,
+            _ => {
+                return Err(BioFormatsError::UnsupportedFormat(format!(
+                    "PNM writer: unsupported {:?} spp={}",
+                    meta.pixel_type, spp
+                )));
+            }
+        };
+        let mut out = format!("{magic}\n{} {}\n{max}\n", meta.size_x, meta.size_y).into_bytes();
+        out.extend_from_slice(&pixels);
+        std::fs::write(path, out).map_err(BioFormatsError::Io)?;
         self.wrote = true;
         Ok(())
     }

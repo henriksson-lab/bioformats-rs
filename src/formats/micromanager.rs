@@ -800,6 +800,53 @@ fn metadata_file_has_micromanager_marker(path: &Path) -> bool {
     data.contains("micro-manager") || data.contains("micromanager")
 }
 
+fn prefix_metadata_name(name: &str) -> String {
+    let stem = name.rsplit_once('.').map(|(stem, _)| stem).unwrap_or(name);
+    format!("{stem}_metadata.txt")
+}
+
+fn has_tiff_header(path: &Path) -> bool {
+    let Ok(mut file) = File::open(path) else {
+        return false;
+    };
+    let mut header = [0u8; 4];
+    if file.read_exact(&mut header).is_err() {
+        return false;
+    }
+    matches!(
+        header,
+        [b'I', b'I', 42, 0] | [b'M', b'M', 0, 42] | [b'I', b'I', 43, 0] | [b'M', b'M', 0, 43]
+    )
+}
+
+fn micro_manager_metadata_entry(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    let lower = name.to_ascii_lowercase();
+    if lower == "metadata.txt" || lower.ends_with("_metadata.txt") || lower == "metadata.json" {
+        return path.to_path_buf();
+    }
+    if name.eq_ignore_ascii_case("Acqusition.xml") {
+        if let Some(parent) = path.parent() {
+            let metadata = parent.join("metadata.txt");
+            if metadata.exists() {
+                return metadata;
+            }
+            return parent.join(prefix_metadata_name(name));
+        }
+    }
+    if let Some(parent) = path.parent() {
+        let metadata = parent.join("metadata.txt");
+        if metadata.exists() {
+            return metadata;
+        }
+        return parent.join(prefix_metadata_name(name));
+    }
+    path.to_path_buf()
+}
+
 /// Discover all sibling `Pos_*` position directories (multi-position series).
 /// Returns the list of metadata.txt paths in sorted order, or just the single
 /// supplied file if this is not a multi-position dataset.
@@ -879,6 +926,21 @@ impl FormatReader for MicromanagerReader {
         if name == "metadata.txt" || name.ends_with("_metadata.txt") {
             return metadata_file_has_micromanager_marker(path);
         }
+        if name == "acqusition.xml" {
+            return metadata_file_has_micromanager_marker(path);
+        }
+        let is_tiff = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| {
+                let e = e.to_ascii_lowercase();
+                e == "tif" || e == "tiff"
+            })
+            .unwrap_or(false);
+        if is_tiff {
+            let metadata = micro_manager_metadata_entry(path);
+            return has_tiff_header(path) && metadata_file_has_micromanager_marker(&metadata);
+        }
         // Extra Rust support for JSON-named metadata; Java uses metadata.txt or
         // *_metadata.txt, but accepting metadata.json does not alter those paths.
         name == "metadata.json"
@@ -889,7 +951,8 @@ impl FormatReader for MicromanagerReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        let position_files = discover_positions(path);
+        let metadata_entry = micro_manager_metadata_entry(path);
+        let position_files = discover_positions(&metadata_entry);
         let mut positions = Vec::with_capacity(position_files.len());
         for pf in position_files {
             positions.push(parse_position(&pf)?);
@@ -901,7 +964,7 @@ impl FormatReader for MicromanagerReader {
         }
         self.positions = positions;
         self.series = 0;
-        self.meta_path = Some(path.to_path_buf());
+        self.meta_path = Some(metadata_entry);
         Ok(())
     }
 
@@ -1039,6 +1102,7 @@ mod tests {
     "Slices": 1,
     "Frames": 2,
     "PixelType": "GRAY8",
+    "MicroManagerVersion": "2.0",
     "SlicesFirst": false,
     "ChNames": ["DAPI"],
     "PixelSize_um": 0.5
@@ -1111,6 +1175,23 @@ mod tests {
         assert_eq!(pos.temperature, Some(-20.0));
         assert_eq!(pos.camera_mode.as_deref(), Some("EMCCD"));
         assert_eq!(pos.voltage, vec![1.5]);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn tiff_entry_point_resolves_sibling_metadata_like_java() {
+        let meta_path = write_dataset();
+        let dir = meta_path.parent().unwrap().to_path_buf();
+        let tiff_path = dir.join("img_0.tif");
+
+        let probe = MicromanagerReader::new();
+        assert!(probe.is_this_type_by_name(&tiff_path));
+
+        let mut reader = MicromanagerReader::new();
+        reader.set_id(&tiff_path).unwrap();
+        assert_eq!(reader.metadata().image_count, 2);
+        assert_eq!(reader.open_bytes(1).unwrap().len(), 64);
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -1264,6 +1345,22 @@ mod tests {
 
         std::fs::write(&path, r#"{"Summary":{"Source":"Micro-Manager","Width":1}}"#).unwrap();
         assert!(reader.is_this_type_by_name(&path));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn acqusition_xml_entry_resolves_sibling_metadata_like_java() {
+        let metadata = write_dataset();
+        let dir = metadata.parent().unwrap().to_path_buf();
+        let xml = dir.join("Acqusition.xml");
+        std::fs::write(&xml, "<root>Micro-Manager</root>").unwrap();
+
+        let mut reader = MicromanagerReader::new();
+        assert!(reader.is_this_type_by_name(&xml));
+        reader.set_id(&xml).unwrap();
+        assert_eq!(reader.metadata().size_x, 8);
+        assert_eq!(reader.open_bytes(0).unwrap()[0], 0);
 
         let _ = std::fs::remove_dir_all(dir);
     }

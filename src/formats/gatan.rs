@@ -1145,6 +1145,8 @@ pub struct GatanReader {
     /// `shapes` — annotation ROIs parsed from the DM tag tree
     /// (GatanReader.java:113), emitted as OME ROIs in `ome_metadata`.
     shapes: Vec<RoiShape>,
+    current_series: usize,
+    montage_series_count: usize,
 }
 
 impl GatanReader {
@@ -1174,6 +1176,8 @@ impl GatanReader {
             stage_z: Vec::new(),
             acquisition_mode: None,
             shapes: Vec::new(),
+            current_series: 0,
+            montage_series_count: 1,
         }
     }
 }
@@ -1262,6 +1266,9 @@ impl FormatReader for GatanReader {
         }
 
         let version = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
+        if version != 3 && version != 4 {
+            return Err(BioFormatsError::Format("invalid header".into()));
+        }
         let dm4 = version == 4;
 
         // Byte order field: Java does `m.littleEndian = in.readInt() != 1`.
@@ -1416,7 +1423,7 @@ impl FormatReader for GatanReader {
             meta_map.insert("Specimen position".into(), MetadataValue::Float(v));
         }
 
-        let meta = ImageMetadata {
+        let mut meta = ImageMetadata {
             size_x: img.width,
             size_y: img.height,
             size_z: image_count,
@@ -1441,6 +1448,17 @@ impl FormatReader for GatanReader {
             modulo_c: None,
             modulo_t: None,
         };
+
+        let mut montage_series_count = 1usize;
+        if found_montage && stage_x.len() > 1 && meta.size_z > 1 {
+            montage_series_count = stage_x.len();
+            meta.size_z /= montage_series_count as u32;
+            meta.image_count = meta
+                .size_z
+                .checked_mul(meta.size_c)
+                .and_then(|n| n.checked_mul(meta.size_t))
+                .ok_or_else(|| BioFormatsError::Format("Gatan DM image count overflows".into()))?;
+        }
 
         let (psx, psy, psz) = select_physical_sizes(&pixel_sizes, img.height);
         let _ = units; // units only affect the OME unit, not the reported value
@@ -1469,6 +1487,8 @@ impl FormatReader for GatanReader {
         self.stage_z = stage_z;
         self.acquisition_mode = acquisition_mode_from_info(info.as_deref());
         self.shapes = shapes;
+        self.current_series = 0;
+        self.montage_series_count = montage_series_count;
         Ok(())
     }
 
@@ -1496,26 +1516,33 @@ impl FormatReader for GatanReader {
         self.stage_z.clear();
         self.acquisition_mode = None;
         self.shapes.clear();
+        self.current_series = 0;
+        self.montage_series_count = 1;
         Ok(())
     }
 
     fn series_count(&self) -> usize {
-        usize::from(self.meta.is_some())
+        if self.meta.is_some() {
+            self.montage_series_count
+        } else {
+            0
+        }
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
         if self.meta.is_none() {
             return Err(BioFormatsError::NotInitialized);
         }
-        if s != 0 {
+        if s >= self.montage_series_count {
             Err(BioFormatsError::SeriesOutOfRange(s))
         } else {
+            self.current_series = s;
             Ok(())
         }
     }
 
     fn series(&self) -> usize {
-        0
+        self.current_series
     }
 
     fn metadata(&self) -> &ImageMetadata {
@@ -1532,7 +1559,12 @@ impl FormatReader for GatanReader {
         let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         let bps = meta.pixel_type.bytes_per_sample();
         let plane_bytes = (meta.size_x * meta.size_y) as usize * bps;
-        let start = plane_index as usize * plane_bytes;
+        let absolute_plane = self
+            .current_series
+            .checked_mul(meta.image_count as usize)
+            .and_then(|base| base.checked_add(plane_index as usize))
+            .ok_or_else(|| BioFormatsError::Format("Gatan plane offset overflows".into()))?;
+        let start = absolute_plane * plane_bytes;
         let end = start + plane_bytes;
         if end as u64 > self.pixel_data_len {
             return Err(BioFormatsError::InvalidData(
@@ -1577,7 +1609,12 @@ impl FormatReader for GatanReader {
         let plane_bytes = src_row_bytes
             .checked_mul(meta.size_y as usize)
             .ok_or_else(|| BioFormatsError::Format("Gatan plane byte count overflows".into()))?;
-        let plane_start = (plane_index as usize)
+        let absolute_plane = self
+            .current_series
+            .checked_mul(meta.image_count as usize)
+            .and_then(|base| base.checked_add(plane_index as usize))
+            .ok_or_else(|| BioFormatsError::Format("Gatan plane offset overflows".into()))?;
+        let plane_start = absolute_plane
             .checked_mul(plane_bytes)
             .ok_or_else(|| BioFormatsError::Format("Gatan plane offset overflows".into()))?;
         if plane_start as u64 + plane_bytes as u64 > self.pixel_data_len {
@@ -1641,10 +1678,15 @@ impl FormatReader for GatanReader {
 
         let img = ome.images.get_mut(0)?;
 
-        // Image name: GatanReader only sets an explicit name ("Tile #N") for
-        // multi-series montages; for a single image it falls back to the file's
-        // base name (with extension), e.g. "clem_fig3b.dm3".
-        if let Some(path) = &self.path {
+        // Image name: GatanReader sets "Tile #N" for split montage series.
+        if self.found_montage && self.montage_series_count > 1 {
+            let digits = (self.montage_series_count + 1).to_string().len();
+            img.name = Some(format!(
+                "Tile #{:0width$}",
+                self.current_series + 1,
+                width = digits
+            ));
+        } else if let Some(path) = &self.path {
             img.name = path
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -1675,14 +1717,12 @@ impl FormatReader for GatanReader {
         }
 
         // Plane positions and exposure time. Java sets montage stage positions
-        // per series when found (GatanReader.java:380-389); with one series we
-        // use the first montage tile if present, else the single posX/Y/Z. Every
-        // plane gets the "Sample Time" exposure (GatanReader.java:391-393).
+        // per series when found (GatanReader.java:380-389).
         let (px, py, pz) = if self.found_montage && !self.stage_x.is_empty() {
             (
-                self.stage_x.first().copied(),
-                self.stage_y.first().copied(),
-                self.stage_z.first().copied(),
+                self.stage_x.get(self.current_series).copied(),
+                self.stage_y.get(self.current_series).copied(),
+                self.stage_z.get(self.current_series).copied(),
             )
         } else {
             (self.pos_x, self.pos_y, self.pos_z)
@@ -2267,12 +2307,103 @@ impl FormatReader for GatanDm2Reader {
 mod tests {
     use super::*;
     use crate::common::reader::FormatReader;
+    use std::collections::HashMap;
     use std::path::PathBuf;
 
     fn testdata(rel: &str) -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("testdata")
             .join(rel)
+    }
+
+    #[test]
+    fn set_id_rejects_non_dm3_dm4_version_like_java() {
+        let path = std::env::temp_dir().join(format!(
+            "bioformats_gatan_bad_version_{}.dm3",
+            std::process::id()
+        ));
+        let mut bytes = vec![0u8; 16];
+        bytes[3] = 2; // big-endian int32 version = 2
+        std::fs::write(&path, bytes).unwrap();
+
+        let mut reader = GatanReader::new();
+        let err = reader.set_id(&path).unwrap_err();
+
+        assert!(err.to_string().contains("invalid header"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn split_montage_series_reads_absolute_plane_like_java() {
+        let path = std::env::temp_dir().join(format!(
+            "bioformats_gatan_split_montage_{}.dm4",
+            std::process::id()
+        ));
+        std::fs::write(&path, [1, 2, 3, 4]).unwrap();
+
+        let mut reader = GatanReader {
+            path: Some(path.clone()),
+            meta: Some(ImageMetadata {
+                size_x: 1,
+                size_y: 1,
+                size_z: 2,
+                size_c: 1,
+                size_t: 1,
+                pixel_type: PixelType::Uint8,
+                bits_per_pixel: 8,
+                image_count: 2,
+                dimension_order: DimensionOrder::XYZTC,
+                is_rgb: false,
+                is_interleaved: false,
+                is_indexed: false,
+                is_little_endian: true,
+                resolution_count: 1,
+                thumbnail: false,
+                series_metadata: HashMap::new(),
+                lookup_table: None,
+                modulo_z: None,
+                modulo_c: None,
+                modulo_t: None,
+            }),
+            pixel_data_offset: 0,
+            pixel_data_len: 4,
+            dm_data_type: 6,
+            physical_size_x: None,
+            physical_size_y: None,
+            physical_size_z: None,
+            version: 4,
+            mag: None,
+            voltage: None,
+            gamma: None,
+            timestamp: None,
+            signed: false,
+            sample_time: Some(0.25),
+            pos_x: None,
+            pos_y: None,
+            pos_z: None,
+            found_montage: true,
+            stage_x: vec![10.0, 20.0],
+            stage_y: vec![11.0, 21.0],
+            stage_z: vec![12.0, 22.0],
+            acquisition_mode: None,
+            shapes: Vec::new(),
+            current_series: 0,
+            montage_series_count: 2,
+        };
+
+        assert_eq!(reader.series_count(), 2);
+        assert_eq!(reader.open_bytes(1).unwrap(), vec![2]);
+        reader.set_series(1).unwrap();
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![3]);
+
+        let ome = reader.ome_metadata().unwrap();
+        assert_eq!(ome.images[0].name.as_deref(), Some("Tile #2"));
+        let plane = ome.images[0].planes.first().unwrap();
+        assert_eq!(plane.position_x, Some(20.0));
+        assert_eq!(plane.position_y, Some(21.0));
+        assert_eq!(plane.position_z, Some(22.0));
+
+        let _ = std::fs::remove_file(path);
     }
 
     // Pure-logic port of GatanReader's "Microscope Info" → acquisition mode

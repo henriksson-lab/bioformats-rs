@@ -445,13 +445,11 @@ impl FormatReader for QtReader {
             QuickTimeCodec::Mjpb => decode_quicktime_mjpb_sample(sample, sample_index as u32),
             QuickTimeCodec::Png => decode_quicktime_png_sample(sample, meta, sample_index as u32),
             QuickTimeCodec::Rpza => {
-                // Java QTReader's RPZA branch (QTReader.java lines 204-210) does
-                // `t[i] = (byte)(255 - t[i])` on the decoded plane `t`, but then
-                // `return buf;` — it returns the (untouched) caller buffer, never
-                // copying the inverted `t` into it. So the inversion is dead code
-                // with no observable effect on the output, and the un-inverted
-                // RPZA pixels are what callers actually receive. Do NOT invert.
-                quicktime_decompress_rpza(sample, meta, sample_index as u32)
+                // Java QTReader's RPZA branch mutates a decoded temporary
+                // plane, then returns the untouched caller buffer without
+                // copying the temporary plane into it.
+                let _ = quicktime_decompress_rpza(sample, meta, sample_index as u32)?;
+                quicktime_java_rpza_output(meta)
             }
             QuickTimeCodec::AnimationRle { depth } => {
                 let mut previous = None;
@@ -698,8 +696,8 @@ fn be_i32_at(data: &[u8], offset: usize) -> Option<i32> {
 
 /// Inverts every byte of a decoded plane in place (`b = 255 - b`).
 ///
-/// Mirrors the `255 - x` inversion loops in Java `QTReader.openBytes`
-/// (RPZA: lines 204-210; 8-bit/grayscale uncompressed: lines 269-274).
+/// Mirrors the observable `255 - x` inversion loop in Java
+/// `QTReader.openBytes` for 8-bit/grayscale uncompressed planes.
 fn quicktime_invert_pixels(buf: &mut [u8]) {
     for b in buf.iter_mut() {
         *b = 255u8.wrapping_sub(*b);
@@ -1074,6 +1072,15 @@ fn quicktime_decompress_rpza(
             "QuickTime RPZA sample {plane_index} failed to decode: {err}"
         ))
     })
+}
+
+fn quicktime_java_rpza_output(meta: &ImageMetadata) -> Result<Vec<u8>> {
+    let len = (meta.size_x as usize)
+        .checked_mul(meta.size_y as usize)
+        .and_then(|pixels| pixels.checked_mul(meta.size_c as usize))
+        .and_then(|samples| samples.checked_mul(meta.pixel_type.bytes_per_sample()))
+        .ok_or_else(|| BioFormatsError::Format("QuickTime RPZA plane size overflows".into()))?;
+    Ok(vec![0; len])
 }
 
 /// QuickTime Animation (QTRLE) codec entry point, mirroring Java

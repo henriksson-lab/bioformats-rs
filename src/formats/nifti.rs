@@ -20,8 +20,7 @@ use crate::common::region::crop_full_plane;
 //
 // Mirrors NiftiReader.populatePixelType. Datatype 128 (RGB24) falls through to
 // case 256 in Java, so Bio-Formats reports INT8 with sizeC=3. Datatype 2304
-// also falls through to the Java default and throws, but Rust keeps RGBA32 as an
-// allowed extension because extra supported cases are acceptable here.
+// also falls through to the Java default and throws.
 fn nifti_pixel_type(datatype: i16) -> Result<(PixelType, Option<u32>)> {
     Ok(match datatype {
         1 | 2 => (PixelType::Uint8, None),
@@ -33,7 +32,6 @@ fn nifti_pixel_type(datatype: i16) -> Result<(PixelType, Option<u32>)> {
         256 => (PixelType::Int8, None),
         512 => (PixelType::Uint16, None),
         768 => (PixelType::Uint32, None),
-        2304 => (PixelType::Uint8, Some(4)),
         other => {
             return Err(BioFormatsError::UnsupportedFormat(format!(
                 "Unsupported NIfTI data type: {}",
@@ -700,6 +698,22 @@ mod tests {
         assert_eq!(meta.size_c, 3);
         assert!(meta.is_rgb);
         assert!(meta.is_interleaved);
+    }
+
+    #[test]
+    fn rgba32_datatype_is_unsupported_like_java_fallthrough() {
+        let mut buf = synthetic_header(0);
+        // Java NiftiReader case 2304 sets UINT8/sizeC=4 but has no break, so it
+        // falls through to default and throws.
+        buf[70..72].copy_from_slice(&2304i16.to_le_bytes());
+        buf[72..74].copy_from_slice(&32i16.to_le_bytes());
+
+        let hdr = parse_header(&buf).unwrap();
+        let err = build_metadata(&hdr).unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("Unsupported NIfTI data type: 2304"));
     }
 
     fn tmp_path(name: &str) -> PathBuf {

@@ -7,7 +7,8 @@
 //! starts with the archive's base name, else the first entry), and that entry
 //! is delegated to the auto-detecting image reader.
 
-use std::io::Read;
+use std::collections::HashMap;
+use std::io::{ErrorKind, Read, Seek};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -15,6 +16,11 @@ use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::ImageMetadata;
 use crate::common::reader::FormatReader;
 use crate::registry::ImageReader;
+
+struct ZipEntryInfo {
+    index: usize,
+    header_start: u64,
+}
 
 pub struct ZipReader {
     /// Directory holding the extracted entries; removed on close.
@@ -47,8 +53,10 @@ impl ZipReader {
         for component in Path::new(name).components() {
             match component {
                 std::path::Component::Normal(part) => rel.push(part),
-                std::path::Component::CurDir => {}
-                _ => return None,
+                std::path::Component::CurDir
+                | std::path::Component::RootDir
+                | std::path::Component::ParentDir => {}
+                _ => {}
             }
         }
         (!rel.as_os_str().is_empty()).then_some(rel)
@@ -56,6 +64,56 @@ impl ZipReader {
 
     fn primary_name_matches_base(name: &str, base: &str) -> bool {
         !base.is_empty() && name.starts_with(base)
+    }
+
+    fn extract_entry(
+        entry_index: usize,
+        entry: &mut zip::read::ZipFile<'_>,
+        dir: &Path,
+        inner_base: &str,
+        extracted_files: &mut Vec<PathBuf>,
+        extracted_by_name: &mut HashMap<String, PathBuf>,
+        occupied_paths: &mut HashMap<PathBuf, String>,
+        first_entry: &mut Option<String>,
+        primary_entry: &mut Option<String>,
+    ) -> Result<()> {
+        let name = entry.name().to_string();
+        if first_entry.is_none() {
+            *first_entry = Some(name.clone());
+        }
+        if primary_entry.is_none() && Self::primary_name_matches_base(&name, inner_base) {
+            *primary_entry = Some(name.clone());
+        }
+        if entry.is_dir() {
+            return Ok(());
+        }
+        let rel_path = match Self::safe_entry_path(&name) {
+            Some(path) => path,
+            None => return Ok(()),
+        };
+        let mut out_path = dir.join(&rel_path);
+        if occupied_paths
+            .get(&out_path)
+            .is_some_and(|existing_name| existing_name != &name)
+        {
+            out_path = dir
+                .join(format!("__bioformats_zip_entry_{}", entry_index))
+                .join(&rel_path);
+        }
+        occupied_paths
+            .entry(out_path.clone())
+            .or_insert_with(|| name.clone());
+        if let Some(parent) = out_path.parent() {
+            std::fs::create_dir_all(parent).map_err(BioFormatsError::Io)?;
+        }
+
+        let mut buf = Vec::new();
+        entry.read_to_end(&mut buf).map_err(BioFormatsError::Io)?;
+        std::fs::write(&out_path, &buf).map_err(BioFormatsError::Io)?;
+
+        extracted_by_name.insert(name, out_path.clone());
+        extracted_files.push(out_path);
+        Ok(())
     }
 }
 
@@ -80,10 +138,6 @@ impl FormatReader for ZipReader {
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.close()?;
-        let file = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
-        let mut archive = zip::ZipArchive::new(file)
-            .map_err(|e| BioFormatsError::Format(format!("ZIP open error: {e}")))?;
-
         // Per the Java ZipReader, the preferred ("primary") entry is the first
         // entry whose name starts with the archive's base name (file name minus
         // the ".zip" suffix).
@@ -113,45 +167,95 @@ impl FormatReader for ZipReader {
         std::fs::create_dir_all(&dir).map_err(BioFormatsError::Io)?;
 
         let mut extracted_files: Vec<PathBuf> = Vec::new();
-        let mut first_entry: Option<PathBuf> = None;
-        let mut primary_entry: Option<PathBuf> = None;
+        let mut extracted_by_name: HashMap<String, PathBuf> = HashMap::new();
+        let mut occupied_paths: HashMap<PathBuf, String> = HashMap::new();
+        let mut first_entry: Option<String> = None;
+        let mut primary_entry: Option<String> = None;
 
-        for i in 0..archive.len() {
-            let mut entry = archive
-                .by_index(i)
-                .map_err(|e| BioFormatsError::Format(format!("ZIP entry error: {e}")))?;
-            if entry.is_dir() {
-                continue;
-            }
-            let name = entry.name().to_string();
-            let rel_path = match Self::safe_entry_path(&name) {
-                Some(path) => path,
-                None => continue,
-            };
-            let out_path = dir.join(rel_path);
-            if let Some(parent) = out_path.parent() {
-                std::fs::create_dir_all(parent).map_err(BioFormatsError::Io)?;
-            }
+        let file = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
+        match zip::ZipArchive::new(file) {
+            Ok(mut archive) => {
+                let mut entries = Vec::with_capacity(archive.len());
+                for i in 0..archive.len() {
+                    let entry = archive
+                        .by_index(i)
+                        .map_err(|e| BioFormatsError::Format(format!("ZIP entry error: {e}")))?;
+                    entries.push(ZipEntryInfo {
+                        index: i,
+                        header_start: entry.header_start(),
+                    });
+                }
+                entries.sort_by_key(|entry| entry.header_start);
 
-            let mut buf = Vec::new();
-            entry.read_to_end(&mut buf).map_err(BioFormatsError::Io)?;
-            std::fs::write(&out_path, &buf).map_err(BioFormatsError::Io)?;
+                for (entry_index, info) in entries.into_iter().enumerate() {
+                    let mut entry = archive
+                        .by_index(info.index)
+                        .map_err(|e| BioFormatsError::Format(format!("ZIP entry error: {e}")))?;
+                    Self::extract_entry(
+                        entry_index,
+                        &mut entry,
+                        &dir,
+                        &inner_base,
+                        &mut extracted_files,
+                        &mut extracted_by_name,
+                        &mut occupied_paths,
+                        &mut first_entry,
+                        &mut primary_entry,
+                    )?;
+                }
+            }
+            Err(_) => {
+                let mut archive = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
+                let archive_len = archive.metadata().map_err(BioFormatsError::Io)?.len();
+                let mut entry_index = 0usize;
 
-            if first_entry.is_none() {
-                first_entry = Some(out_path.clone());
+                loop {
+                    let entry_start = archive.stream_position().map_err(BioFormatsError::Io)?;
+                    let mut entry = match zip::read::read_zipfile_from_stream(&mut archive) {
+                        Ok(Some(entry)) => entry,
+                        Ok(None) => break,
+                        Err(zip::result::ZipError::Io(err))
+                            if err.kind() == ErrorKind::UnexpectedEof
+                                && first_entry.is_some()
+                                && entry_start == archive_len =>
+                        {
+                            break;
+                        }
+                        Err(e) => {
+                            return Err(BioFormatsError::Format(format!("ZIP entry error: {e}")));
+                        }
+                    };
+                    Self::extract_entry(
+                        entry_index,
+                        &mut entry,
+                        &dir,
+                        &inner_base,
+                        &mut extracted_files,
+                        &mut extracted_by_name,
+                        &mut occupied_paths,
+                        &mut first_entry,
+                        &mut primary_entry,
+                    )?;
+                    entry_index += 1;
+                }
             }
-            if primary_entry.is_none() && Self::primary_name_matches_base(&name, &inner_base) {
-                primary_entry = Some(out_path.clone());
-            }
-            extracted_files.push(out_path);
         }
 
-        let primary = match primary_entry.or(first_entry) {
+        let primary_name = match primary_entry.or(first_entry) {
             Some(primary) => primary,
             None => {
                 let _ = std::fs::remove_dir_all(&dir);
                 return Err(BioFormatsError::UnsupportedFormat(
                     "Zip file does not contain any valid files".to_string(),
+                ));
+            }
+        };
+        let primary = match extracted_by_name.get(&primary_name).cloned() {
+            Some(primary) => primary,
+            None => {
+                let _ = std::fs::remove_dir_all(&dir);
+                return Err(BioFormatsError::UnsupportedFormat(
+                    "Zip primary entry is not a recognized image".to_string(),
                 ));
             }
         };

@@ -892,6 +892,74 @@ impl Default for TcsReader {
     }
 }
 
+fn same_existing_path(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
+}
+
+fn find_tcs_xml_sibling_for_tiff(path: &Path) -> Option<PathBuf> {
+    let parent = path.parent()?;
+    let entries = std::fs::read_dir(parent).ok()?;
+    let mut xml_files: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.eq_ignore_ascii_case("xml"))
+                .unwrap_or(false)
+        })
+        .collect();
+    xml_files.sort();
+
+    for xml in xml_files {
+        let Ok((_, tiffs)) = parse_leica_xml(&xml) else {
+            continue;
+        };
+        if tiffs
+            .iter()
+            .any(|candidate| same_existing_path(candidate, path))
+        {
+            return Some(xml);
+        }
+    }
+    None
+}
+
+pub(crate) fn tcs_xml_sibling_references_tiff(path: &Path) -> bool {
+    find_tcs_xml_sibling_for_tiff(path).is_some()
+}
+
+fn tiff_first_ifd_text_tag(path: &Path, tag: u16) -> Option<String> {
+    let Ok(file) = std::fs::File::open(path) else {
+        return None;
+    };
+    let mut parser = crate::tiff::parser::TiffParser::new(file).ok()?;
+    let (ifd, _) = parser.read_ifd(parser.first_ifd_offset).ok()?;
+    ifd.get(tag).and_then(|v| v.as_str()).map(|s| s.to_string())
+}
+
+pub(crate) fn is_tcs_tagged_tiff(path: &Path) -> bool {
+    tiff_first_ifd_text_tag(path, 269)
+        .map(|document| document.starts_with("CHANNEL"))
+        .unwrap_or(false)
+        || tiff_first_ifd_text_tag(path, crate::tiff::ifd::tag::SOFTWARE)
+            .map(|software| software.trim().starts_with("TCS"))
+            .unwrap_or(false)
+}
+
+fn load_single_tcs_tiff(path: &Path) -> Result<ImageMetadata> {
+    let mut tiff = TiffReader::new();
+    tiff.set_id(path)?;
+    let mut meta = tiff.metadata().clone();
+    meta.series_metadata.insert(
+        "format".into(),
+        MetadataValue::String("Leica TCS TIFF".into()),
+    );
+    Ok(meta)
+}
+
 fn parse_leica_xml(path: &Path) -> Result<(ImageMetadata, Vec<PathBuf>)> {
     let content = std::fs::read_to_string(path).map_err(BioFormatsError::Io)?;
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
@@ -1090,6 +1158,12 @@ fn parse_leica_xml(path: &Path) -> Result<(ImageMetadata, Vec<PathBuf>)> {
         DimensionOrder::XYCTZ
     };
 
+    let mut series_metadata = HashMap::new();
+    series_metadata.insert(
+        "format".into(),
+        MetadataValue::String("Leica TCS TIFF".into()),
+    );
+
     let meta = ImageMetadata {
         size_x: width,
         size_y: height,
@@ -1106,7 +1180,7 @@ fn parse_leica_xml(path: &Path) -> Result<(ImageMetadata, Vec<PathBuf>)> {
         is_little_endian: true,
         resolution_count: 1,
         thumbnail: false,
-        series_metadata: HashMap::new(),
+        series_metadata,
         lookup_table: None,
         modulo_z: None,
         modulo_c: None,
@@ -1118,10 +1192,19 @@ fn parse_leica_xml(path: &Path) -> Result<(ImageMetadata, Vec<PathBuf>)> {
 
 impl FormatReader for TcsReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
-        path.extension()
+        let is_xml = path
+            .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.eq_ignore_ascii_case("xml"))
+            .unwrap_or(false);
+        if is_xml {
+            return true;
+        }
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("tif") || e.eq_ignore_ascii_case("tiff"))
             .unwrap_or(false)
+            && (tcs_xml_sibling_references_tiff(path) || is_tcs_tagged_tiff(path))
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
@@ -1131,6 +1214,27 @@ impl FormatReader for TcsReader {
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.close()?;
+        if path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("tif") || e.eq_ignore_ascii_case("tiff"))
+            .unwrap_or(false)
+        {
+            if let Some(xml) = find_tcs_xml_sibling_for_tiff(path) {
+                let (meta, tiff_files) = parse_leica_xml(&xml)?;
+                self.path = Some(xml);
+                self.meta = Some(meta);
+                self.tiff_files = tiff_files;
+                return Ok(());
+            }
+            if is_tcs_tagged_tiff(path) {
+                let meta = load_single_tcs_tiff(path)?;
+                self.path = Some(path.to_path_buf());
+                self.meta = Some(meta);
+                self.tiff_files = vec![path.to_path_buf()];
+                return Ok(());
+            }
+        }
         let content_prefix = {
             let mut f = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
             let mut buf = vec![0u8; 256];

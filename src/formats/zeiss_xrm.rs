@@ -16,6 +16,7 @@ use crate::common::reader::FormatReader;
 use crate::common::region::crop_full_plane;
 
 const IMAGE_DATA: &str = "/ImageData/";
+const OLE2_MAGIC: &[u8; 8] = &[0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1];
 
 pub struct ZeissXrmReader {
     path: Option<PathBuf>,
@@ -48,8 +49,10 @@ impl FormatReader for ZeissXrmReader {
         matches!(ext.as_deref(), Some("xrm") | Some("txrm") | Some("txm"))
     }
 
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
-        false
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        // Java ZeissXRMReader.isThisType(RandomAccessInputStream) checks only
+        // the POI/OLE2 compound-file magic.
+        header.starts_with(OLE2_MAGIC)
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
@@ -456,6 +459,16 @@ mod tests {
 
     fn write_i32_stream(comp: &mut cfb::CompoundFile<std::fs::File>, path: &str, value: i32) {
         write_stream(comp, path, &value.to_le_bytes());
+    }
+
+    #[test]
+    fn xrm_byte_detection_matches_java_ole2_magic() {
+        let reader = ZeissXrmReader::new();
+        assert!(reader.is_this_type_by_bytes(OLE2_MAGIC));
+        assert!(reader
+            .is_this_type_by_bytes(&[0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1, 0, 1, 2, 3]));
+        assert!(!reader.is_this_type_by_bytes(&OLE2_MAGIC[..7]));
+        assert!(!reader.is_this_type_by_bytes(b"not a compound document"));
     }
 
     #[test]

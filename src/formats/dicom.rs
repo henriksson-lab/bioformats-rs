@@ -1737,7 +1737,9 @@ fn build_metadata(a: &DicomAttrs) -> Result<ImageMetadata> {
         image_count,
         dimension_order: DimensionOrder::XYCZT,
         is_rgb,
-        is_interleaved: true,
+        is_interleaved: !is_rgb
+            || (classify_transfer_syntax(&a.transfer_syntax) != EncapsulatedSyntax::Rle
+                && a.planar_configuration == 0),
         is_indexed: is_palette_color,
         is_little_endian: a.little_endian,
         resolution_count: 1,
@@ -2056,6 +2058,73 @@ fn planar_to_interleaved(buf: &[u8], meta: &ImageMetadata) -> Vec<u8> {
         }
     }
     out
+}
+
+fn interleaved_to_planar(buf: &[u8], meta: &ImageMetadata) -> Vec<u8> {
+    let samples = meta.size_c as usize;
+    let sample_bytes = meta.pixel_type.bytes_per_sample();
+    let pixels_per_plane = meta.size_x as usize * meta.size_y as usize;
+    let channel_stride = pixels_per_plane * sample_bytes;
+    let mut out = vec![0u8; buf.len()];
+
+    for pixel in 0..pixels_per_plane {
+        for channel in 0..samples {
+            let src = (pixel * samples + channel) * sample_bytes;
+            let dst = channel * channel_stride + pixel * sample_bytes;
+            out[dst..dst + sample_bytes].copy_from_slice(&buf[src..src + sample_bytes]);
+        }
+    }
+    out
+}
+
+fn crop_planar_full_plane(
+    format_name: &str,
+    full: &[u8],
+    meta: &ImageMetadata,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+) -> Result<Vec<u8>> {
+    crate::common::region::validate_region(format_name, meta.size_x, meta.size_y, x, y, w, h)?;
+
+    let bps = meta.pixel_type.bytes_per_sample();
+    let channels = meta.size_c as usize;
+    let row_bytes = (meta.size_x as usize)
+        .checked_mul(bps)
+        .ok_or_else(|| BioFormatsError::Format(format!("{format_name} row size overflows")))?;
+    let plane_bytes = row_bytes
+        .checked_mul(meta.size_y as usize)
+        .ok_or_else(|| BioFormatsError::Format(format!("{format_name} plane size overflows")))?;
+    let expected_len = plane_bytes
+        .checked_mul(channels)
+        .ok_or_else(|| BioFormatsError::Format(format!("{format_name} buffer size overflows")))?;
+    if full.len() < expected_len {
+        return Err(BioFormatsError::InvalidData(format!(
+            "{format_name} plane buffer is too short: got {}, expected at least {expected_len}",
+            full.len()
+        )));
+    }
+
+    let out_row = (w as usize).checked_mul(bps).ok_or_else(|| {
+        BioFormatsError::Format(format!("{format_name} output row size overflows"))
+    })?;
+    let mut out = vec![0u8; channels * h as usize * out_row];
+    let start_x = (x as usize).checked_mul(bps).ok_or_else(|| {
+        BioFormatsError::Format(format!("{format_name} region x offset overflows"))
+    })?;
+    let out_plane_bytes = h as usize * out_row;
+
+    for channel in 0..channels {
+        let channel_src = channel * plane_bytes;
+        let channel_dst = channel * out_plane_bytes;
+        for row in 0..h as usize {
+            let src = channel_src + (y as usize + row) * row_bytes + start_x;
+            let dst = channel_dst + row * out_row;
+            out[dst..dst + out_row].copy_from_slice(&full[src..src + out_row]);
+        }
+    }
+    Ok(out)
 }
 
 /// Transfer-syntax classification mirroring DicomReader.java:
@@ -2498,7 +2567,7 @@ impl DicomReader {
             self.pixel_representation,
             &self.palette,
         );
-        if self.planar_configuration == 1 && tile_meta.size_c > 1 {
+        if self.planar_configuration == 1 && tile_meta.size_c > 1 && tile_meta.is_interleaved {
             tile = planar_to_interleaved(&tile, tile_meta);
         }
         if self.photometric_interpretation.trim() == "MONOCHROME1" {
@@ -2793,8 +2862,9 @@ impl FormatReader for DicomReader {
                         ec,
                         bpp,
                     )?;
-                    // RLE output is already interleaved (planar config 0);
-                    // run it through the native normalisation pipeline.
+                    // The RLE decoder reassembles native samples as interleaved
+                    // bytes; Java marks RLE core metadata as non-interleaved, so
+                    // convert RGB buffers back to planar after normalisation.
                     let mut buf = normalize_native_pixels(
                         &native,
                         meta,
@@ -2804,6 +2874,9 @@ impl FormatReader for DicomReader {
                         self.pixel_representation,
                         &self.palette,
                     );
+                    if meta.is_rgb && !meta.is_interleaved {
+                        buf = interleaved_to_planar(&buf, meta);
+                    }
                     if self.photometric_interpretation.trim() == "MONOCHROME1" {
                         invert_monochrome1(
                             &mut buf,
@@ -2841,7 +2914,7 @@ impl FormatReader for DicomReader {
             &self.palette,
         );
 
-        if self.planar_configuration == 1 && meta.size_c > 1 {
+        if self.planar_configuration == 1 && meta.size_c > 1 && meta.is_interleaved {
             buf = planar_to_interleaved(&buf, meta);
         }
         if self.photometric_interpretation.trim() == "MONOCHROME1" {
@@ -2866,6 +2939,9 @@ impl FormatReader for DicomReader {
     ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        if meta.is_rgb && !meta.is_interleaved {
+            return crop_planar_full_plane("DICOM", &full, meta, x, y, w, h);
+        }
         crop_full_plane("DICOM", &full, meta, meta.size_c as usize, x, y, w, h)
     }
 

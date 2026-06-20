@@ -685,6 +685,11 @@ fn generic_tiff_name_wrappers(path: &Path, header: &[u8]) -> Vec<Box<dyn FormatR
     if has_prairie_xml_sibling(path) {
         readers.push(boxed_reader(crate::formats::prairie::PrairieReader::new()));
     }
+    if crate::formats::prairie::tcs_xml_sibling_references_tiff(path)
+        || crate::formats::prairie::is_tcs_tagged_tiff(path)
+    {
+        readers.push(boxed_reader(crate::formats::prairie::TcsReader::new()));
+    }
     let lei = crate::formats::leica::LeicaReader::new();
     if has_lei_sibling(path) && lei.is_this_type_by_bytes(header) {
         readers.push(boxed_reader(lei));
@@ -1426,6 +1431,43 @@ mod tests {
         assert_eq!(reader.metadata().image_count, 2);
         assert_eq!(reader.open_bytes(0).unwrap(), vec![11]);
         assert_eq!(reader.open_bytes(1).unwrap(), vec![22]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn leica_tcs_companion_tiff_entry_dispatches_before_generic_tiff() {
+        let dir = temp_dir("leica_tcs_tiff_entry");
+        let tiff = dir.join("stack.tif");
+        let meta = ImageMetadata {
+            size_x: 1,
+            size_y: 1,
+            size_z: 1,
+            size_c: 1,
+            size_t: 1,
+            pixel_type: PixelType::Uint8,
+            bits_per_pixel: 8,
+            image_count: 1,
+            ..Default::default()
+        };
+        ImageWriter::save(&tiff, &meta, &[vec![33]]).unwrap();
+        std::fs::write(
+            dir.join("scan.xml"),
+            r#"<LEICA>
+<Image Width="1" Height="1"/>
+<DimensionDescription DimID="1" NumberOfElements="1" BytesInc="1"/>
+<DimensionDescription DimID="2" NumberOfElements="1"/>
+<Attachment Name="stack.tif"/>
+</LEICA>"#,
+        )
+        .unwrap();
+
+        let mut reader = ImageReader::open(&tiff).expect("Leica TCS TIFF entry should dispatch");
+
+        assert!(matches!(
+            reader.metadata().series_metadata.get("format"),
+            Some(MetadataValue::String(value)) if value == "Leica TCS TIFF"
+        ));
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![33]);
         let _ = std::fs::remove_dir_all(dir);
     }
 

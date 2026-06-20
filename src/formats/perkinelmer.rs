@@ -1554,23 +1554,6 @@ fn parse_photon_dynamics_header(path: &Path) -> Result<PhotonDynamicsParsed> {
             "Photon Dynamics PDS has invalid FILE REC LEN".into(),
         ));
     }
-    // Java PDSReader computes scanline padding as
-    // `recordWidth - (sizeX % recordWidth)` and passes that to readPlane.
-    let pad = record_width - (size_x as usize % record_width);
-    let row_pixels = size_x as usize + pad;
-    let required_len = (row_pixels as u64)
-        .checked_mul(size_y as u64)
-        .and_then(|n| n.checked_mul(meta.size_c as u64))
-        .and_then(|n| n.checked_mul(2))
-        .ok_or_else(|| BioFormatsError::Format("Photon Dynamics IMG size overflows".into()))?;
-    let actual_len = std::fs::metadata(&pixels_path)
-        .map_err(BioFormatsError::Io)?
-        .len();
-    if actual_len < required_len {
-        return Err(BioFormatsError::UnsupportedFormat(format!(
-            "Photon Dynamics IMG payload is shorter than declared image: got {actual_len} bytes, expected at least {required_len}"
-        )));
-    }
 
     Ok(PhotonDynamicsParsed {
         meta,
@@ -2020,7 +2003,7 @@ mod photon_dynamics_tests {
     }
 
     #[test]
-    fn photon_dynamics_rejects_missing_magic_and_short_img() {
+    fn photon_dynamics_rejects_missing_magic_and_defers_short_img() {
         let (hdr, img) = tmp_pair("photon_invalid");
         std::fs::write(&hdr, b"NXP = 3\nNYP = 2\n").unwrap();
         std::fs::write(&img, []).unwrap();
@@ -2031,14 +2014,16 @@ mod photon_dynamics_tests {
         ));
 
         write_header(&hdr, "+", "+", 3);
-        let err = PhotonDynamicsReader::new().set_id(&hdr).unwrap_err();
-        assert!(matches!(
-            err,
-            BioFormatsError::UnsupportedFormat(message) if message.contains("shorter")
-        ));
+        let mut reader = PhotonDynamicsReader::new();
+        reader.set_id(&hdr).unwrap();
+        assert!(reader.open_bytes(0).is_err());
+
+        let _ = std::fs::remove_file(&img);
+        let mut reader = PhotonDynamicsReader::new();
+        reader.set_id(&hdr).unwrap();
+        assert!(reader.open_bytes(0).is_err());
 
         let _ = std::fs::remove_file(hdr);
-        let _ = std::fs::remove_file(img);
     }
 
     #[test]

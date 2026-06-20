@@ -984,10 +984,8 @@ fn nd2_raster_mapping(
 
 /// Very lightweight XML value extractor — just grab the first occurrence of a tag.
 fn xml_value(xml: &str, tag: &str) -> Option<String> {
-    let open = format!("<{}", tag);
-    let pos = xml.find(&open)?;
+    let (pos, gt) = xml_find_start_tag(xml, tag, 0)?;
     let after_open = &xml[pos..];
-    let gt = after_open.find('>')?;
     let attrs = &after_open[..gt];
     if let Some(value) = xml_attr(attrs, "value") {
         return Some(value);
@@ -999,27 +997,60 @@ fn xml_value(xml: &str, tag: &str) -> Option<String> {
     Some(content_start[..end].trim().to_string())
 }
 
+fn xml_find_start_tag(xml: &str, tag: &str, mut cursor: usize) -> Option<(usize, usize)> {
+    let open = format!("<{tag}");
+    while let Some(relative_pos) = xml[cursor..].find(&open) {
+        let pos = cursor + relative_pos;
+        let name_end = pos + open.len();
+        let valid_boundary = xml[name_end..]
+            .chars()
+            .next()
+            .is_some_and(|c| c == '>' || c == '/' || c.is_whitespace());
+        if valid_boundary {
+            let gt = xml[pos..].find('>')?;
+            return Some((pos, gt));
+        }
+        cursor = name_end;
+    }
+    None
+}
+
 fn xml_attr(tag_text: &str, attr: &str) -> Option<String> {
-    let pattern = format!("{attr}=\"");
-    let pos = tag_text.find(&pattern)?;
-    let value_start = pos + pattern.len();
-    let rest = &tag_text[value_start..];
-    let value_end = rest.find('"')?;
-    Some(rest[..value_end].to_string())
+    let mut cursor = 0;
+    while cursor < tag_text.len() {
+        let tail = &tag_text[cursor..];
+        let Some(eq_rel) = tail.find('=') else {
+            break;
+        };
+        let eq = cursor + eq_rel;
+        let name_start = tag_text[..eq]
+            .rfind(|c: char| c.is_whitespace() || c == '<')
+            .map_or(0, |pos| pos + 1);
+        let name = tag_text[name_start..eq].trim();
+        let rest = tag_text[eq + 1..].trim_start();
+        let mut chars = rest.chars();
+        let quote = chars.next()?;
+        if quote != '"' && quote != '\'' {
+            cursor = eq + 1;
+            continue;
+        }
+        let value_start = eq + 1 + (tag_text[eq + 1..].len() - rest.len()) + quote.len_utf8();
+        let value_end = tag_text[value_start..].find(quote)?;
+        if name == attr {
+            return Some(tag_text[value_start..value_start + value_end].to_string());
+        }
+        cursor = value_start + value_end + quote.len_utf8();
+    }
+    None
 }
 
 fn xml_values(xml: &str, tag: &str) -> Vec<String> {
     let mut values = Vec::new();
-    let open = format!("<{}", tag);
     let close = format!("</{}>", tag);
     let mut cursor = 0;
 
-    while let Some(relative_pos) = xml[cursor..].find(&open) {
-        let pos = cursor + relative_pos;
+    while let Some((pos, gt)) = xml_find_start_tag(xml, tag, cursor) {
         let after_open = &xml[pos..];
-        let Some(gt) = after_open.find('>') else {
-            break;
-        };
         let attrs = &after_open[..gt];
         if let Some(value) = xml_attr(attrs, "value") {
             values.push(value);
@@ -1038,15 +1069,11 @@ fn xml_values(xml: &str, tag: &str) -> Vec<String> {
 /// Collect the `<item_N>` numeric children of the first `<tag>…</tag>` element,
 /// mirroring ND2Handler's `dPosX`/`dPosY`/`dPosZ` position-list parsing.
 fn nd2_xml_item_list_f64(xml: &str, tag: &str) -> Vec<f64> {
-    let open = format!("<{tag}");
     let close = format!("</{tag}>");
-    let Some(pos) = xml.find(&open) else {
+    let Some((pos, gt)) = xml_find_start_tag(xml, tag, 0) else {
         return Vec::new();
     };
     let after_open = &xml[pos..];
-    let Some(gt) = after_open.find('>') else {
-        return Vec::new();
-    };
     if after_open[..gt].trim_end().ends_with('/') {
         return Vec::new();
     }
@@ -1255,12 +1282,8 @@ fn nd2_xml_plane_z_position(xml: &str) -> Option<f64> {
 
 fn nd2_xml_ui_count_for_runtype(xml: &str, runtype_suffix: &str) -> Option<u32> {
     let mut cursor = 0;
-    while let Some(relative_pos) = xml[cursor..].find("<uiCount") {
-        let pos = cursor + relative_pos;
+    while let Some((pos, gt)) = xml_find_start_tag(xml, "uiCount", cursor) {
         let after_open = &xml[pos..];
-        let Some(gt) = after_open.find('>') else {
-            break;
-        };
         let attrs = &after_open[..gt];
         if xml_attr(attrs, "runtype")
             .as_deref()
@@ -1370,9 +1393,8 @@ fn nd2_bpp_value(xml: &str) -> Option<u8> {
 }
 
 fn rect_sensor_extent(xml: &str) -> Option<(u32, u32)> {
-    let pos = xml.find("<rectSensorUser")?;
+    let (pos, gt) = xml_find_start_tag(xml, "rectSensorUser", 0)?;
     let after_open = &xml[pos..];
-    let gt = after_open.find('>')?;
     let content_start = &after_open[gt + 1..];
     let end = content_start.find("</rectSensorUser>")?;
     let rect = &content_start[..end];
@@ -1513,12 +1535,8 @@ fn old_nd2_metadata_text(f: &mut BufReader<File>) -> std::io::Result<String> {
 fn old_nd2_metadata_indexes(text: &str) -> Vec<u32> {
     let mut indexes = Vec::new();
     let mut cursor = 0;
-    while let Some(relative_pos) = text[cursor..].find("<MetadataSeq") {
-        let pos = cursor + relative_pos;
+    while let Some((pos, gt)) = xml_find_start_tag(text, "MetadataSeq", cursor) {
         let after_open = &text[pos..];
-        let Some(gt) = after_open.find('>') else {
-            break;
-        };
         if let Some(value) = xml_attr(&after_open[..gt], "_SEQUENCE_INDEX") {
             if let Ok(index) = value.parse::<u32>() {
                 if !indexes.contains(&index) {
@@ -4033,6 +4051,67 @@ mod tests {
         assert_eq!(lv.pos_y, vec![10.0, 20.0]);
         assert_eq!(lv.pos_z, vec![1.0, 2.0]);
         assert_eq!(lv.position_count, 2);
+    }
+
+    #[test]
+    fn nd2_xml_accepts_single_quoted_attributes_like_sax() {
+        let xml = r#"<root>
+          <uiCount runtype='CLxTimeLoop' value='3'/>
+          <dCalibration value='0.25'/>
+          <dPosX><item_0 value='100.0'/><item_1 value='200.0'/></dPosX>
+        </root>"#;
+        let mut lv = Nd2LvValues::default();
+        parse_nd2_xml_metadata(xml, &mut lv);
+
+        assert_eq!(nd2_xml_ui_count_for_runtype(xml, "TimeLoop"), Some(3));
+        assert_eq!(lv.calibration, Some(0.25));
+        assert_eq!(lv.pos_x, vec![100.0, 200.0]);
+    }
+
+    #[test]
+    fn nd2_xml_attribute_names_match_exactly_like_sax() {
+        let xml = r#"<root>
+          <uiCount other_runtype='CLxTimeLoop' value='3'/>
+          <uiCount runtype='CLxTimeLoop' other_value='9'>4</uiCount>
+          <dCalibration other_value='0.5'>0.25</dCalibration>
+          <dPosX><item_0 other_value='100.0'>200.0</item_0></dPosX>
+        </root>"#;
+        let mut lv = Nd2LvValues::default();
+        parse_nd2_xml_metadata(xml, &mut lv);
+
+        assert_eq!(nd2_xml_ui_count_for_runtype(xml, "TimeLoop"), Some(4));
+        assert_eq!(lv.calibration, Some(0.25));
+        assert_eq!(lv.pos_x, vec![200.0]);
+    }
+
+    #[test]
+    fn nd2_xml_tag_names_match_exactly_like_sax() {
+        let xml = r#"<root>
+          <uiCountExtra runtype="CLxTimeLoop" value="3"/>
+          <uiCount runtype="CLxTimeLoop" value="4"/>
+          <dCalibrationExtra value="0.5"/>
+          <dCalibration value="0.25"/>
+          <dPosXExtra><item_0 value="100.0"/></dPosXExtra>
+          <dPosX><item_0 value="200.0"/></dPosX>
+        </root>"#;
+        let mut lv = Nd2LvValues::default();
+        parse_nd2_xml_metadata(xml, &mut lv);
+
+        assert_eq!(nd2_xml_ui_count_for_runtype(xml, "TimeLoop"), Some(4));
+        assert_eq!(lv.calibration, Some(0.25));
+        assert_eq!(lv.pos_x, vec![200.0]);
+    }
+
+    #[test]
+    fn nd2_xml_dimension_tags_do_not_match_prefix_names() {
+        let xml = r#"<root>
+          <uiWidthExtra value="99"/>
+          <uiHeightExtra value="88"/>
+          <uiCompExtra value="7"/>
+          <uiBpcExtra value="16"/>
+        </root>"#;
+
+        assert_eq!(parse_nd2_attributes(xml), (0, 0, 1, 1, 8));
     }
 
     #[test]

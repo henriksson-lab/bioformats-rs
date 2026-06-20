@@ -903,13 +903,16 @@ impl FormatReader for UnisokuReader {
         let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
             return false;
         };
-        if ext.eq_ignore_ascii_case("hdr") {
-            return resolve_unisoku_dat_path(path).exists();
-        }
-        if ext.eq_ignore_ascii_case("dat") {
-            return resolve_unisoku_header_path(path).exists();
-        }
-        false
+        let header_path = if ext.eq_ignore_ascii_case("hdr") {
+            path.to_path_buf()
+        } else if ext.eq_ignore_ascii_case("dat") {
+            resolve_unisoku_header_path(path)
+        } else {
+            return false;
+        };
+        std::fs::read(&header_path)
+            .map(|header| self.is_this_type_by_bytes(&header))
+            .unwrap_or(false)
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
