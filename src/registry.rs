@@ -388,6 +388,21 @@ pub(crate) fn open_reader(path: &Path) -> Result<Box<dyn FormatReader>> {
         }
     }
 
+    // Java CanonRawReader byte-detects legacy 300D CRW files solely by exact
+    // file length. `peek_header` cannot represent that full-stream predicate,
+    // so mirror it before extension/generic probing.
+    if path
+        .metadata()
+        .map(|m| crate::formats::camera2::CanonRawReader::is_legacy_file_length(m.len()))
+        .unwrap_or(false)
+    {
+        let mut r = boxed_reader(crate::formats::camera2::CanonRawReader::new());
+        match r.set_id(path) {
+            Ok(()) => return Ok(r),
+            Err(err) => remember_set_id_error(&mut best_error, err),
+        }
+    }
+
     // TIFF-based vendor wrappers often have no magic beyond TIFF itself.
     // Give non-generic TIFF extensions a chance before the broad TiffReader
     // byte signature accepts the file.
@@ -504,6 +519,14 @@ pub(crate) fn detect_reader_without_set_id(path: &Path) -> Result<Box<dyn Format
         ));
     }
 
+    if path
+        .metadata()
+        .map(|m| crate::formats::camera2::CanonRawReader::is_legacy_file_length(m.len()))
+        .unwrap_or(false)
+    {
+        return Ok(boxed_reader(crate::formats::camera2::CanonRawReader::new()));
+    }
+
     if is_tiff_header(&header) {
         let readers = tiff_wrapper_readers_for_extension(path, &header);
         if let Some(reader) = readers.into_iter().next() {
@@ -600,6 +623,8 @@ fn tiff_wrapper_readers_for_extension(path: &Path, header: &[u8]) -> Vec<Box<dyn
         Some("qptiff") => vec![boxed_reader(crate::formats::extended::VectraReader::new())],
         Some("gel") => vec![boxed_reader(crate::formats::extended::GelReader::new())],
         Some("flex") => vec![boxed_reader(crate::formats::flex::FlexReader::new())],
+        Some("fff") => vec![boxed_reader(crate::formats::camera2::ImaconReader::new())],
+        Some("pcoraw") => vec![boxed_reader(crate::formats::camera2::PcoRawReader::new())],
         Some("cr2") | Some("crw") | Some("cr3") => {
             vec![boxed_reader(crate::formats::camera2::CanonRawReader::new())]
         }
@@ -660,6 +685,11 @@ fn tiff_wrapper_readers_for_extension(path: &Path, header: &[u8]) -> Vec<Box<dyn
             if tiff_first_ifd_has_all_tags(path, &[33628, 33630, 33631]) {
                 readers.push(boxed_reader(
                     crate::formats::metamorph::MetamorphReader::new(),
+                ));
+            }
+            if tiff_first_ifd_has_all_tags(path, &[37724]) {
+                readers.push(boxed_reader(
+                    crate::formats::camera2::PhotoshopTiffReader::new(),
                 ));
             }
 
@@ -1240,6 +1270,82 @@ mod tests {
             reader.metadata().series_metadata.get("format"),
             Some(MetadataValue::String(value)) if value == "MetaMorph STK"
         ));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn pcoraw_dispatch_runs_before_generic_tiff_and_reads_rec_companion() {
+        let image = temp_path("pco_pair.pcoraw");
+        let rec = image.with_extension("rec");
+        write_minimal_tiff_with_description(&image, "PCO pixels");
+        std::fs::write(&rec, "Exposure / Delay: 50 ms\n").unwrap();
+
+        let reader = ImageReader::open(&image).expect("PCO-RAW dispatch failed");
+
+        assert!(matches!(
+            reader.metadata().series_metadata.get("Exposure / Delay"),
+            Some(MetadataValue::String(value)) if value == "50 ms"
+        ));
+        let _ = std::fs::remove_file(image);
+        let _ = std::fs::remove_file(rec);
+    }
+
+    #[test]
+    fn imacon_fff_dispatch_runs_before_generic_tiff() {
+        let path = temp_path("imacon.fff");
+        write_minimal_tiff_with_extra_tags(
+            &path,
+            &[
+                (
+                    34377,
+                    2,
+                    b"0\n1\n2\n3\nAda Lovelace\n5\nScan\n7\n20240102\n9\n030405+0000\0",
+                ),
+                (
+                    50457,
+                    2,
+                    b"prefix <root><key>Camera</key><value>Imacon 949</value></root>\0",
+                ),
+            ],
+        );
+
+        let reader = ImageReader::open(&path).expect("Imacon dispatch failed");
+
+        assert!(matches!(
+            reader.metadata().series_metadata.get("Camera"),
+            Some(MetadataValue::String(value)) if value == "Imacon 949"
+        ));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn photoshop_tiff_dispatch_runs_before_generic_tiff() {
+        let path = temp_path("photoshop_layers.tif");
+        write_minimal_tiff_with_extra_tags(&path, &[(37724, 7, b"8BPS\0")]);
+
+        let reader = ImageReader::open(&path).expect("Photoshop TIFF dispatch failed");
+
+        assert!(matches!(
+            reader.metadata().series_metadata.get("Photoshop layer count"),
+            Some(MetadataValue::Int(value)) if *value == 0
+        ));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn extensionless_fixed_length_canon_crw_dispatches_like_java_byte_probe() {
+        let path = temp_path("legacy_canon_raw");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(18_653_760).unwrap();
+        drop(file);
+
+        let reader = ImageReader::open(&path).expect("Canon RAW dispatch failed");
+
+        assert_eq!(reader.metadata().size_x, 4080);
+        assert_eq!(reader.metadata().size_y, 3048);
+        assert_eq!(reader.metadata().size_c, 3);
+        assert!(reader.metadata().is_rgb);
+        assert!(reader.metadata().is_interleaved);
         let _ = std::fs::remove_file(path);
     }
 
@@ -1845,6 +1951,52 @@ mod tests {
         }
         bytes.extend_from_slice(&0u32.to_le_bytes());
         bytes.extend_from_slice(&desc);
+        bytes.push(7);
+
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn write_minimal_tiff_with_extra_tags(path: &PathBuf, extras: &[(u16, u16, &[u8])]) {
+        let ifd_entry_count = 10u32 + extras.len() as u32;
+        let ifd_start = 8u32;
+        let mut next_offset = ifd_start + 2 + ifd_entry_count * 12 + 4;
+
+        let mut extra_entries = Vec::new();
+        let mut extra_data = Vec::new();
+        for &(tag, field_type, data) in extras {
+            extra_entries.push(tiff_entry(tag, field_type, data.len() as u32, next_offset));
+            extra_data.extend_from_slice(data);
+            next_offset += data.len() as u32;
+        }
+        let pixel_start = next_offset;
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"II");
+        bytes.extend_from_slice(&42u16.to_le_bytes());
+        bytes.extend_from_slice(&ifd_start.to_le_bytes());
+
+        let entries = [
+            tiff_entry(256, 4, 1, 1),           // ImageWidth
+            tiff_entry(257, 4, 1, 1),           // ImageLength
+            tiff_entry(258, 3, 1, 8),           // BitsPerSample
+            tiff_entry(259, 3, 1, 1),           // Compression
+            tiff_entry(262, 3, 1, 1),           // PhotometricInterpretation
+            tiff_entry(273, 4, 1, pixel_start), // StripOffsets
+            tiff_entry(277, 3, 1, 1),           // SamplesPerPixel
+            tiff_entry(278, 4, 1, 1),           // RowsPerStrip
+            tiff_entry(279, 4, 1, 1),           // StripByteCounts
+            tiff_entry(284, 3, 1, 1),           // PlanarConfiguration
+        ];
+
+        bytes.extend_from_slice(&(ifd_entry_count as u16).to_le_bytes());
+        for entry in entries {
+            bytes.extend_from_slice(&entry);
+        }
+        for entry in extra_entries {
+            bytes.extend_from_slice(&entry);
+        }
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&extra_data);
         bytes.push(7);
 
         std::fs::write(path, bytes).unwrap();

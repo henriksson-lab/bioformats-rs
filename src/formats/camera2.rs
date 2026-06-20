@@ -41,6 +41,18 @@ fn placeholder_meta_u16() -> ImageMetadata {
     }
 }
 
+fn tiff_header_contains_first_ifd_tag(header: &[u8], tag: u16) -> bool {
+    let cursor = std::io::Cursor::new(header);
+    let mut parser = match crate::tiff::parser::TiffParser::new(cursor) {
+        Ok(parser) => parser,
+        Err(_) => return false,
+    };
+    parser
+        .read_ifd(parser.first_ifd_offset)
+        .map(|(ifd, _)| ifd.get(tag).is_some())
+        .unwrap_or(false)
+}
+
 // ---------------------------------------------------------------------------
 // Shared RAW / Bayer-CFA pixel helpers
 //
@@ -1282,13 +1294,28 @@ impl Default for L2dReader {
 
 impl FormatReader for L2dReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
-        matches!(
-            path.extension()
-                .and_then(|e| e.to_str())
-                .map(|e| e.to_ascii_lowercase())
-                .as_deref(),
-            Some("l2d") | Some("scn")
-        )
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        if matches!(ext.as_deref(), Some("l2d") | Some("scn")) {
+            return true;
+        }
+        if !matches!(ext.as_deref(), Some("tif") | Some("tiff")) || !path.exists() {
+            return false;
+        }
+
+        let Some(parent) = path.parent() else {
+            return false;
+        };
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            return false;
+        };
+        let scan_name = stem
+            .rsplit_once('_')
+            .map(|(prefix, _)| prefix)
+            .unwrap_or(stem);
+        parent.join(format!("{scan_name}.scn")).exists() && parent.join(scan_name).exists()
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
@@ -1443,6 +1470,10 @@ impl CanonRawReader {
         }
     }
 
+    pub(crate) fn is_legacy_file_length(len: u64) -> bool {
+        len == Self::FILE_LENGTH
+    }
+
     /// Decode the legacy CRW interleaved RGB plane (port of initFile + the
     /// channel split in openBytes from `CanonRawReader.java`).
     fn decode_legacy_plane(path: &Path) -> Result<Vec<u8>> {
@@ -1525,15 +1556,15 @@ impl FormatReader for CanonRawReader {
         )
     }
 
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
-        false
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        Self::is_legacy_file_length(header.len() as u64)
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.close()?;
         // Legacy detection: exact fixed file length (CanonRawReader.java).
         let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-        if len == Self::FILE_LENGTH {
+        if Self::is_legacy_file_length(len) {
             let mut meta = placeholder_meta_u16();
             meta.size_x = Self::SIZE_X as u32;
             meta.size_y = Self::SIZE_Y as u32;
@@ -1743,9 +1774,8 @@ impl FormatReader for ImaconReader {
         )
     }
 
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
-        // Java requires the XML_TAG in the first IFD; bytes alone insufficient.
-        false
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        tiff_header_contains_first_ifd_tag(header, Self::XML_TAG)
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
@@ -2225,8 +2255,9 @@ impl IpwReader {
         drop(comp);
 
         let tmp = std::env::temp_dir().join(format!(
-            "bioformats_ipw_{}_{}.tif",
+            "bioformats_ipw_{}_{}_{}.tif",
             std::process::id(),
+            std::thread::current().name().unwrap_or("thread"),
             stream_path.replace(['/', '\\', ' '], "_")
         ));
         std::fs::write(&tmp, &data).map_err(BioFormatsError::Io)?;
@@ -2247,26 +2278,37 @@ impl Default for IpwReader {
     }
 }
 
-/// Parse the IPW `ImageInfo` description into (sizeC, sizeZ, sizeT).
-fn parse_ipw_image_info(text: &str) -> Result<(Option<u32>, Option<u32>, Option<u32>)> {
+/// Parse the IPW `ImageInfo` description into (sizeC, sizeZ, sizeT), adding
+/// the same per-line metadata keys as Java `IPWReader`.
+fn parse_ipw_image_info(
+    text: &str,
+    series_metadata: &mut HashMap<String, MetadataValue>,
+) -> Result<(Option<u32>, Option<u32>, Option<u32>)> {
     let (mut c, mut z, mut t) = (None, None, None);
     for line in text.split('\n') {
-        if let Some((label, data)) = line.split_once('=') {
-            let label = label.trim();
-            match label.trim() {
-                "channels" | "slices" | "frames" => {
-                    let value = data.trim().parse::<u32>().map_err(|_| {
-                        BioFormatsError::Format(format!("IPW: invalid {label} value"))
-                    })?;
-                    match label {
-                        "channels" => c = Some(value),
-                        "slices" => z = Some(value),
-                        "frames" => t = Some(value),
-                        _ => {}
-                    }
+        let token = line.trim();
+        if token.is_empty() {
+            continue;
+        }
+        let (label, data) = if let Some((label, data)) = token.split_once('=') {
+            (label.trim(), data.trim())
+        } else {
+            ("Timestamp", token)
+        };
+        series_metadata.insert(label.to_string(), MetadataValue::String(data.to_string()));
+        match label {
+            "channels" | "slices" | "frames" => {
+                let value = data
+                    .parse::<u32>()
+                    .map_err(|_| BioFormatsError::Format(format!("IPW: invalid {label} value")))?;
+                match label {
+                    "channels" => c = Some(value),
+                    "slices" => z = Some(value),
+                    "frames" => t = Some(value),
+                    _ => {}
                 }
-                _ => {}
             }
+            _ => {}
         }
     }
     Ok((c, z, t))
@@ -2352,7 +2394,7 @@ impl FormatReader for IpwReader {
                         "Image Description".into(),
                         MetadataValue::String(text.trim().to_string()),
                     );
-                    let (c, z, t) = parse_ipw_image_info(&text)?;
+                    let (c, z, t) = parse_ipw_image_info(&text, &mut series_metadata)?;
                     size_c = c;
                     size_z = z;
                     size_t = t;
@@ -2384,6 +2426,15 @@ impl FormatReader for IpwReader {
         if first_meta.is_rgb {
             size_c = size_c.saturating_mul(first_meta.size_c.max(1));
         }
+        series_metadata
+            .entry("slices".into())
+            .or_insert_with(|| MetadataValue::String("1".into()));
+        series_metadata
+            .entry("channels".into())
+            .or_insert_with(|| MetadataValue::String("1".into()));
+        series_metadata
+            .entry("frames".into())
+            .or_insert_with(|| MetadataValue::String(image_count.to_string()));
 
         let meta = ImageMetadata {
             size_x: first_meta.size_x,
@@ -2490,6 +2541,8 @@ impl FormatReader for IpwReader {
 ///
 /// Mirrors `PhotoshopTiffReader.IMAGE_SOURCE_DATA` (37724) in the Java reader.
 const PHOTOSHOP_IMAGE_SOURCE_DATA: u16 = 37724;
+const PHOTOSHOP_PACKBITS: i32 = 1;
+const PHOTOSHOP_ZIP: i32 = 3;
 
 /// Endianness-aware byte cursor over the `IMAGE_SOURCE_DATA` payload.
 ///
@@ -2607,6 +2660,11 @@ pub struct PhotoshopTiffReader {
     current_series: usize,
     /// Decoded, ASCII-cleaned layer names (Java `layerNames`, filtered).
     layer_names: Vec<String>,
+    source_data: Vec<u8>,
+    layer_offsets: Vec<usize>,
+    layer_data_sizes: Vec<usize>,
+    compression: Vec<i32>,
+    channel_order: Vec<Vec<usize>>,
 }
 
 impl PhotoshopTiffReader {
@@ -2616,6 +2674,11 @@ impl PhotoshopTiffReader {
             metas: Vec::new(),
             current_series: 0,
             layer_names: Vec::new(),
+            source_data: Vec::new(),
+            layer_offsets: Vec::new(),
+            layer_data_sizes: Vec::new(),
+            compression: Vec::new(),
+            channel_order: Vec::new(),
         }
     }
 
@@ -2639,6 +2702,11 @@ impl PhotoshopTiffReader {
     /// applying Java's name-acceptance filter. Accepted names become `layer_names`
     /// and `"Layer name"` global-metadata list entries.
     fn init_file(&mut self, source_data: &[u8]) {
+        self.source_data = source_data.to_vec();
+        self.layer_offsets.clear();
+        self.layer_data_sizes.clear();
+        self.compression.clear();
+        self.channel_order.clear();
         let little_endian = self.inner.is_little_endian();
         let mut tag = PsTag::new(source_data, little_endian);
 
@@ -2660,6 +2728,8 @@ impl PhotoshopTiffReader {
 
             if block_type == b"ryaL" {
                 let n_layers = (tag.read_short() as i32).unsigned_abs() as usize;
+                let mut accepted_channel_orders: Vec<Vec<usize>> = Vec::new();
+                let mut accepted_data_sizes: Vec<Vec<usize>> = Vec::new();
 
                 for layer in 0..n_layers {
                     let top = tag.read_int();
@@ -2683,9 +2753,19 @@ impl PhotoshopTiffReader {
                     }
 
                     let channel_count = layer_size_c.max(0) as usize;
+                    let mut layer_channel_order = vec![0usize; channel_count];
+                    let mut layer_data_sizes = vec![0usize; channel_count];
                     for _c in 0..channel_count {
-                        let _channel_id = tag.read_short();
-                        let _data_size = tag.read_int();
+                        let mut channel_id = tag.read_short();
+                        if channel_id < 0 {
+                            channel_id = (layer_size_c - 1) as i16;
+                        }
+                        let channel_index = usize::try_from(channel_id).unwrap_or(usize::MAX);
+                        let data_size = tag.read_int().max(0) as usize;
+                        if channel_index < layer_channel_order.len() {
+                            layer_channel_order[channel_index] = _c;
+                        }
+                        layer_data_sizes[_c] = data_size;
                     }
 
                     tag.skip_bytes(12);
@@ -2726,6 +2806,8 @@ impl PhotoshopTiffReader {
                         layer_meta.dimension_order = self.inner.metadata().dimension_order;
                         self.layer_names.push(layer_name);
                         layer_metas.push(layer_meta);
+                        accepted_channel_orders.push(layer_channel_order);
+                        accepted_data_sizes.push(layer_data_sizes);
                         series_count += 1;
                     }
 
@@ -2735,6 +2817,39 @@ impl PhotoshopTiffReader {
                         tag.skip_bytes(target - tag.fp());
                     } else {
                         tag.seek(target);
+                    }
+                }
+
+                let accepted_layers = layer_metas.len();
+                for layer in 0..accepted_layers {
+                    let size_c = layer_metas[layer].size_c as usize;
+                    self.compression.push(0);
+                    self.channel_order.push(
+                        accepted_channel_orders
+                            .get(layer)
+                            .cloned()
+                            .unwrap_or_default(),
+                    );
+                    for c in 0..size_c {
+                        let start_fp = tag.fp();
+                        let compression = tag.read_short() as i32;
+                        self.compression[layer] = compression;
+                        let mut offset = tag.fp();
+                        if compression == PHOTOSHOP_PACKBITS {
+                            let skip = if layer == 0 { 256 * 6 + 36 } else { 192 };
+                            tag.skip_bytes(skip);
+                            offset = tag.fp();
+                        }
+                        self.layer_offsets.push(offset);
+                        self.layer_data_sizes.push(
+                            accepted_data_sizes
+                                .get(layer)
+                                .and_then(|sizes| sizes.get(c))
+                                .copied()
+                                .unwrap_or(0),
+                        );
+                        let data_size = self.layer_data_sizes.last().copied().unwrap_or(0);
+                        tag.seek(start_fp.saturating_add(data_size));
                     }
                 }
             } else {
@@ -2772,6 +2887,78 @@ impl PhotoshopTiffReader {
         self.metas = metas;
         self.current_series = 0;
     }
+
+    fn layer_plane_bytes(&self, series: usize) -> Result<Vec<u8>> {
+        let meta = self
+            .metas
+            .get(series)
+            .ok_or(BioFormatsError::SeriesOutOfRange(series))?;
+        let layer = series - 1;
+        let size_c = meta.size_c.max(1) as usize;
+        let offset_index = self
+            .metas
+            .iter()
+            .skip(1)
+            .take(layer)
+            .map(|m| m.size_c.max(1) as usize)
+            .sum::<usize>();
+        let bps = meta.pixel_type.bytes_per_sample();
+        let channel_bytes = meta.size_x as usize * meta.size_y as usize * bps;
+        let plane_bytes = channel_bytes.checked_mul(size_c).ok_or_else(|| {
+            BioFormatsError::Format("Photoshop layer plane size overflows".into())
+        })?;
+
+        let compression = self.compression.get(layer).copied().unwrap_or(0);
+        if compression == PHOTOSHOP_ZIP || compression == PHOTOSHOP_PACKBITS {
+            let mut plane = Vec::with_capacity(plane_bytes);
+            for c in 0..size_c {
+                let index = self
+                    .channel_order
+                    .get(layer)
+                    .and_then(|order| order.get(c))
+                    .copied()
+                    .unwrap_or(c);
+                let entry = offset_index + index;
+                let start = self.layer_offsets.get(entry).copied().ok_or_else(|| {
+                    BioFormatsError::Format("Photoshop layer offset is missing".into())
+                })?;
+                let declared = self.layer_data_sizes.get(entry).copied().unwrap_or(0);
+                let raw_start = start.saturating_sub(2);
+                let end = raw_start
+                    .saturating_add(declared)
+                    .min(self.source_data.len());
+                let encoded = self.source_data.get(start..end).ok_or_else(|| {
+                    BioFormatsError::Format(
+                        "Photoshop layer compressed payload is truncated".into(),
+                    )
+                })?;
+                let mut decoded = if compression == PHOTOSHOP_ZIP {
+                    crate::common::codec::decompress_deflate(encoded)?
+                } else {
+                    crate::common::codec::decompress_packbits(encoded)?
+                };
+                decoded.truncate(channel_bytes);
+                if decoded.len() < channel_bytes {
+                    decoded.resize(channel_bytes, 0);
+                }
+                plane.extend_from_slice(&decoded);
+            }
+            return Ok(plane);
+        }
+
+        let start = self
+            .layer_offsets
+            .get(offset_index)
+            .copied()
+            .ok_or_else(|| BioFormatsError::Format("Photoshop layer offset is missing".into()))?;
+        let end = start.checked_add(plane_bytes).ok_or_else(|| {
+            BioFormatsError::Format("Photoshop layer plane offset overflows".into())
+        })?;
+        let bytes = self.source_data.get(start..end).ok_or_else(|| {
+            BioFormatsError::Format("Photoshop layer payload is shorter than declared".into())
+        })?;
+        Ok(bytes.to_vec())
+    }
 }
 
 impl Default for PhotoshopTiffReader {
@@ -2791,10 +2978,8 @@ impl FormatReader for PhotoshopTiffReader {
         )
     }
 
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
-        // Java isThisType requires the first IFD to contain IMAGE_SOURCE_DATA,
-        // which lives past the header window; detection happens in set_id.
-        false
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        tiff_header_contains_first_ifd_tag(header, PHOTOSHOP_IMAGE_SOURCE_DATA)
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
@@ -2812,6 +2997,11 @@ impl FormatReader for PhotoshopTiffReader {
 
     fn close(&mut self) -> Result<()> {
         self.layer_names.clear();
+        self.source_data.clear();
+        self.layer_offsets.clear();
+        self.layer_data_sizes.clear();
+        self.compression.clear();
+        self.channel_order.clear();
         self.metas.clear();
         self.current_series = 0;
         self.inner.close()
@@ -2844,23 +3034,48 @@ impl FormatReader for PhotoshopTiffReader {
 
     fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
         if self.current_series != 0 {
-            return Err(BioFormatsError::UnsupportedFormat(
-                "Photoshop TIFF layer pixel decoding is not supported".into(),
-            ));
+            if p != 0 {
+                return Err(BioFormatsError::PlaneOutOfRange(p));
+            }
+            return self.layer_plane_bytes(self.current_series);
         }
         self.inner.open_bytes(p)
     }
 
     fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
         if self.current_series != 0 {
-            return Err(BioFormatsError::UnsupportedFormat(
-                "Photoshop TIFF layer pixel decoding is not supported".into(),
-            ));
+            if p != 0 {
+                return Err(BioFormatsError::PlaneOutOfRange(p));
+            }
+            let full = self.layer_plane_bytes(self.current_series)?;
+            let meta = self
+                .metas
+                .get(self.current_series)
+                .ok_or(BioFormatsError::NotInitialized)?;
+            return crop_full_plane(
+                "Photoshop TIFF",
+                &full,
+                meta,
+                meta.size_c.max(1) as usize,
+                x,
+                y,
+                w,
+                h,
+            );
         }
         self.inner.open_bytes_region(p, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
+        if self.current_series != 0 {
+            let meta = self
+                .metas
+                .get(self.current_series)
+                .ok_or(BioFormatsError::NotInitialized)?;
+            let (tw, th) = (meta.size_x.min(256), meta.size_y.min(256));
+            let (tx, ty) = ((meta.size_x - tw) / 2, (meta.size_y - th) / 2);
+            return self.open_bytes_region(p, tx, ty, tw, th);
+        }
         self.inner.open_thumb_bytes(p)
     }
 
@@ -3433,6 +3648,21 @@ mod tests {
     }
 
     #[test]
+    fn l2d_identifies_java_style_tiff_companion_by_neighbors() {
+        let root = temp_dir("l2d_tiff_detection");
+        fs::create_dir_all(root.join("ScanA")).unwrap();
+        let tiff = root.join("ScanA_700.tif");
+        write_u8_tiff(&tiff, &[1], 1, 1);
+        fs::write(root.join("ScanA.scn"), "ImageNames=ScanA_700.tif\n").unwrap();
+
+        let reader = L2dReader::new();
+        assert!(reader.is_this_type_by_name(&tiff));
+        assert!(!reader.is_this_type_by_name(&root.join("other.tif")));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn l2d_multiplies_logical_channels_by_rgb_samples() {
         let root = temp_dir("l2d_rgb_channels");
         let scan_dir = root.join("ScanA");
@@ -3468,6 +3698,14 @@ mod tests {
         );
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn canon_byte_detection_matches_java_fixed_length_probe() {
+        let reader = CanonRawReader::new();
+        assert!(!reader.is_this_type_by_bytes(&vec![0; 1024]));
+        let legacy = vec![0u8; CanonRawReader::FILE_LENGTH as usize];
+        assert!(reader.is_this_type_by_bytes(&legacy));
     }
 
     fn push_tiff_entry(data: &mut Vec<u8>, tag: u16, typ: u16, count: u32, value: u32) {
@@ -3538,6 +3776,22 @@ mod tests {
         data.push(11);
         data.push(22);
         fs::write(path, data).unwrap();
+    }
+
+    #[test]
+    fn imacon_byte_detection_requires_first_ifd_xml_tag_like_java() {
+        let root = temp_dir("imacon_byte_detection");
+        let imacon = root.join("sample.fff");
+        let plain = root.join("plain.tif");
+        write_two_ifd_imacon(&imacon);
+        write_u8_tiff(&plain, &[1], 1, 1);
+
+        let reader = ImaconReader::new();
+        assert!(reader.is_this_type_by_bytes(&fs::read(&imacon).unwrap()));
+        assert!(!reader.is_this_type_by_bytes(&fs::read(&plain).unwrap()));
+        assert!(!reader.is_this_type_by_bytes(b"not a tiff"));
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -3791,6 +4045,40 @@ mod tests {
     }
 
     #[test]
+    fn photoshop_byte_detection_requires_image_source_data_tag_like_java() {
+        let mut tagged = Vec::new();
+        tagged.extend_from_slice(b"II");
+        tagged.extend_from_slice(&42u16.to_le_bytes());
+        tagged.extend_from_slice(&8u32.to_le_bytes());
+        tagged.extend_from_slice(&11u16.to_le_bytes());
+        push_tiff_entry(&mut tagged, 256, 4, 1, 1);
+        push_tiff_entry(&mut tagged, 257, 4, 1, 1);
+        push_tiff_entry(&mut tagged, 258, 3, 1, 8);
+        push_tiff_entry(&mut tagged, 259, 3, 1, 1);
+        push_tiff_entry(&mut tagged, 262, 3, 1, 1);
+        push_tiff_entry(&mut tagged, 273, 4, 1, 146);
+        push_tiff_entry(&mut tagged, 277, 3, 1, 1);
+        push_tiff_entry(&mut tagged, 278, 4, 1, 1);
+        push_tiff_entry(&mut tagged, 279, 4, 1, 1);
+        push_tiff_entry(&mut tagged, 284, 3, 1, 1);
+        push_tiff_entry(&mut tagged, PHOTOSHOP_IMAGE_SOURCE_DATA, 7, 5, 150);
+        tagged.extend_from_slice(&0u32.to_le_bytes());
+        tagged.push(7);
+        tagged.extend_from_slice(b"8BPS\0");
+
+        let root = temp_dir("photoshop_byte_detection");
+        let plain = root.join("plain.tif");
+        write_u8_tiff(&plain, &[1], 1, 1);
+
+        let reader = PhotoshopTiffReader::new();
+        assert!(reader.is_this_type_by_bytes(&tagged));
+        assert!(!reader.is_this_type_by_bytes(&fs::read(&plain).unwrap()));
+        assert!(!reader.is_this_type_by_bytes(b"not a tiff"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn photoshop_layer_block_yields_named_layer_metadata() {
         // Hand-build a little-endian IMAGE_SOURCE_DATA payload (matching an
         // uninitialised TiffReader's default endianness) with one Layr block
@@ -3930,6 +4218,48 @@ mod tests {
             .metadata()
             .series_metadata
             .contains_key("Layer name #1"));
+    }
+
+    #[test]
+    fn photoshop_layer_series_reads_uncompressed_pixels_like_java() {
+        let name = b"Backgrnd";
+        let mut layer = Vec::new();
+        layer.extend_from_slice(&0i32.to_le_bytes()); // top
+        layer.extend_from_slice(&0i32.to_le_bytes()); // left
+        layer.extend_from_slice(&2i32.to_le_bytes()); // bottom
+        layer.extend_from_slice(&2i32.to_le_bytes()); // right
+        layer.extend_from_slice(&1i16.to_le_bytes()); // sizeC
+        layer.extend_from_slice(&0i16.to_le_bytes()); // channelID
+        layer.extend_from_slice(&6i32.to_le_bytes()); // compression short + 4 pixels
+        layer.extend_from_slice(&[0u8; 12]);
+
+        let mut extra = Vec::new();
+        extra.extend_from_slice(&0i32.to_le_bytes()); // mask == 0
+        extra.extend_from_slice(&0i32.to_le_bytes()); // blending == 0
+        extra.push(name.len() as u8);
+        extra.extend_from_slice(name);
+        layer.extend_from_slice(&(extra.len() as i32).to_le_bytes());
+        layer.extend_from_slice(&extra);
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&1i16.to_le_bytes());
+        body.extend_from_slice(&layer);
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"8BPS\0");
+        payload.extend_from_slice(b"8BIM");
+        payload.extend_from_slice(b"ryaL");
+        payload.extend_from_slice(&(body.len() as i32).to_le_bytes());
+        payload.extend_from_slice(&body);
+        payload.extend_from_slice(&0i16.to_le_bytes()); // raw compression
+        payload.extend_from_slice(&[1, 2, 3, 4]);
+
+        let mut reader = PhotoshopTiffReader::new();
+        reader.init_file(&payload);
+        reader.set_series(1).unwrap();
+
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 3, 4]);
+        assert_eq!(reader.open_bytes_region(0, 1, 0, 1, 2).unwrap(), vec![2, 4]);
     }
 
     #[test]

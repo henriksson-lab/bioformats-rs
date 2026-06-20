@@ -1241,6 +1241,26 @@ fn parse_inveon_header(path: &Path) -> Result<InveonHeader> {
                     let candidate = parent.join(name);
                     if candidate.exists() {
                         data_file = Some(candidate);
+                    } else if let Some(header_name) = path.file_name().and_then(|n| n.to_str()) {
+                        // Java InveonReader fallback for renamed datasets:
+                        // when the stored file_name no longer exists, scan the
+                        // header directory for a sibling whose name is a prefix
+                        // of the header name (e.g. scan.img + scan.img.hdr).
+                        let mut names = Vec::new();
+                        for entry in fs::read_dir(parent).map_err(BioFormatsError::Io)? {
+                            let entry = entry.map_err(BioFormatsError::Io)?;
+                            if let Some(file_name) =
+                                entry.path().file_name().and_then(|n| n.to_str())
+                            {
+                                names.push(file_name.to_string());
+                            }
+                        }
+                        names.sort();
+                        for file in names {
+                            if file != header_name && header_name.starts_with(&file) {
+                                data_file = Some(parent.join(file));
+                            }
+                        }
                     }
                 }
             }
@@ -1365,6 +1385,31 @@ impl InveonReader {
             physical_size_z: None,
         }
     }
+
+    fn java_hdr_companion(path: &Path) -> PathBuf {
+        if path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("hdr"))
+            .unwrap_or(false)
+        {
+            return path.to_path_buf();
+        }
+
+        PathBuf::from(format!("{}.hdr", path.to_string_lossy()))
+    }
+
+    fn resolve_hdr_path(path: &Path) -> PathBuf {
+        let java_path = Self::java_hdr_companion(path);
+        if java_path.exists() {
+            return java_path;
+        }
+
+        let stem = path.file_stem().unwrap_or_default();
+        path.parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(format!("{}.hdr", stem.to_string_lossy()))
+    }
 }
 impl Default for InveonReader {
     fn default() -> Self {
@@ -1376,19 +1421,7 @@ impl FormatReader for InveonReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
         // Inveon .hdr files can conflict with Analyze; Java keeps suffix
         // detection non-sufficient and checks for the header marker.
-        let hdr_path = if path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.eq_ignore_ascii_case("hdr"))
-            .unwrap_or(false)
-        {
-            path.to_path_buf()
-        } else {
-            let stem = path.file_stem().unwrap_or_default();
-            path.parent()
-                .unwrap_or_else(|| Path::new("."))
-                .join(format!("{}.hdr", stem.to_string_lossy()))
-        };
+        let hdr_path = Self::resolve_hdr_path(path);
         std::fs::read_to_string(hdr_path)
             .map(|s| s.contains(INVEON_HEADER_MARKER))
             .unwrap_or(false)
@@ -1405,16 +1438,7 @@ impl FormatReader for InveonReader {
         let stem = path.file_stem().unwrap_or_default();
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
 
-        let hdr_path = if path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.eq_ignore_ascii_case("hdr"))
-            .unwrap_or(false)
-        {
-            path.to_path_buf()
-        } else {
-            parent.join(format!("{}.hdr", stem.to_string_lossy()))
-        };
+        let hdr_path = Self::resolve_hdr_path(path);
         let default_img_path = parent.join(format!("{}.img", stem.to_string_lossy()));
 
         let header = parse_inveon_header(&hdr_path)?;
@@ -2386,6 +2410,53 @@ mod clinical_metadata_tests {
         assert_eq!(reader.open_bytes(0).unwrap(), vec![11]);
         reader.set_series(1).unwrap();
         assert_eq!(reader.open_bytes(0).unwrap(), vec![22]);
+
+        let _ = std::fs::remove_file(&hdr);
+        let _ = std::fs::remove_file(&img);
+    }
+
+    #[test]
+    fn inveon_non_hdr_entry_appends_hdr_to_full_path_like_java() {
+        let base = tmp_path("scan_entry");
+        let img = base.with_extension("img");
+        let hdr = PathBuf::from(format!("{}.hdr", img.to_string_lossy()));
+        std::fs::write(
+            &hdr,
+            b"Header file for data file\nx_dimension 1\ny_dimension 1\nz_dimension 1\n\
+              data_type 1\n",
+        )
+        .unwrap();
+        std::fs::write(&img, [77u8]).unwrap();
+
+        let mut reader = InveonReader::new();
+        assert!(reader.is_this_type_by_name(&img));
+        reader
+            .set_id(&img)
+            .expect("inveon set_id from Java-style entry");
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![77]);
+
+        let _ = std::fs::remove_file(&hdr);
+        let _ = std::fs::remove_file(&img);
+    }
+
+    #[test]
+    fn inveon_direct_hdr_uses_java_renamed_data_file_fallback() {
+        let base = tmp_path("renamed_scan");
+        let img = base.with_extension("img");
+        let hdr = PathBuf::from(format!("{}.hdr", img.to_string_lossy()));
+        std::fs::write(
+            &hdr,
+            b"Header file for data file\nx_dimension 1\ny_dimension 1\nz_dimension 1\n\
+              data_type 1\nfile_name missing_original_name.img\n",
+        )
+        .unwrap();
+        std::fs::write(&img, [88u8]).unwrap();
+
+        let mut reader = InveonReader::new();
+        reader
+            .set_id(&hdr)
+            .expect("inveon set_id from direct renamed hdr");
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![88]);
 
         let _ = std::fs::remove_file(&hdr);
         let _ = std::fs::remove_file(&img);

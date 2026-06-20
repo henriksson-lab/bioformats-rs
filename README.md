@@ -7,6 +7,7 @@ A pure-Rust translation of [Bio-Formats](https://www.openmicroscopy.org/bio-form
 
 **plenty small errors left to audit**
 
+* 2026-06-20: Close to all files audited. some left
 * 2026-06-19: Extensive reaudit with conservative LLM (many problems fixed). About half files now reaudited, passing only if clean twice in a row - the rest to come
 * 2026-06-17: Some more stragglers found. Definitely need a final audit, but using a different LLM
 * 2026-06-14: Translation theoretically as complete as it can get. Testing on more data is however needed; if the code does not work on some file you have, please provide if possible

@@ -1043,7 +1043,7 @@ fn ics_writer_reorders_non_rgb_planes_to_declared_xyztc_layout() {
     reader.set_id(&path).unwrap();
     assert_eq!(
         reader.metadata().dimension_order,
-        bioformats::common::metadata::DimensionOrder::XYTCZ
+        bioformats::common::metadata::DimensionOrder::XYZTC
     );
     assert_eq!(reader.open_bytes(0).unwrap(), vec![10]);
     assert_eq!(reader.open_bytes(1).unwrap(), vec![30]);
@@ -1071,7 +1071,9 @@ fn ics_writer_accepts_ids_suffix_like_java_ics1_pair() {
     let header = std::fs::read_to_string(&ics_path).unwrap();
     assert!(header.contains("ics_version\t1.0"));
     assert!(header.contains("filename\t"));
-    assert!(header.contains("layout\torder\tbits x y"));
+    assert!(header.contains("layout\tparameters\t6"));
+    assert!(header.contains("layout\torder\tbits x y z t ch"));
+    assert!(header.contains("layout\tsizes\t8 2 1 1 1 1"));
     assert_eq!(std::fs::read(&ids_path).unwrap(), vec![7, 9]);
 
     let mut from_ics = bioformats::formats::ics::IcsReader::new();
@@ -1081,6 +1083,54 @@ fn ics_writer_accepts_ids_suffix_like_java_ics1_pair() {
     let mut from_ids = bioformats::formats::ics::IcsReader::new();
     from_ids.set_id(&ids_path).unwrap();
     assert_eq!(from_ids.open_bytes(0).unwrap(), vec![7, 9]);
+}
+
+#[test]
+fn ics_writer_rgb_header_matches_java_axis_layout() {
+    let mut meta = ImageMetadata::default();
+    meta.size_x = 1;
+    meta.size_y = 1;
+    meta.size_c = 3;
+    meta.pixel_type = PixelType::Uint8;
+    meta.bits_per_pixel = 8;
+    meta.image_count = 1;
+    meta.is_rgb = true;
+    meta.is_interleaved = true;
+
+    let path = temp_path("ics_rgb_layout.ics");
+    ImageWriter::save(&path, &meta, &[vec![1, 2, 3]]).unwrap();
+    let header = std::fs::read_to_string(&path).unwrap();
+
+    assert!(header.contains("layout\tparameters\t6"));
+    assert!(header.contains("layout\torder\tbits ch x y z t"));
+    assert!(header.contains("layout\tsizes\t8 3 1 1 1 1"));
+}
+
+#[test]
+fn ics_writer_byte_order_header_matches_java_little_endian_rules() {
+    for (name, pixel_type, bits, expected) in [
+        ("u8", PixelType::Uint8, 8, "1"),
+        ("u16", PixelType::Uint16, 16, "1 2"),
+        ("u32", PixelType::Uint32, 32, "4 3 2 1"),
+        ("f32", PixelType::Float32, 32, "1 2 3 4"),
+    ] {
+        let mut meta = ImageMetadata::default();
+        meta.size_x = 1;
+        meta.size_y = 1;
+        meta.size_c = 1;
+        meta.pixel_type = pixel_type;
+        meta.bits_per_pixel = bits;
+        meta.image_count = 1;
+        meta.is_little_endian = true;
+
+        let path = temp_path(&format!("ics_byte_order_{name}.ics"));
+        ImageWriter::save(&path, &meta, &[vec![0; pixel_type.bytes_per_sample()]]).unwrap();
+        let contents = String::from_utf8_lossy(&std::fs::read(&path).unwrap()).to_string();
+        assert!(
+            contents.contains(&format!("representation\tbyte_order\t{expected}\r\n")),
+            "{name}: header did not contain Java byte_order {expected:?}:\n{contents}"
+        );
+    }
 }
 
 #[test]

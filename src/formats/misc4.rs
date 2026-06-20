@@ -5204,6 +5204,16 @@ struct ObfStack {
     is_flim: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ObfOmePixels {
+    size_x: u32,
+    size_y: u32,
+    size_z: u32,
+    size_c: u32,
+    size_t: u32,
+    dimension_order: DimensionOrder,
+}
+
 /// True if `label` is a FLIM (SPCM-prefixed) dimension label.
 fn obf_is_flim_label(label: &str) -> bool {
     label.starts_with("SPCM")
@@ -5282,6 +5292,52 @@ fn obf_apply_description_metadata(
     if !parsed_xml {
         metadata.insert("Description".into(), MetadataValue::String(description));
     }
+}
+
+fn obf_xml_attr(tag: &str, attr: &str) -> Option<String> {
+    let search = format!("{attr}=\"");
+    let start = tag.find(&search)? + search.len();
+    let end = tag[start..].find('"')? + start;
+    Some(tag[start..end].to_string())
+}
+
+fn obf_dimension_order(value: &str) -> Option<DimensionOrder> {
+    match value {
+        "XYCTZ" => Some(DimensionOrder::XYCTZ),
+        "XYCZT" => Some(DimensionOrder::XYCZT),
+        "XYTCZ" => Some(DimensionOrder::XYTCZ),
+        "XYTZC" => Some(DimensionOrder::XYTZC),
+        "XYZCT" => Some(DimensionOrder::XYZCT),
+        "XYZTC" => Some(DimensionOrder::XYZTC),
+        _ => None,
+    }
+}
+
+fn obf_parse_ome_pixels(ome_xml: &str) -> Vec<ObfOmePixels> {
+    let mut out = Vec::new();
+    let mut pos = 0;
+    while let Some(rel) = ome_xml[pos..].find("<Pixels") {
+        let start = pos + rel;
+        let Some(end_rel) = ome_xml[start..].find('>') else {
+            break;
+        };
+        let tag = &ome_xml[start..start + end_rel + 1];
+        let parsed = || -> Option<ObfOmePixels> {
+            Some(ObfOmePixels {
+                size_x: obf_xml_attr(tag, "SizeX")?.parse().ok()?,
+                size_y: obf_xml_attr(tag, "SizeY")?.parse().ok()?,
+                size_z: obf_xml_attr(tag, "SizeZ")?.parse().ok()?,
+                size_c: obf_xml_attr(tag, "SizeC")?.parse().ok()?,
+                size_t: obf_xml_attr(tag, "SizeT")?.parse().ok()?,
+                dimension_order: obf_dimension_order(&obf_xml_attr(tag, "DimensionOrder")?)?,
+            })
+        };
+        if let Some(pixels) = parsed() {
+            out.push(pixels);
+        }
+        pos = start + end_rel + 1;
+    }
+    out
 }
 
 /// Little-endian sequential reader over the OBF file used during parsing.
@@ -5691,12 +5747,13 @@ impl ObfReadState {
 /// zlib-compressed, possibly chunked pixel block. Each stack maps to one
 /// Bio-Formats series. The non-FLIM read path is implemented (chunk walking,
 /// flush-point seeking and streaming inflate); the OME-XML side metadata block
-/// (file version >= 2) is skipped, so dimensions always come from the raw
-/// stack headers.
+/// (file version >= 2) is parsed when present so Java-style OME-XML Pixels
+/// dimensions can override raw stack headers.
 pub struct ObfReader {
     path: Option<PathBuf>,
     metas: Vec<ImageMetadata>,
     stacks: Vec<ObfStack>,
+    ome_pixels: Vec<ObfOmePixels>,
     series: usize,
 }
 
@@ -5706,6 +5763,7 @@ impl ObfReader {
             path: None,
             metas: Vec::new(),
             stacks: Vec::new(),
+            ome_pixels: Vec::new(),
             series: 0,
         }
     }
@@ -5743,6 +5801,29 @@ impl ObfReader {
         }
     }
 
+    fn read_obf_string(input: &mut ObfIn) -> Result<String> {
+        let length = input.i32()?;
+        if length <= 0 {
+            return Ok(String::new());
+        }
+        Ok(String::from_utf8_lossy(&input.read_n(length as usize)?).into_owned())
+    }
+
+    fn read_file_metadata_block(&mut self, input: &mut ObfIn) -> Result<()> {
+        loop {
+            let key = Self::read_obf_string(input)?;
+            if key.is_empty() {
+                break;
+            }
+            let value = Self::read_obf_string(input)?;
+            if key == "ome_xml" {
+                self.ome_pixels = obf_parse_ome_pixels(&value);
+                break;
+            }
+        }
+        Ok(())
+    }
+
     /// Parse one stack starting at `current`; returns the offset of the next
     /// stack (0 = end of list).
     fn init_stack(&mut self, input: &mut ObfIn, current: u64) -> Result<u64> {
@@ -5777,11 +5858,23 @@ impl ObfReader {
             }
         }
 
-        let mut size_x = sizes[0].max(0) as u32;
-        let mut size_y = sizes[1].max(0) as u32;
-        let mut size_z = sizes[2].max(0) as u32;
-        let size_c = sizes[3].max(0) as u32;
-        let size_t = sizes[4].max(0) as u32;
+        let image = self.metas.len();
+        let ome_pixels = self.ome_pixels.get(image);
+        let mut size_x = ome_pixels
+            .map(|p| p.size_x)
+            .unwrap_or_else(|| sizes[0].max(0) as u32);
+        let mut size_y = ome_pixels
+            .map(|p| p.size_y)
+            .unwrap_or_else(|| sizes[1].max(0) as u32);
+        let mut size_z = ome_pixels
+            .map(|p| p.size_z)
+            .unwrap_or_else(|| sizes[2].max(0) as u32);
+        let size_c = ome_pixels
+            .map(|p| p.size_c)
+            .unwrap_or_else(|| sizes[3].max(0) as u32);
+        let size_t = ome_pixels
+            .map(|p| p.size_t)
+            .unwrap_or_else(|| sizes[4].max(0) as u32);
         let mut image_count = size_z * size_c * size_t;
         // FLIM moduloZ, populated below when an SPCM label is encountered.
         let mut modulo_z: Option<ModuloAnnotation> = None;
@@ -6034,7 +6127,9 @@ impl ObfReader {
             pixel_type,
             bits_per_pixel,
             image_count,
-            dimension_order: DimensionOrder::XYZCT,
+            dimension_order: ome_pixels
+                .map(|p| p.dimension_order)
+                .unwrap_or(DimensionOrder::XYZCT),
             is_rgb: false,
             is_interleaved: false,
             is_indexed: false,
@@ -6145,6 +6240,7 @@ impl FormatReader for ObfReader {
         self.path = None;
         self.metas.clear();
         self.stacks.clear();
+        self.ome_pixels.clear();
         self.series = 0;
 
         let file = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
@@ -6163,9 +6259,13 @@ impl FormatReader for ObfReader {
         let length_of_description = input.i32()?;
         input.skip(length_of_description.max(0) as u64)?;
         if version >= 2 {
-            // meta_data_position: OME-XML side metadata is skipped; dimensions
-            // come from the raw stack headers instead.
-            let _meta_data_position = input.i64()?;
+            let meta_data_position = input.i64()?;
+            let current_position = input.pos()?;
+            if meta_data_position > 0 {
+                input.seek(meta_data_position as u64)?;
+                self.read_file_metadata_block(&mut input)?;
+            }
+            input.seek(current_position)?;
         }
 
         if stack_position != 0 {
@@ -6193,6 +6293,7 @@ impl FormatReader for ObfReader {
         self.path = None;
         self.metas.clear();
         self.stacks.clear();
+        self.ome_pixels.clear();
         self.series = 0;
         Ok(())
     }
@@ -6280,6 +6381,90 @@ mod pds_tests {
         v
     }
 
+    fn push_i32(v: &mut Vec<u8>, n: i32) {
+        v.extend_from_slice(&n.to_le_bytes());
+    }
+
+    fn push_i64(v: &mut Vec<u8>, n: i64) {
+        v.extend_from_slice(&n.to_le_bytes());
+    }
+
+    fn push_f64(v: &mut Vec<u8>, n: f64) {
+        v.extend_from_slice(&n.to_le_bytes());
+    }
+
+    fn push_obf_string(v: &mut Vec<u8>, s: &str) {
+        push_i32(v, s.len() as i32);
+        v.extend_from_slice(s.as_bytes());
+    }
+
+    fn minimal_obf_v2_with_ome_pixels() -> PathBuf {
+        let path = unique_base("obf_ome").with_extension("obf");
+        let ome_xml = r#"<OME><Image ID="Image:0"><Pixels ID="Pixels:0" DimensionOrder="XYZTC" Type="uint8" SizeX="5" SizeY="4" SizeZ="2" SizeC="3" SizeT="2"><Channel ID="Channel:0:0" SamplesPerPixel="1"/><Channel ID="Channel:0:1" SamplesPerPixel="1"/><Channel ID="Channel:0:2" SamplesPerPixel="1"/></Pixels></Image></OME>"#;
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(OBF_FILE_MAGIC);
+        bytes.extend_from_slice(&OBF_MAGIC_NUMBER.to_le_bytes());
+        push_i32(&mut bytes, 2);
+        let stack_position_patch = bytes.len();
+        push_i64(&mut bytes, 0);
+        push_i32(&mut bytes, 0);
+        let metadata_position_patch = bytes.len();
+        push_i64(&mut bytes, 0);
+
+        let metadata_position = bytes.len() as i64;
+        push_obf_string(&mut bytes, "ome_xml");
+        push_obf_string(&mut bytes, ome_xml);
+        push_i32(&mut bytes, 0);
+
+        let stack_position = bytes.len() as i64;
+        bytes.extend_from_slice(OBF_STACK_MAGIC);
+        bytes.extend_from_slice(&OBF_MAGIC_NUMBER.to_le_bytes());
+        push_i32(&mut bytes, 1);
+        push_i32(&mut bytes, 5);
+        for _ in 0..OBF_MAX_DIMS {
+            push_i32(&mut bytes, 1);
+        }
+        for _ in 0..OBF_MAX_DIMS {
+            push_f64(&mut bytes, 1.0);
+        }
+        for _ in 0..OBF_MAX_DIMS {
+            push_f64(&mut bytes, 0.0);
+        }
+        push_i32(&mut bytes, 0x01);
+        push_i32(&mut bytes, 0);
+        push_i32(&mut bytes, 0);
+        push_i32(&mut bytes, 5);
+        push_i32(&mut bytes, 0);
+        push_i64(&mut bytes, 0);
+        push_i64(&mut bytes, 1);
+        push_i64(&mut bytes, 0);
+        bytes.extend_from_slice(b"stack");
+        bytes.push(0);
+
+        let footer = bytes.len();
+        let labels_offset = 4 + OBF_MAX_DIMS * 4 + OBF_MAX_DIMS * 4;
+        push_i32(&mut bytes, labels_offset as i32);
+        for _ in 0..OBF_MAX_DIMS {
+            push_i32(&mut bytes, 0);
+        }
+        for _ in 0..OBF_MAX_DIMS {
+            push_i32(&mut bytes, 0);
+        }
+        assert_eq!(bytes.len(), footer + labels_offset);
+        for label in ["X", "Y", "Z", "C", "T"] {
+            push_obf_string(&mut bytes, label);
+        }
+
+        bytes[stack_position_patch..stack_position_patch + 8]
+            .copy_from_slice(&stack_position.to_le_bytes());
+        bytes[metadata_position_patch..metadata_position_patch + 8]
+            .copy_from_slice(&metadata_position.to_le_bytes());
+
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
     /// Write a minimal grayscale PDS fixture: `.hdr` + companion `.IMG`.
     ///
     /// Header carries the ` IDENTIFICATION` magic, `NXP`/`NYP`, `COLOR = 1`
@@ -6356,6 +6541,28 @@ mod pds_tests {
             plain.get("Description"),
             Some(MetadataValue::String(value)) if value == "plain description"
         ));
+    }
+
+    #[test]
+    fn obf_v2_uses_ome_xml_pixels_for_core_dimensions() {
+        let path = minimal_obf_v2_with_ome_pixels();
+        let mut reader = ObfReader::new();
+        reader.set_id(&path).expect("OBF set_id");
+        let meta = reader.metadata();
+
+        assert_eq!(meta.size_x, 5);
+        assert_eq!(meta.size_y, 4);
+        assert_eq!(meta.size_z, 2);
+        assert_eq!(meta.size_c, 3);
+        assert_eq!(meta.size_t, 2);
+        assert_eq!(meta.image_count, 12);
+        assert_eq!(meta.dimension_order, DimensionOrder::XYZTC);
+        assert_eq!(
+            meta.series_metadata.get("Name").map(ToString::to_string),
+            Some("stack".to_string())
+        );
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

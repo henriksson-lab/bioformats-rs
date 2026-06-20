@@ -1352,10 +1352,28 @@ fn finish_psd(
     Ok((meta, pixels))
 }
 
+fn psd_samples_per_plane(meta: &ImageMetadata) -> usize {
+    if meta.is_rgb {
+        let effective_c = meta.image_count.max(1);
+        (meta.size_c / effective_c).max(1) as usize
+    } else {
+        1
+    }
+}
+
+fn psd_plane_bytes(meta: &ImageMetadata) -> Result<usize> {
+    (meta.size_x as usize)
+        .checked_mul(meta.size_y as usize)
+        .and_then(|v| v.checked_mul(meta.pixel_type.bytes_per_sample()))
+        .and_then(|v| v.checked_mul(psd_samples_per_plane(meta)))
+        .ok_or_else(|| BioFormatsError::Format("PSD plane size overflows".into()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::common::metadata::MetadataValue;
+    use std::fs;
 
     #[test]
     fn packbits_rejects_truncated_literal_payload() {
@@ -1526,6 +1544,38 @@ mod tests {
             .keys()
             .any(|key| key.starts_with("psd.image_resource.1060.xmp.")));
     }
+
+    #[test]
+    fn multi_rgb_group_planes_match_java_first_group_read() {
+        let path = std::env::temp_dir().join(format!(
+            "bioformats_rs_psd_multi_rgb_{}.psd",
+            std::process::id()
+        ));
+        let mut data = Vec::new();
+        data.extend_from_slice(b"8BPS");
+        data.extend_from_slice(&1u16.to_be_bytes());
+        data.extend_from_slice(&[0; 6]);
+        data.extend_from_slice(&6u16.to_be_bytes()); // channels
+        data.extend_from_slice(&1u32.to_be_bytes()); // height
+        data.extend_from_slice(&1u32.to_be_bytes()); // width
+        data.extend_from_slice(&8u16.to_be_bytes()); // depth
+        data.extend_from_slice(&3u16.to_be_bytes()); // RGB
+        data.extend_from_slice(&0u32.to_be_bytes()); // color mode data
+        data.extend_from_slice(&0u32.to_be_bytes()); // image resources
+        data.extend_from_slice(&0u32.to_be_bytes()); // layer/mask
+        data.extend_from_slice(&0u16.to_be_bytes()); // raw compression
+        data.extend_from_slice(&[1, 2, 3, 4, 5, 6]); // planar channels
+        fs::write(&path, data).unwrap();
+
+        let mut reader = PsdReader::new();
+        reader.set_id(&path).unwrap();
+        let meta = reader.metadata();
+        assert_eq!((meta.size_c, meta.image_count), (6, 2));
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 3]);
+        assert_eq!(reader.open_bytes(1).unwrap(), vec![1, 2, 3]);
+
+        let _ = fs::remove_file(path);
+    }
 }
 
 impl FormatReader for PsdReader {
@@ -1581,10 +1631,16 @@ impl FormatReader for PsdReader {
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        if plane_index != 0 {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
-        self.pixels.clone().ok_or(BioFormatsError::NotInitialized)
+        let plane_bytes = psd_plane_bytes(meta)?;
+        let full = self
+            .pixels
+            .as_ref()
+            .ok_or(BioFormatsError::NotInitialized)?;
+        Ok(full[..plane_bytes.min(full.len())].to_vec())
     }
 
     fn open_bytes_region(
@@ -1595,10 +1651,10 @@ impl FormatReader for PsdReader {
         w: u32,
         h: u32,
     ) -> Result<Vec<u8>> {
-        if plane_index != 0 {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         let full = self
             .pixels
             .as_ref()
@@ -1607,7 +1663,7 @@ impl FormatReader for PsdReader {
         validate_region("PSD", meta.size_x, meta.size_y, x, y, w, h)?;
 
         let bps = meta.pixel_type.bytes_per_sample();
-        let channels = meta.size_c as usize;
+        let channels = psd_samples_per_plane(meta);
         let row_bytes = (meta.size_x as usize)
             .checked_mul(bps)
             .ok_or_else(|| BioFormatsError::Format("PSD row size overflows".into()))?;

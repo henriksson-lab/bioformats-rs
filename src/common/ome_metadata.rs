@@ -2255,6 +2255,44 @@ fn effective_size_c(meta: &ImageMetadata) -> u32 {
     }
 }
 
+fn zct_coords_from_order(
+    order: crate::common::metadata::DimensionOrder,
+    size_z: u32,
+    size_c: u32,
+    size_t: u32,
+    plane_index: u32,
+) -> (u32, u32, u32) {
+    let mut rem = plane_index;
+    let mut z = 0;
+    let mut c = 0;
+    let mut t = 0;
+    for axis in match order {
+        crate::common::metadata::DimensionOrder::XYZCT => ['Z', 'C', 'T'],
+        crate::common::metadata::DimensionOrder::XYZTC => ['Z', 'T', 'C'],
+        crate::common::metadata::DimensionOrder::XYCZT => ['C', 'Z', 'T'],
+        crate::common::metadata::DimensionOrder::XYCTZ => ['C', 'T', 'Z'],
+        crate::common::metadata::DimensionOrder::XYTCZ => ['T', 'C', 'Z'],
+        crate::common::metadata::DimensionOrder::XYTZC => ['T', 'Z', 'C'],
+    } {
+        match axis {
+            'Z' => {
+                z = rem % size_z;
+                rem /= size_z;
+            }
+            'C' => {
+                c = rem % size_c;
+                rem /= size_c;
+            }
+            'T' => {
+                t = rem % size_t;
+                rem /= size_t;
+            }
+            _ => {}
+        }
+    }
+    (z, c, t)
+}
+
 fn generic_planes_from_metadata(meta: &ImageMetadata) -> Vec<OmePlane> {
     let mut planes = Vec::new();
     for plane_index in 0..meta.image_count {
@@ -2309,10 +2347,13 @@ fn generic_planes_from_metadata(meta: &ImageMetadata) -> Vec<OmePlane> {
         {
             let c_size = effective_size_c(meta);
             let z_size = meta.size_z.max(1);
+            let t_size = meta.size_t.max(1);
+            let (the_z, the_c, the_t) =
+                zct_coords_from_order(meta.dimension_order, z_size, c_size, t_size, plane_index);
             planes.push(OmePlane {
-                the_z: (plane_index / c_size) % z_size,
-                the_c: plane_index % c_size,
-                the_t: plane_index / (c_size * z_size),
+                the_z,
+                the_c,
+                the_t,
                 delta_t,
                 exposure_time,
                 position_x,
@@ -3174,5 +3215,58 @@ mod tests {
         assert_eq!(xml.matches("<Channel ").count(), 2);
         assert_eq!(xml.matches(r#"SamplesPerPixel="3""#).count(), 2);
         assert!(xml.contains(r#"<Pixels ID="Pixels:0" DimensionOrder="XYCZT" Type="uint8" SizeX="2" SizeY="2" SizeZ="1" SizeC="6" SizeT="1" BigEndian="false""#));
+    }
+
+    #[test]
+    fn plane_metadata_uses_dimension_order_for_zct_coords() {
+        let mut meta = ImageMetadata {
+            size_x: 1,
+            size_y: 1,
+            size_z: 2,
+            size_c: 2,
+            size_t: 2,
+            pixel_type: PixelType::Uint8,
+            bits_per_pixel: 8,
+            image_count: 8,
+            dimension_order: DimensionOrder::XYZTC,
+            is_rgb: false,
+            is_interleaved: false,
+            is_indexed: false,
+            is_little_endian: true,
+            resolution_count: 1,
+            thumbnail: false,
+            series_metadata: std::collections::HashMap::new(),
+            lookup_table: None,
+            modulo_z: None,
+            modulo_c: None,
+            modulo_t: None,
+        };
+        for plane in 0..meta.image_count {
+            meta.series_metadata.insert(
+                format!("plane.{plane}.delta_t"),
+                MetadataValue::Float(plane as f64),
+            );
+        }
+
+        let ome = OmeMetadata::from_image_metadata(&meta);
+        let planes = &ome.images.first().expect("OME image").planes;
+        let coords: Vec<(u32, u32, u32)> = planes
+            .iter()
+            .map(|plane| (plane.the_z, plane.the_c, plane.the_t))
+            .collect();
+
+        assert_eq!(
+            coords,
+            vec![
+                (0, 0, 0),
+                (1, 0, 0),
+                (0, 0, 1),
+                (1, 0, 1),
+                (0, 1, 0),
+                (1, 1, 0),
+                (0, 1, 1),
+                (1, 1, 1),
+            ]
+        );
     }
 }

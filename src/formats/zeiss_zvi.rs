@@ -997,19 +997,9 @@ impl FormatReader for ZeissZviReader {
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
-        // OLE2 CFB magic — shared with other OLE2 files, so also require the context
-        // that the caller will have already checked the extension separately.
-        // For the magic-byte pass we require both magic + a deferred extension check
-        // is not possible here (no path), so we return false to force extension path.
-        // Actually we CAN check: bytes 0-3 must match AND the call site checks extension
-        // too via is_this_type_by_name. But the registry tries magic first; to avoid
-        // false-matching .doc/.xls/.oib etc. we intentionally return false here
-        // and let the extension fallback handle ZVI.
-        //
-        // Returning false from magic means the registry will try is_this_type_by_name
-        // next, which checks the .zvi extension.
-        let _ = header;
-        false
+        // Java ZeissZVIReader.isThisType(RandomAccessInputStream) reads a
+        // big-endian int and compares only the first four OLE2 magic bytes.
+        matches!(header.get(..4), Some([0xd0, 0xcf, 0x11, 0xe0]))
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
@@ -1325,6 +1315,15 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("bioformats_zvi_{nanos}_{name}.zvi"))
+    }
+
+    #[test]
+    fn zvi_byte_detection_matches_java_ole2_prefix() {
+        let reader = ZeissZviReader::new();
+        assert!(reader.is_this_type_by_bytes(&[0xd0, 0xcf, 0x11, 0xe0]));
+        assert!(reader.is_this_type_by_bytes(&[0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1,]));
+        assert!(!reader.is_this_type_by_bytes(&[0xd0, 0xcf, 0x11]));
+        assert!(!reader.is_this_type_by_bytes(&[0xe0, 0x11, 0xcf, 0xd0]));
     }
 
     /// Build one ZVI item ("/Image/Item(N)/CONTENTS") stream carrying the given

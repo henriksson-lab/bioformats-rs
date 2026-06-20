@@ -4566,19 +4566,28 @@ impl FeiTiffReader {
         } else {
             FEI_SFEG_TAG
         };
-        let Some(tag) = ifd.get(tag_key).and_then(fei_ifd_text_value) else {
-            return;
-        };
-        let tag = tag.trim().to_string();
-        if tag.is_empty() {
-            return;
-        }
-
         let mut vendor = std::collections::HashMap::new();
         vendor.insert(
             "Software".to_string(),
             crate::common::metadata::MetadataValue::String(software.to_string()),
         );
+        let Some(tag) = ifd.get(tag_key).and_then(fei_ifd_text_value) else {
+            if let Some(s) = self.inner.series_list_mut().first_mut() {
+                for (k, v) in vendor {
+                    s.metadata.series_metadata.insert(k, v);
+                }
+            }
+            return;
+        };
+        let tag = tag.trim().to_string();
+        if tag.is_empty() {
+            if let Some(s) = self.inner.series_list_mut().first_mut() {
+                for (k, v) in vendor {
+                    s.metadata.series_metadata.insert(k, v);
+                }
+            }
+            return;
+        }
 
         if tag.starts_with('<') {
             self.parse_fei_xmlish(&tag, &mut vendor);
@@ -6602,6 +6611,12 @@ fn metadata_value_from_text(value: &str) -> crate::common::metadata::MetadataVal
 /// Improvision/PerkinElmer Volocity software.
 pub struct ImprovisionTiffReader {
     inner: crate::tiff::TiffReader,
+    /// Java `files`: sorted same-`SampleUUID` TIFF siblings when
+    /// `MultiFileTIFF=yes`, otherwise just the opened file.
+    files: Vec<std::path::PathBuf>,
+    /// Java `readers`: one TIFF delegate per entry in `files`.
+    readers: Vec<crate::tiff::TiffReader>,
+    last_file: usize,
     /// Per-plane channel colours parsed from `WhiteColour` comment lines
     /// (mirrors Java `ArrayList<Color> channelColors`). `None` marks a plane
     /// whose `WhiteColour` value had fewer than three components.
@@ -6621,9 +6636,14 @@ pub struct ImprovisionTiffReader {
 }
 
 impl ImprovisionTiffReader {
+    const IMPROVISION_MAGIC_STRING: &'static str = "Improvision";
+
     pub fn new() -> Self {
         ImprovisionTiffReader {
             inner: crate::tiff::TiffReader::new(),
+            files: Vec::new(),
+            readers: Vec::new(),
+            last_file: 0,
             channel_colors: Vec::new(),
             c_names: Vec::new(),
             pixel_size_t: 1,
@@ -6652,12 +6672,13 @@ impl ImprovisionTiffReader {
     /// Translate Java `initStandardMetadata` field-filling: parse the per-plane
     /// comments to populate `pixel_size_{x,y,z}`, `channel_colors`, `c_names`
     /// and `pixel_size_t`. Returns `size_c` used to size `c_names`.
-    fn parse_comments(&mut self, comments: &[String]) {
+    fn parse_comments(&mut self, comments: &[String]) -> bool {
         let mut total_z: Option<u32> = None;
         let mut total_c: Option<u32> = None;
         let mut total_t: Option<u32> = None;
         let mut coords: Vec<[i32; 3]> = vec![[-1, -1, -1]; comments.len()];
         let mut raw_metadata: Vec<(String, crate::common::metadata::MetadataValue)> = Vec::new();
+        let mut multiple_files = false;
 
         // First pass: calibration + WhiteColour (mirrors Java lines 170-219).
         for (plane, comment) in comments.iter().enumerate() {
@@ -6715,6 +6736,9 @@ impl ImprovisionTiffReader {
                     }
                     "TimepointName" => {
                         coords[plane][2] = value.trim().parse::<i32>().unwrap_or(-1);
+                    }
+                    "MultiFileTIFF" => {
+                        multiple_files = value.trim().eq_ignore_ascii_case("yes");
                     }
                     _ => {}
                 }
@@ -6784,6 +6808,7 @@ impl ImprovisionTiffReader {
         if size_t > 0 {
             self.pixel_size_t = sum / size_t;
         }
+        multiple_files
     }
 
     fn apply_improvision_dimensions(
@@ -6912,16 +6937,7 @@ impl ImprovisionTiffReader {
         }];
     }
 
-    fn enrich_metadata(&mut self) {
-        if self.inner.series_list().is_empty() {
-            return;
-        }
-        let comments = self.plane_comments();
-        self.parse_comments(&comments);
-        self.build_ome();
-
-        // Surface the parsed scalar fields into series_metadata, mirroring the
-        // Java field/key names so callers can read them without OME.
+    fn surface_parsed_metadata(&mut self) {
         use crate::common::metadata::MetadataValue;
         let mut vendor: Vec<(String, MetadataValue)> = Vec::new();
         if self.pixel_size_x > 0.0 {
@@ -7024,6 +7040,165 @@ impl ImprovisionTiffReader {
         })()
         .unwrap_or(false)
     }
+
+    fn sample_uuid_from_path(path: &Path) -> Result<Option<String>> {
+        let mut reader = crate::tiff::TiffReader::new();
+        reader.set_id(path)?;
+        let comment = reader
+            .series_list()
+            .first()
+            .and_then(|s| s.metadata.series_metadata.get("ImageDescription"))
+            .and_then(|v| {
+                if let crate::common::metadata::MetadataValue::String(s) = v {
+                    Some(s.as_str())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or("");
+        if comment.contains(Self::IMPROVISION_MAGIC_STRING) {
+            Ok(Some(improvision_sample_uuid(comment)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn discover_files(&self, path: &Path, multiple_files: bool) -> Vec<std::path::PathBuf> {
+        if !multiple_files {
+            return vec![path.to_path_buf()];
+        }
+        let Ok(Some(current_uuid)) = Self::sample_uuid_from_path(path) else {
+            return vec![path.to_path_buf()];
+        };
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let mut entries: Vec<String> = match std::fs::read_dir(parent) {
+            Ok(read_dir) => read_dir
+                .filter_map(|entry| entry.ok())
+                .filter_map(|entry| entry.file_name().into_string().ok())
+                .collect(),
+            Err(_) => return vec![path.to_path_buf()],
+        };
+        entries.sort();
+
+        let mut files = Vec::new();
+        for name in entries {
+            let candidate = parent.join(name);
+            if !self.is_this_type_by_name(&candidate) {
+                continue;
+            }
+            let Ok(Some(uuid)) = Self::sample_uuid_from_path(&candidate) else {
+                continue;
+            };
+            if uuid == current_uuid {
+                files.push(candidate);
+            }
+        }
+        if files.is_empty() {
+            vec![path.to_path_buf()]
+        } else {
+            files
+        }
+    }
+
+    fn init_readers(&mut self) -> Result<()> {
+        self.readers.clear();
+        for file in &self.files {
+            let mut reader = crate::tiff::TiffReader::new();
+            reader.set_id(file)?;
+            self.readers.push(reader);
+        }
+        Ok(())
+    }
+
+    fn apply_java_multifile_fallback(&mut self) {
+        let ifd_count = self.inner.ifd_count() as u32;
+        let files_len = self.files.len() as u32;
+        let Some(series) = self.inner.series_list_mut().first_mut() else {
+            return;
+        };
+        let m = &mut series.metadata;
+        if files_len.saturating_mul(ifd_count) < m.image_count {
+            self.files.truncate(1);
+            m.image_count = ifd_count;
+            m.size_z = ifd_count.max(1);
+            m.size_t = 1;
+            if !m.is_rgb {
+                m.size_c = 1;
+            }
+        }
+    }
+
+    fn resolve_multifile_plane(&self, plane_index: u32) -> Result<(usize, u32)> {
+        let meta = self.metadata();
+        if plane_index >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        let files_len = self.files.len();
+        if files_len <= 1 {
+            return Ok((0, plane_index));
+        }
+        let (z, c, t) = improvision_plane_to_zct(plane_index, meta)
+            .ok_or(BioFormatsError::PlaneOutOfRange(plane_index))?;
+        let xyzct_index = t
+            .checked_mul(meta.size_z)
+            .and_then(|v| v.checked_mul(improvision_effective_size_c(meta)))
+            .and_then(|v| v.checked_add(c.checked_mul(meta.size_z)?))
+            .and_then(|v| v.checked_add(z))
+            .ok_or_else(|| BioFormatsError::Format("Improvision plane index overflows".into()))?;
+        Ok((
+            (xyzct_index as usize) % files_len,
+            plane_index / files_len as u32,
+        ))
+    }
+}
+
+fn improvision_sample_uuid(comment: &str) -> String {
+    let normalized = comment.replace("\r\n", "\n").replace('\r', "\n");
+    for line in normalized.split('\n') {
+        let line = line.trim();
+        if let Some(value) = line.strip_prefix("SampleUUID=") {
+            return value.trim().to_string();
+        }
+    }
+    String::new()
+}
+
+fn improvision_effective_size_c(meta: &ImageMetadata) -> u32 {
+    if meta.is_rgb {
+        (meta.size_c / 3).max(1)
+    } else {
+        meta.size_c.max(1)
+    }
+}
+
+fn improvision_plane_to_zct(plane_index: u32, meta: &ImageMetadata) -> Option<(u32, u32, u32)> {
+    for t in 0..meta.size_t.max(1) {
+        for z in 0..meta.size_z.max(1) {
+            for c in 0..improvision_effective_size_c(meta) {
+                if improvision_zct_to_plane(z, c, t, meta)? == plane_index {
+                    return Some((z, c, t));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn improvision_zct_to_plane(z: u32, c: u32, t: u32, meta: &ImageMetadata) -> Option<u32> {
+    let size_z = meta.size_z.max(1);
+    let size_c = improvision_effective_size_c(meta);
+    let size_t = meta.size_t.max(1);
+    if z >= size_z || c >= size_c || t >= size_t {
+        return None;
+    }
+    Some(match meta.dimension_order {
+        crate::common::metadata::DimensionOrder::XYZCT => t * size_z * size_c + c * size_z + z,
+        crate::common::metadata::DimensionOrder::XYZTC => c * size_z * size_t + t * size_z + z,
+        crate::common::metadata::DimensionOrder::XYCZT => t * size_c * size_z + z * size_c + c,
+        crate::common::metadata::DimensionOrder::XYCTZ => z * size_c * size_t + t * size_c + c,
+        crate::common::metadata::DimensionOrder::XYTCZ => z * size_t * size_c + c * size_t + t,
+        crate::common::metadata::DimensionOrder::XYTZC => c * size_t * size_z + z * size_t + t,
+    })
 }
 
 impl Default for ImprovisionTiffReader {
@@ -7046,12 +7221,32 @@ impl FormatReader for ImprovisionTiffReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.close()?;
         self.inner.set_id(path)?;
-        self.enrich_metadata();
+        let comments = self.plane_comments();
+        let multiple_files = self.parse_comments(&comments);
+        self.files = self.discover_files(path, multiple_files);
+        self.apply_java_multifile_fallback();
+        self.init_readers()?;
+        self.build_ome();
+        self.surface_parsed_metadata();
         Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
+        for reader in &mut self.readers {
+            let _ = reader.close();
+        }
+        self.files.clear();
+        self.readers.clear();
+        self.last_file = 0;
+        self.channel_colors.clear();
+        self.c_names.clear();
+        self.pixel_size_t = 1;
+        self.pixel_size_x = 0.0;
+        self.pixel_size_y = 0.0;
+        self.pixel_size_z = 0.0;
+        self.ome_images.clear();
         self.inner.close()
     }
     fn series_count(&self) -> usize {
@@ -7067,10 +7262,22 @@ impl FormatReader for ImprovisionTiffReader {
         self.inner.metadata()
     }
     fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
-        self.inner.open_bytes(p)
+        let (file, plane) = self.resolve_multifile_plane(p)?;
+        self.last_file = file;
+        if self.readers.is_empty() {
+            self.inner.open_bytes(p)
+        } else {
+            self.readers[file].open_bytes(plane)
+        }
     }
     fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
-        self.inner.open_bytes_region(p, x, y, w, h)
+        let (file, plane) = self.resolve_multifile_plane(p)?;
+        self.last_file = file;
+        if self.readers.is_empty() {
+            self.inner.open_bytes_region(p, x, y, w, h)
+        } else {
+            self.readers[file].open_bytes_region(plane, x, y, w, h)
+        }
     }
     fn open_thumb_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
         self.inner.open_thumb_bytes(p)
@@ -9823,6 +10030,23 @@ mod nikon_elements_tiff_tests {
     }
 
     #[test]
+    fn fei_empty_private_tag_still_records_java_software_metadata() {
+        let path = temp_path("fei_empty_titan_metadata");
+        write_minimal_tiff_with_ascii_tags(
+            &path,
+            &[(FEI_HELIOS_TAG, "    "), (FEI_TITAN_TAG, "    ")],
+        );
+
+        let mut reader = FeiTiffReader::new();
+        reader.set_id(&path).unwrap();
+
+        assert!(matches!(
+            reader.metadata().series_metadata.get("Software"),
+            Some(MetadataValue::String(value)) if value == "Helios NanoLab"
+        ));
+    }
+
+    #[test]
     fn nikon_elements_tiff_projects_variant_and_channel_metadata() {
         let path = temp_path("variant_metadata");
         write_minimal_tiff_with_description(
@@ -11854,6 +12078,83 @@ mod improvision_tests {
         plain[marker..marker + "Improvision".len()].copy_from_slice(b"plain-text!");
         assert!(!ImprovisionTiffReader::new().is_this_type_by_bytes(&plain));
         let _ = std::fs::remove_file(path);
+    }
+
+    fn write_one_pixel_improvision_tiff(path: &std::path::Path, desc: &str, pixel: u8) {
+        let mut desc = desc.as_bytes().to_vec();
+        desc.push(0);
+
+        let ifd_entry_count = 11u32;
+        let ifd_start = 8u32;
+        let desc_start = ifd_start + 2 + ifd_entry_count * 12 + 4;
+        let pixel_start = desc_start + desc.len() as u32;
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"II");
+        bytes.extend_from_slice(&42u16.to_le_bytes());
+        bytes.extend_from_slice(&ifd_start.to_le_bytes());
+        let entries = [
+            tiff_entry(256, 4, 1, 1),
+            tiff_entry(257, 4, 1, 1),
+            tiff_entry(258, 3, 1, 8),
+            tiff_entry(259, 3, 1, 1),
+            tiff_entry(262, 3, 1, 1),
+            tiff_entry(270, 2, desc.len() as u32, desc_start),
+            tiff_entry(273, 4, 1, pixel_start),
+            tiff_entry(277, 3, 1, 1),
+            tiff_entry(278, 4, 1, 1),
+            tiff_entry(279, 4, 1, 1),
+            tiff_entry(284, 3, 1, 1),
+        ];
+        bytes.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        for entry in entries {
+            bytes.extend_from_slice(&entry);
+        }
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&desc);
+        bytes.push(pixel);
+
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn multifile_tiff_groups_by_sample_uuid_and_routes_xyzct_to_siblings() {
+        let dir = std::env::temp_dir().join(format!(
+            "bioformats_rs_improvision_multifile_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir(&dir);
+        let a = dir.join("a.tif");
+        let b = dir.join("b.tif");
+        let other = dir.join("c.tif");
+        let desc = "Improvision\n\
+                    MultiFileTIFF=yes\n\
+                    SampleUUID=uuid-1\n\
+                    TotalZPlanes=2\n\
+                    TotalChannels=1\n\
+                    TotalTimepoints=1\n\
+                    ZPlane=1\n\
+                    ChannelNo=1\n\
+                    TimepointName=1";
+        write_one_pixel_improvision_tiff(&a, desc, 10);
+        write_one_pixel_improvision_tiff(&b, desc, 20);
+        write_one_pixel_improvision_tiff(
+            &other,
+            "Improvision\nMultiFileTIFF=yes\nSampleUUID=other",
+            99,
+        );
+
+        let mut reader = ImprovisionTiffReader::new();
+        reader.set_id(&b).unwrap();
+
+        assert_eq!(reader.metadata().image_count, 2);
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![10]);
+        assert_eq!(reader.open_bytes(1).unwrap(), vec![20]);
+
+        let _ = std::fs::remove_file(a);
+        let _ = std::fs::remove_file(b);
+        let _ = std::fs::remove_file(other);
+        let _ = std::fs::remove_dir(dir);
     }
 }
 

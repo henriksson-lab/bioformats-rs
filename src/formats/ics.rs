@@ -893,6 +893,21 @@ fn bytes_as_little_endian(meta: &ImageMetadata, data: &[u8]) -> Vec<u8> {
     out
 }
 
+fn ics_writer_byte_order(meta: &ImageMetadata) -> String {
+    let bits = meta.pixel_type.bytes_per_sample() * 8;
+    let bytes = (bits / 8).max(1);
+    let is_float = matches!(meta.pixel_type, PixelType::Float32 | PixelType::Float64);
+    // Pixel samples are normalized to little-endian before writing. Java's ICS
+    // byte-order convention is inverted for integer samples at 32 bits and up.
+    let ascending = bits < 32 || is_float;
+    let values: Vec<String> = if ascending {
+        (1..=bytes).map(|v| v.to_string()).collect()
+    } else {
+        (1..=bytes).rev().map(|v| v.to_string()).collect()
+    };
+    values.join(" ")
+}
+
 fn ics_metadata_path_for_ids(path: &Path) -> PathBuf {
     match path.extension().and_then(|e| e.to_str()) {
         Some(ext) if ext.chars().next().is_some_and(|c| c.is_ascii_uppercase()) => {
@@ -980,28 +995,31 @@ impl FormatWriter for IcsWriter {
             path.file_name().unwrap_or_default().to_string_lossy()
         )
         .map_err(BioFormatsError::Io)?;
-        let mut order_parts = vec!["bits"];
-        let mut size_parts = vec![bps.to_string()];
-        if meta.is_rgb {
-            order_parts.push("ch");
-            size_parts.push(meta.size_c.max(1).to_string());
-        }
-        order_parts.push("x");
-        size_parts.push(meta.size_x.to_string());
-        order_parts.push("y");
-        size_parts.push(meta.size_y.to_string());
-        if meta.size_z > 1 {
-            order_parts.push("z");
-            size_parts.push(meta.size_z.to_string());
-        }
-        if meta.size_t > 1 {
-            order_parts.push("t");
-            size_parts.push(meta.size_t.to_string());
-        }
-        if !meta.is_rgb && meta.size_c > 1 {
-            order_parts.push("ch");
-            size_parts.push(meta.size_c.to_string());
-        }
+        let (order_parts, size_parts) = if meta.is_rgb {
+            (
+                vec!["bits", "ch", "x", "y", "z", "t"],
+                vec![
+                    bps.to_string(),
+                    meta.size_c.max(1).to_string(),
+                    meta.size_x.to_string(),
+                    meta.size_y.to_string(),
+                    meta.size_z.max(1).to_string(),
+                    meta.size_t.max(1).to_string(),
+                ],
+            )
+        } else {
+            (
+                vec!["bits", "x", "y", "z", "t", "ch"],
+                vec![
+                    bps.to_string(),
+                    meta.size_x.to_string(),
+                    meta.size_y.to_string(),
+                    meta.size_z.max(1).to_string(),
+                    meta.size_t.max(1).to_string(),
+                    meta.size_c.max(1).to_string(),
+                ],
+            )
+        };
 
         write!(f, "layout\tparameters\t{}\r\n", order_parts.len()).map_err(BioFormatsError::Io)?;
         write!(f, "layout\torder\t{}\r\n", order_parts.join(" ")).map_err(BioFormatsError::Io)?;
@@ -1009,7 +1027,12 @@ impl FormatWriter for IcsWriter {
         write!(f, "layout\tsignificant_bits\t{}\r\n", bps).map_err(BioFormatsError::Io)?;
         write!(f, "representation\tformat\t{}\r\n", format_str).map_err(BioFormatsError::Io)?;
         write!(f, "representation\tsign\t{}\r\n", sign_str).map_err(BioFormatsError::Io)?;
-        write!(f, "representation\tbyte_order\t1 2 3 4\r\n").map_err(BioFormatsError::Io)?;
+        write!(
+            f,
+            "representation\tbyte_order\t{}\r\n",
+            ics_writer_byte_order(&meta)
+        )
+        .map_err(BioFormatsError::Io)?;
         write!(f, "representation\tcompression\tuncompressed\r\n").map_err(BioFormatsError::Io)?;
         // The ICS2 terminator MUST end in a bare LF, not CRLF. Java's ICSReader locates
         // the pixel-data offset for ICS v2 with `in.readString(NL)` (NL = "\r\n"),

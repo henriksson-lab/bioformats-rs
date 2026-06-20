@@ -812,27 +812,6 @@ fn validate_incell_companions(m: &InCellMeta) -> Result<()> {
                 "InCell .im companion metadata is missing positive image dimensions".into(),
             ));
         }
-        let plane_bytes = (m.image_width as u64)
-            .checked_mul(m.image_height as u64)
-            .and_then(|v| v.checked_mul(2))
-            .ok_or_else(|| BioFormatsError::Format("InCell .im plane size overflows".into()))?;
-        let required_len = 128u64
-            .checked_add(plane_bytes)
-            .ok_or_else(|| BioFormatsError::Format("InCell .im payload size overflows".into()))?;
-        for plane in iter_image_planes(m) {
-            if !plane.is_tiff {
-                let Some(path) = &plane.filename else {
-                    continue;
-                };
-                let len = std::fs::metadata(path).map_err(BioFormatsError::Io)?.len();
-                if len < required_len {
-                    return Err(BioFormatsError::Format(format!(
-                        "InCell .im companion {} is shorter than declared payload: need {required_len} bytes, file length {len}",
-                        path.display()
-                    )));
-                }
-            }
-        }
     }
     if !has_tiff_companion && !has_im_companion {
         return Err(BioFormatsError::UnsupportedFormat(
@@ -1154,6 +1133,35 @@ fn series_to_well_field(
     (row * well_cols.max(1) + col, field)
 }
 
+fn read_incell_im_plane(path: &Path, plane_bytes: usize) -> Result<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut f = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
+    let len = f.metadata().map_err(BioFormatsError::Io)?.len();
+    let mut buf = vec![0u8; plane_bytes];
+
+    // Java InCellReader only seeks past the 128-byte .im header when the file is
+    // larger than the expected plane payload. Shorter/equal files leave the
+    // caller's zero-filled buffer unchanged.
+    if len <= plane_bytes as u64 {
+        return Ok(buf);
+    }
+
+    let offset = 128u64;
+    let end = offset
+        .checked_add(plane_bytes as u64)
+        .ok_or_else(|| BioFormatsError::InvalidData("InCell .im plane offset overflows".into()))?;
+    if end > len {
+        return Err(BioFormatsError::InvalidData(format!(
+            "InCell .im plane exceeds file length: need bytes {offset}..{end}, file length {len}"
+        )));
+    }
+    f.seek(SeekFrom::Start(offset))
+        .map_err(BioFormatsError::Io)?;
+    f.read_exact(&mut buf).map_err(BioFormatsError::Io)?;
+    Ok(buf)
+}
+
 impl FormatReader for InCellReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
         let ext = path
@@ -1288,24 +1296,7 @@ impl FormatReader for InCellReader {
             return self.tiff_reader.open_bytes(0);
         }
 
-        // .im files: pixel data after a 128-byte header.
-        use std::io::{Read, Seek, SeekFrom};
-        let mut f = std::fs::File::open(&tiff_path).map_err(BioFormatsError::Io)?;
-        let len = f.metadata().map_err(BioFormatsError::Io)?.len();
-        let mut buf = vec![0u8; plane_bytes];
-        let offset = 128u64;
-        let end = offset.checked_add(plane_bytes as u64).ok_or_else(|| {
-            BioFormatsError::InvalidData("InCell .im plane offset overflows".into())
-        })?;
-        if end > len {
-            return Err(BioFormatsError::InvalidData(format!(
-                "InCell .im plane exceeds file length: need bytes {offset}..{end}, file length {len}"
-            )));
-        }
-        f.seek(SeekFrom::Start(offset))
-            .map_err(BioFormatsError::Io)?;
-        f.read_exact(&mut buf).map_err(BioFormatsError::Io)?;
-        Ok(buf)
+        read_incell_im_plane(&tiff_path, plane_bytes)
     }
 
     fn open_bytes_region(
@@ -1588,6 +1579,27 @@ mod tests {
         let crop = reader.open_bytes_region(0, 1, 0, 1, 2).unwrap();
 
         assert_eq!(crop, vec![0, 0]);
+    }
+
+    #[test]
+    fn incell_im_file_no_larger_than_plane_returns_zero_buffer_like_java() {
+        let dir = temp_dir("short_im_zero");
+        let im = dir.join("plane.im");
+        std::fs::write(&im, [1u8; 8]).unwrap();
+
+        assert_eq!(read_incell_im_plane(&im, 8).unwrap(), vec![0u8; 8]);
+
+        let mut meta = InCellMeta {
+            image_width: 2,
+            image_height: 2,
+            image_files: vec![vec![vec![vec![Some(ImagePlane {
+                filename: Some(im),
+                is_tiff: false,
+            })]]]],
+            ..Default::default()
+        };
+        meta.plate_map = vec![vec![true]];
+        validate_incell_companions(&meta).unwrap();
     }
 
     #[test]

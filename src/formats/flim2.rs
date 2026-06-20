@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{BufReader, Cursor, ErrorKind, Read, Seek};
+use std::io::{BufReader, ErrorKind, Read, Seek};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -5433,18 +5433,69 @@ pub struct NdpisReader {
     ndpi_files: Vec<PathBuf>,
     /// Per-channel resolved channel name (from NDPI tag 65434), if present.
     channel_names: Vec<Option<String>>,
+    /// Java NDPISReader `bandUsed`: selected RGB band for each NDPI companion.
+    band_used: Vec<usize>,
     metas: Vec<ImageMetadata>,
     pyramid_series: Vec<bool>,
     current_series: usize,
 }
 
 const NDPI_TAG_CHANNEL: u16 = 65434;
+const NDPI_TAG_EMISSION_WAVELENGTH: u16 = 65451;
+const NDPI_TAG_METADATA: u16 = 65449;
 
-fn ndpis_channel_name(path: &Path) -> Option<String> {
-    let file = File::open(path).ok()?;
-    let mut parser = crate::tiff::parser::TiffParser::new(file).ok()?;
-    let (ifd, _) = parser.read_ifd(parser.first_ifd_offset).ok()?;
-    ifd.get_str(NDPI_TAG_CHANNEL).map(str::to_owned)
+fn ndpis_channel_info(path: &Path) -> (Option<String>, usize) {
+    let Ok(file) = File::open(path) else {
+        return (None, 0);
+    };
+    let Ok(mut parser) = crate::tiff::parser::TiffParser::new(file) else {
+        return (None, 0);
+    };
+    let Ok((ifd, _)) = parser.read_ifd(parser.first_ifd_offset) else {
+        return (None, 0);
+    };
+    let mut name = ifd.get_str(NDPI_TAG_CHANNEL).map(str::to_owned);
+    let mut band_used = 0usize;
+    let wavelength = ifd
+        .get(NDPI_TAG_EMISSION_WAVELENGTH)
+        .and_then(|v| v.as_vec_f64().first().copied());
+
+    if ifd.samples_per_pixel() >= 3 {
+        if let Some(wavelength) = wavelength {
+            if wavelength > 380.0 && wavelength <= 490.0 {
+                band_used = 2;
+            } else if wavelength > 490.0 && wavelength <= 580.0 {
+                band_used = 1;
+            } else if wavelength > 580.0 && wavelength <= 780.0 {
+                band_used = 0;
+            }
+        }
+
+        if let Some(extra) = ifd.get_str(NDPI_TAG_METADATA) {
+            for line in extra.split("\r\n") {
+                if !line.trim().starts_with(";NDP Shading Data") {
+                    continue;
+                }
+                for pair in line.split(';') {
+                    let Some(eq) = pair.find('=') else { continue };
+                    let key = pair[..eq].trim();
+                    let value = pair[eq + 1..].trim();
+                    if wavelength.is_none() && key.starts_with("Transmittance") && value != "-" {
+                        if let Some(ch) = key.chars().last() {
+                            if let Some(index) = "RGB".find(ch) {
+                                band_used = index;
+                            }
+                        }
+                    }
+                    if key == "Name" && !value.is_empty() {
+                        name = Some(value.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    (name, band_used)
 }
 
 impl NdpisReader {
@@ -5453,6 +5504,7 @@ impl NdpisReader {
             readers: Vec::new(),
             ndpi_files: Vec::new(),
             channel_names: Vec::new(),
+            band_used: Vec::new(),
             metas: Vec::new(),
             pyramid_series: Vec::new(),
             current_series: 0,
@@ -5473,6 +5525,35 @@ impl NdpisReader {
         let c = p % size_c;
         let t = p / (size_c * size_z);
         Ok((c as usize, t * size_z + z))
+    }
+
+    fn select_ndpi_band(
+        &self,
+        reader: &crate::formats::tiff_wrappers::NdpiReader,
+        channel: usize,
+        data: Vec<u8>,
+        width: u32,
+        height: u32,
+    ) -> Vec<u8> {
+        let meta = reader.metadata();
+        if !meta.is_rgb {
+            return data;
+        }
+        let rgb_channels = meta.size_c.max(1) as usize;
+        if rgb_channels <= 1 {
+            return data;
+        }
+        let band = self.band_used.get(channel).copied().unwrap_or(0);
+        let band = if band < rgb_channels { band } else { 0 };
+        let bytes_per_sample = meta.pixel_type.bytes_per_sample();
+        let plane_len = width as usize * height as usize * bytes_per_sample;
+        let start = band.saturating_mul(plane_len);
+        let end = start.saturating_add(plane_len);
+        if end <= data.len() {
+            data[start..end].to_vec()
+        } else {
+            data
+        }
     }
 
     fn is_pyramid_series(&self) -> bool {
@@ -5533,12 +5614,14 @@ impl FormatReader for NdpisReader {
         // Open each channel file as a TIFF delegate.
         let mut readers = Vec::with_capacity(files.len());
         let mut channel_names = Vec::with_capacity(files.len());
+        let mut band_used = Vec::with_capacity(files.len());
         for file in &files {
             let mut r = crate::formats::tiff_wrappers::NdpiReader::new();
             r.set_id(file)?;
-            // Channel name from NDPI tag 65434 on the first IFD.
-            let name = ndpis_channel_name(file);
+            // Channel name and RGB band selection from the first IFD.
+            let (name, band) = ndpis_channel_info(file);
             channel_names.push(name);
+            band_used.push(band);
             readers.push(r);
         }
 
@@ -5568,6 +5651,7 @@ impl FormatReader for NdpisReader {
         self.readers = readers;
         self.ndpi_files = files;
         self.channel_names = channel_names;
+        self.band_used = band_used;
         self.metas = metas;
         self.pyramid_series = pyramid_series;
         self.current_series = 0;
@@ -5580,6 +5664,7 @@ impl FormatReader for NdpisReader {
         self.readers.clear();
         self.ndpi_files.clear();
         self.channel_names.clear();
+        self.band_used.clear();
         self.metas.clear();
         self.pyramid_series.clear();
         self.current_series = 0;
@@ -5613,7 +5698,12 @@ impl FormatReader for NdpisReader {
         }
         let (channel, inner_plane) = self.zct_channel_plane(p)?;
         self.readers[channel].set_series(self.current_series)?;
-        self.readers[channel].open_bytes(inner_plane)
+        let (width, height) = {
+            let meta = self.readers[channel].metadata();
+            (meta.size_x, meta.size_y)
+        };
+        let data = self.readers[channel].open_bytes(inner_plane)?;
+        Ok(self.select_ndpi_band(&self.readers[channel], channel, data, width, height))
     }
     fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
         if !self.is_pyramid_series() {
@@ -5622,7 +5712,8 @@ impl FormatReader for NdpisReader {
         }
         let (channel, inner_plane) = self.zct_channel_plane(p)?;
         self.readers[channel].set_series(self.current_series)?;
-        self.readers[channel].open_bytes_region(inner_plane, x, y, w, h)
+        let data = self.readers[channel].open_bytes_region(inner_plane, x, y, w, h)?;
+        Ok(self.select_ndpi_band(&self.readers[channel], channel, data, w, h))
     }
     fn open_thumb_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
         if !self.is_pyramid_series() {
@@ -5631,7 +5722,11 @@ impl FormatReader for NdpisReader {
         }
         let (channel, inner_plane) = self.zct_channel_plane(p)?;
         self.readers[channel].set_series(self.current_series)?;
-        self.readers[channel].open_thumb_bytes(inner_plane)
+        let thumb = self.readers[channel].open_thumb_bytes(inner_plane)?;
+        let meta = self.readers[channel].metadata();
+        let width = meta.size_x.min(256);
+        let height = meta.size_y.min(256);
+        Ok(self.select_ndpi_band(&self.readers[channel], channel, thumb, width, height))
     }
     fn resolution_count(&self) -> usize {
         self.readers
@@ -7402,11 +7497,9 @@ impl FormatReader for ImarisTiffReader {
         matches!(ext.as_deref(), Some("ims"))
     }
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
-        TiffParser::new(Cursor::new(header))
-            .and_then(|mut parser| parser.read_ifds())
-            .ok()
-            .and_then(|ifds| ifds.into_iter().next())
-            .is_some_and(|ifd| slidebook_tiff_matches_first_ifd(&ifd))
+        header.len() >= 4
+            && ((header[0..2] == [0x49, 0x49] && header[2..4] == [42, 0])
+                || (header[0..2] == [0x4d, 0x4d] && header[2..4] == [0, 42]))
     }
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.inner.set_id(path)?;
@@ -17921,6 +18014,15 @@ EndClass: 0
         }
     }
 
+    fn short_vec_entry(tag: u16, values: &[u16]) -> TestEntry {
+        TestEntry {
+            tag,
+            typ: 3,
+            count: values.len() as u32,
+            value: values.iter().flat_map(|v| v.to_le_bytes()).collect(),
+        }
+    }
+
     fn long_entry(tag: u16, value: u32) -> TestEntry {
         TestEntry {
             tag,
@@ -18144,6 +18246,65 @@ EndClass: 0
         file.write_all(&data).unwrap();
     }
 
+    fn write_rgb_ndpi_for_ndpis(path: &Path, channel_name: &str, wavelength: f64, pixels: &[u8]) {
+        const NDPI_MARKER_TAG: u16 = 65426;
+        let mut entries = vec![
+            long_entry(tag::IMAGE_WIDTH, 2),
+            long_entry(tag::IMAGE_LENGTH, 1),
+            short_vec_entry(tag::BITS_PER_SAMPLE, &[8, 8, 8]),
+            short_entry(tag::COMPRESSION, 1),
+            short_entry(tag::PHOTOMETRIC_INTERPRETATION, 2),
+            short_entry(tag::SAMPLES_PER_PIXEL, 3),
+            long_entry(tag::ROWS_PER_STRIP, 1),
+            long_entry(tag::STRIP_BYTE_COUNTS, pixels.len() as u32),
+            short_entry(tag::PLANAR_CONFIGURATION, 1),
+            long_entry(NDPI_MARKER_TAG, 1),
+            ascii_entry(NDPI_TAG_CHANNEL, channel_name),
+            double_entry(NDPI_TAG_EMISSION_WAVELENGTH, wavelength),
+        ];
+        let strip_offset = 8 + ifd_table_len(entries.len() + 1) + ifd_extra_len(&entries);
+        entries.push(long_entry(tag::STRIP_OFFSETS, strip_offset as u32));
+
+        let mut data = Vec::new();
+        data.extend_from_slice(b"II");
+        data.extend_from_slice(&42u16.to_le_bytes());
+        data.extend_from_slice(&8u32.to_le_bytes());
+        write_test_ifd(&mut data, &entries, 8, 0);
+        data.resize(strip_offset, 0);
+        data.extend_from_slice(pixels);
+
+        let mut file = File::create(path).unwrap();
+        file.write_all(&data).unwrap();
+    }
+
+    #[test]
+    fn ndpis_rgb_companions_select_java_band_used_by_emission_wavelength() {
+        let dir = temp_flim2_path("ndpis-band-dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        let index = dir.join("case.ndpis");
+        let blue = dir.join("blue.ndpi");
+        let green = dir.join("green.ndpi");
+
+        write_rgb_ndpi_for_ndpis(&blue, "blue channel", 450.0, &[10, 20, 30, 40, 50, 60]);
+        write_rgb_ndpi_for_ndpis(&green, "green channel", 520.0, &[11, 21, 31, 41, 51, 61]);
+        std::fs::write(
+            &index,
+            "NoImages=2\r\nImage0=blue.ndpi\r\nImage1=green.ndpi\r\n",
+        )
+        .unwrap();
+
+        let mut reader = NdpisReader::new();
+        reader.set_id(&index).expect("NDPIS RGB companion fixture");
+
+        assert_eq!(reader.metadata().size_c, 2);
+        assert_eq!(reader.metadata().image_count, 2);
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![20, 60]);
+        assert_eq!(reader.open_bytes(1).unwrap(), vec![41, 31]);
+        assert_eq!(reader.open_bytes_region(0, 1, 0, 1, 1).unwrap(), vec![60]);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     fn write_one_pixel_png(path: &Path, value: u8) {
         let image = image::GrayImage::from_raw(1, 1, vec![value]).unwrap();
         image.save(path).unwrap();
@@ -18246,6 +18407,9 @@ EndClass: 0
             7,
             "[Imaris]\nName=sample_name.ims\nName=DAPI\nDescription=desc\nRecordingDate=2024-01-02 03:04:05.678\n",
         );
+
+        let header = std::fs::read(&ims).unwrap();
+        assert!(ImarisTiffReader::new().is_this_type_by_bytes(&header));
 
         let mut reader = ImarisTiffReader::new();
         reader.set_id(&ims).unwrap();

@@ -462,8 +462,8 @@ fn metadata_tools_project_generic_plane_metadata_to_ome() {
 
     assert_eq!(ome.images[0].planes.len(), 1);
     let plane = &ome.images[0].planes[0];
-    assert_eq!(plane.the_z, 0);
-    assert_eq!(plane.the_c, 1);
+    assert_eq!(plane.the_z, 1);
+    assert_eq!(plane.the_c, 0);
     assert_eq!(plane.the_t, 0);
     assert_eq!(plane.delta_t, Some(3.5));
     assert_eq!(plane.exposure_time, Some(0.125));
@@ -473,7 +473,7 @@ fn metadata_tools_project_generic_plane_metadata_to_ome() {
 
     let xml = ome.to_ome_xml(&meta);
     assert!(xml.contains(
-        r#"<Plane TheZ="0" TheC="1" TheT="0" DeltaT="3.5" ExposureTime="0.125" PositionX="12" PositionY="-4" PositionZ="7.25"/>"#
+        r#"<Plane TheZ="1" TheC="0" TheT="0" DeltaT="3.5" ExposureTime="0.125" PositionX="12" PositionY="-4" PositionZ="7.25"/>"#
     ));
 }
 

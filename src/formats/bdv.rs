@@ -1127,8 +1127,8 @@ impl BdvReader {
                 words.iter().flat_map(|w| w.to_le_bytes()).collect()
             }
             4 => {
-                let words: Vec<u32> = ds
-                    .read_slice::<u32, _>(sel)
+                let words: Vec<i32> = ds
+                    .read_slice::<i32, _>(sel)
                     .map_err(|e| BioFormatsError::Format(format!("HDF5 read: {e}")))?;
                 words.iter().flat_map(|w| w.to_le_bytes()).collect()
             }
@@ -1163,6 +1163,15 @@ fn dataset_exists(file: &hdf5_pure_rust::File, path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_bdv_path(name: &str, ext: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("bioformats_rs_bdv_{name}_{nonce}.{ext}"))
+    }
 
     #[test]
     fn bdv_view_setup_attributes_are_preserved_as_bounded_scalars() {
@@ -1361,6 +1370,52 @@ mod tests {
 
         assert_eq!(r.channel_setups_for_logical_index(0, 0), vec![0, 1]);
         assert_eq!(r.channel_setups_for_logical_index(1, 2), vec![2, 3]);
+    }
+
+    #[test]
+    fn bdv_int32_cells_preserve_signed_java_bits() {
+        let h5_path = temp_bdv_path("signed_i32", "h5");
+        let xml_path = h5_path.with_extension("xml");
+        let h5_name = h5_path.file_name().unwrap().to_string_lossy();
+
+        let mut file = hdf5_pure_rust::WritableFile::create(&h5_path).unwrap();
+        {
+            let mut t0 = file.create_group("t00000").unwrap();
+            let mut s0 = t0.create_group("s00").unwrap();
+            let mut level0 = s0.create_group("0").unwrap();
+            level0
+                .new_dataset_builder("cells")
+                .shape(&[1, 1, 2])
+                .write::<i32>(&[-1, 0x0102_0304])
+                .unwrap();
+        }
+        file.flush().unwrap();
+
+        std::fs::write(
+            &xml_path,
+            format!(
+                r#"<SpimData>
+  <SequenceDescription>
+    <ImageLoader><hdf5>{h5_name}</hdf5></ImageLoader>
+    <ViewSetups><ViewSetup><id>0</id></ViewSetup></ViewSetups>
+    <Timepoints type="range"><first>0</first><last>0</last></Timepoints>
+  </SequenceDescription>
+</SpimData>"#
+            ),
+        )
+        .unwrap();
+
+        let mut r = BdvReader::new();
+        r.set_id(&xml_path).unwrap();
+
+        assert_eq!(r.metadata().pixel_type, PixelType::Int32);
+        assert_eq!(
+            r.open_bytes(0).unwrap(),
+            [(-1i32).to_le_bytes(), 0x0102_0304i32.to_le_bytes()].concat()
+        );
+
+        let _ = std::fs::remove_file(&xml_path);
+        let _ = std::fs::remove_file(&h5_path);
     }
 
     #[test]

@@ -1125,6 +1125,49 @@ fn ipw_multiplies_imageinfo_channels_by_rgb_samples_like_java() {
 }
 
 #[test]
+fn ipw_preserves_imageinfo_metadata_lines_like_java() {
+    use std::io::Write;
+
+    let tiff_path = tmp("ipw_metadata_embedded.tif");
+    let tiff = write_tiny_tiff_bytes(&tiff_path);
+    let path = tmp("metadata_axis.ipw");
+    let mut comp = cfb::create(&path).unwrap();
+    comp.create_storage_all("/0").unwrap();
+    comp.create_stream("/0/ImageTIFF")
+        .unwrap()
+        .write_all(&tiff)
+        .unwrap();
+    comp.create_stream("/ImageInfo")
+        .unwrap()
+        .write_all(b"channels=1\nslices=1\n06/19/2026 01:02:03 PM\nComment=hello\n")
+        .unwrap();
+    drop(comp);
+
+    let mut reader = bioformats::formats::camera2::IpwReader::new();
+    reader.set_id(&path).unwrap();
+    let md = &reader.metadata().series_metadata;
+    assert!(matches!(
+        md.get("Image Description"),
+        Some(MetadataValue::String(value)) if value.contains("Comment=hello")
+    ));
+    assert!(matches!(
+        md.get("Timestamp"),
+        Some(MetadataValue::String(value)) if value == "06/19/2026 01:02:03 PM"
+    ));
+    assert!(matches!(
+        md.get("Comment"),
+        Some(MetadataValue::String(value)) if value == "hello"
+    ));
+    assert!(matches!(
+        md.get("frames"),
+        Some(MetadataValue::String(value)) if value == "1"
+    ));
+
+    let _ = std::fs::remove_file(tiff_path);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
 fn aim_rejects_missing_magic_zero_dimensions_and_short_payload() {
     let mut uninit = bioformats::formats::aim::AimReader::new();
     assert_eq!(uninit.series_count(), 0);
@@ -9259,8 +9302,9 @@ fn ics_writer_counts_channel_axis_in_layout_parameters() {
     let contents = std::fs::read_to_string(&path)
         .unwrap_or_else(|_| String::from_utf8_lossy(&std::fs::read(&path).unwrap()).to_string());
 
-    assert!(contents.contains("layout\tparameters\t4"));
-    assert!(contents.contains("layout\torder\tbits ch x y"));
+    assert!(contents.contains("layout\tparameters\t6"));
+    assert!(contents.contains("layout\torder\tbits ch x y z t"));
+    assert!(contents.contains("layout\tsizes\t8 3 1 1 1 1"));
 }
 
 #[test]
