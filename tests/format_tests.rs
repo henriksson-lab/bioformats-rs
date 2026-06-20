@@ -888,6 +888,24 @@ fn write_tiny_tiff_bytes(path: &Path) -> Vec<u8> {
     std::fs::read(path).unwrap()
 }
 
+fn write_tiny_rgb_tiff_bytes(path: &Path) -> Vec<u8> {
+    let mut meta = ImageMetadata::default();
+    meta.size_x = 1;
+    meta.size_y = 1;
+    meta.size_c = 3;
+    meta.pixel_type = PixelType::Uint8;
+    meta.bits_per_pixel = 8;
+    meta.image_count = 1;
+    meta.is_rgb = true;
+    meta.is_interleaved = true;
+    let mut writer = bioformats::tiff::TiffWriter::new();
+    writer.set_metadata(&meta).unwrap();
+    writer.set_id(path).unwrap();
+    writer.save_bytes(0, &[1, 2, 3]).unwrap();
+    writer.close().unwrap();
+    std::fs::read(path).unwrap()
+}
+
 fn write_tiny_flex_tiff(path: &Path, xml: &str, pixel: u8) {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(b"II");
@@ -1072,6 +1090,35 @@ fn ipw_normalizes_zero_imageinfo_axes_like_java() {
         ),
         (1, 1, 1)
     );
+
+    let _ = std::fs::remove_file(tiff_path);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn ipw_multiplies_imageinfo_channels_by_rgb_samples_like_java() {
+    use std::io::Write;
+
+    let tiff_path = tmp("ipw_embedded_rgb.tif");
+    let tiff = write_tiny_rgb_tiff_bytes(&tiff_path);
+    let path = tmp("rgb_axis.ipw");
+    let mut comp = cfb::create(&path).unwrap();
+    comp.create_storage_all("/0").unwrap();
+    comp.create_stream("/0/ImageTIFF")
+        .unwrap()
+        .write_all(&tiff)
+        .unwrap();
+    comp.create_stream("/ImageInfo")
+        .unwrap()
+        .write_all(b"channels=2\nslices=1\nframes=1\n")
+        .unwrap();
+    drop(comp);
+
+    let mut reader = bioformats::formats::camera2::IpwReader::new();
+    reader.set_id(&path).unwrap();
+    assert!(reader.metadata().is_rgb);
+    assert_eq!(reader.metadata().size_c, 6);
+    assert_eq!(reader.metadata().dimension_order, DimensionOrder::XYCZT);
 
     let _ = std::fs::remove_file(tiff_path);
     let _ = std::fs::remove_file(path);

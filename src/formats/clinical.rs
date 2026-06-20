@@ -1172,7 +1172,8 @@ struct InveonHeader {
     bits_per_pixel: u8,
     little_endian: bool,
     data_file: Option<PathBuf>,
-    data_offset: u64,
+    data_offsets: Vec<u64>,
+    series_count: usize,
     physical_size_x: Option<f64>,
     physical_size_y: Option<f64>,
     physical_size_z: Option<f64>,
@@ -1206,7 +1207,9 @@ fn parse_inveon_header(path: &Path) -> Result<InveonHeader> {
     let mut nt: Option<u32> = None;
     let mut data_type: Option<i32> = None;
     let mut data_file: Option<PathBuf> = None;
-    let mut data_offset = 0u64;
+    let mut data_offsets = Vec::new();
+    let mut total_frames = 0u32;
+    let mut series_count = 1usize;
     let mut physical_size_x = None;
     let mut physical_size_y = None;
     let mut physical_size_z = None;
@@ -1241,9 +1244,25 @@ fn parse_inveon_header(path: &Path) -> Result<InveonHeader> {
                     }
                 }
             }
+        } else if lo.starts_with("total_frames") {
+            total_frames = parts
+                .get(1)
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(0);
+        } else if lo.starts_with("number_of_bed_positions") {
+            let n_pos = parts
+                .get(1)
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(0);
+            let java_series = total_frames.min(n_pos);
+            if java_series > 1 {
+                series_count = java_series as usize;
+            }
         } else if lo.starts_with("data_file_pointer") {
             if let Some(value) = t.strip_prefix(parts.first().copied().unwrap_or_default()) {
-                data_offset = inveon_data_pointer(value.trim()).unwrap_or(data_offset);
+                if let Some(offset) = inveon_data_pointer(value.trim()) {
+                    data_offsets.push(offset);
+                }
             }
         } else if lo.starts_with("pixel_size_x") {
             physical_size_x = parts
@@ -1313,7 +1332,8 @@ fn parse_inveon_header(path: &Path) -> Result<InveonHeader> {
         bits_per_pixel: bpp,
         little_endian,
         data_file,
-        data_offset,
+        data_offsets,
+        series_count,
         physical_size_x,
         physical_size_y,
         physical_size_z,
@@ -1324,8 +1344,9 @@ fn parse_inveon_header(path: &Path) -> Result<InveonHeader> {
 pub struct InveonReader {
     hdr_path: Option<PathBuf>,
     img_path: Option<PathBuf>,
-    meta: Option<ImageMetadata>,
-    data_offset: u64,
+    metas: Vec<ImageMetadata>,
+    current_series: usize,
+    data_offsets: Vec<u64>,
     physical_size_x: Option<f64>,
     physical_size_y: Option<f64>,
     physical_size_z: Option<f64>,
@@ -1336,8 +1357,9 @@ impl InveonReader {
         InveonReader {
             hdr_path: None,
             img_path: None,
-            meta: None,
-            data_offset: 0,
+            metas: Vec::new(),
+            current_series: 0,
+            data_offsets: Vec::new(),
             physical_size_x: None,
             physical_size_y: None,
             physical_size_z: None,
@@ -1379,6 +1401,7 @@ impl FormatReader for InveonReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.close()?;
         let stem = path.file_stem().unwrap_or_default();
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
 
@@ -1396,6 +1419,11 @@ impl FormatReader for InveonReader {
 
         let header = parse_inveon_header(&hdr_path)?;
         let img_path = header.data_file.clone().unwrap_or(default_img_path);
+        let data_offsets = if header.data_offsets.is_empty() {
+            vec![0]
+        } else {
+            header.data_offsets.clone()
+        };
         let bps = header.pixel_type.bytes_per_sample() as u64;
         let plane_count = header
             .size_z
@@ -1406,17 +1434,18 @@ impl FormatReader for InveonReader {
             .and_then(|px| px.checked_mul(plane_count as u64))
             .and_then(|px| px.checked_mul(bps))
             .ok_or_else(|| BioFormatsError::Format("Inveon payload size overflows".into()))?;
-        let required_len = header
-            .data_offset
-            .checked_add(pixel_bytes)
-            .ok_or_else(|| BioFormatsError::Format("Inveon payload size overflows".into()))?;
         let img_len = std::fs::metadata(&img_path)
             .map_err(BioFormatsError::Io)?
             .len();
-        if img_len < required_len {
-            return Err(BioFormatsError::UnsupportedFormat(format!(
-                "Inveon pixel payload is shorter than declared ({img_len} < {required_len})"
-            )));
+        for data_offset in data_offsets.iter().take(header.series_count) {
+            let required_len = data_offset
+                .checked_add(pixel_bytes)
+                .ok_or_else(|| BioFormatsError::Format("Inveon payload size overflows".into()))?;
+            if img_len < required_len {
+                return Err(BioFormatsError::UnsupportedFormat(format!(
+                    "Inveon pixel payload is shorter than declared ({img_len} < {required_len})"
+                )));
+            }
         }
 
         let mut meta_map: HashMap<String, MetadataValue> = header.metadata;
@@ -1425,7 +1454,7 @@ impl FormatReader for InveonReader {
             MetadataValue::String("Siemens Inveon".into()),
         );
 
-        self.meta = Some(ImageMetadata {
+        let meta = ImageMetadata {
             size_x: header.size_x,
             size_y: header.size_y,
             size_z: header.size_z,
@@ -1446,10 +1475,11 @@ impl FormatReader for InveonReader {
             modulo_z: None,
             modulo_c: None,
             modulo_t: None,
-        });
+        };
+        self.metas = vec![meta; header.series_count];
         self.hdr_path = Some(hdr_path);
         self.img_path = Some(img_path);
-        self.data_offset = header.data_offset;
+        self.data_offsets = data_offsets;
         self.physical_size_x = header.physical_size_x;
         self.physical_size_y = header.physical_size_y;
         self.physical_size_z = header.physical_size_z;
@@ -1459,43 +1489,56 @@ impl FormatReader for InveonReader {
     fn close(&mut self) -> Result<()> {
         self.hdr_path = None;
         self.img_path = None;
-        self.meta = None;
-        self.data_offset = 0;
+        self.metas.clear();
+        self.current_series = 0;
+        self.data_offsets.clear();
         self.physical_size_x = None;
         self.physical_size_y = None;
         self.physical_size_z = None;
         Ok(())
     }
     fn series_count(&self) -> usize {
-        usize::from(self.meta.is_some())
+        self.metas.len()
     }
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if self.meta.is_none() {
+        if self.metas.is_empty() {
             Err(BioFormatsError::NotInitialized)
-        } else if s != 0 {
-            Err(BioFormatsError::SeriesOutOfRange(s))
-        } else {
+        } else if s < self.metas.len() {
+            self.current_series = s;
             Ok(())
+        } else {
+            Err(BioFormatsError::SeriesOutOfRange(s))
         }
     }
     fn series(&self) -> usize {
-        0
+        self.current_series
     }
     fn metadata(&self) -> &ImageMetadata {
-        self.meta
-            .as_ref()
+        self.metas
+            .get(self.current_series)
             .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let meta = self
+            .metas
+            .get(self.current_series)
+            .ok_or(BioFormatsError::NotInitialized)?;
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
         let bps = meta.pixel_type.bytes_per_sample();
         let plane_bytes = (meta.size_x * meta.size_y) as usize * bps;
         let offset = self
-            .data_offset
+            .data_offsets
+            .get(self.current_series)
+            .copied()
+            .ok_or_else(|| {
+                BioFormatsError::Format(format!(
+                    "Inveon missing data pointer for series {}",
+                    self.current_series
+                ))
+            })?
             .checked_add(plane_index as u64 * plane_bytes as u64)
             .ok_or_else(|| BioFormatsError::Format("Inveon pixel offset overflows".into()))?;
         let img_path = self
@@ -1519,19 +1562,25 @@ impl FormatReader for InveonReader {
         h: u32,
     ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let meta = self
+            .metas
+            .get(self.current_series)
+            .ok_or(BioFormatsError::NotInitialized)?;
         crop_full_plane("Inveon", &full, meta, 1, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let meta = self
+            .metas
+            .get(self.current_series)
+            .ok_or(BioFormatsError::NotInitialized)?;
         let (tw, th) = (meta.size_x.min(256), meta.size_y.min(256));
         let (tx, ty) = ((meta.size_x - tw) / 2, (meta.size_y - th) / 2);
         self.open_bytes_region(plane_index, tx, ty, tw, th)
     }
 
     fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
-        let meta = self.meta.as_ref()?;
+        let meta = self.metas.get(self.current_series)?;
         let mut ome = crate::common::ome_metadata::OmeMetadata::from_image_metadata(meta);
         if let Some(image) = ome.images.first_mut() {
             image.physical_size_x = self.physical_size_x;
@@ -2312,6 +2361,32 @@ mod clinical_metadata_tests {
             meta_str(&meta.series_metadata, "file_type").as_deref(),
             Some("Image data")
         );
+        let _ = std::fs::remove_file(&hdr);
+        let _ = std::fs::remove_file(&img);
+    }
+
+    #[test]
+    fn inveon_uses_java_data_pointer_per_bed_position_series() {
+        let base = tmp_path("scan_multi_bed");
+        let hdr = base.with_extension("hdr");
+        let img = base.with_extension("img");
+        std::fs::write(
+            &hdr,
+            b"x_dimension 1\ny_dimension 1\nz_dimension 1\ndata_type 1\n\
+              total_frames 2\nnumber_of_bed_positions 2\n\
+              data_file_pointer 0\ndata_file_pointer 4\n",
+        )
+        .unwrap();
+        std::fs::write(&img, [11u8, 0, 0, 0, 22]).unwrap();
+
+        let mut reader = InveonReader::new();
+        reader.set_id(&hdr).expect("inveon set_id");
+
+        assert_eq!(reader.series_count(), 2);
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![11]);
+        reader.set_series(1).unwrap();
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![22]);
+
         let _ = std::fs::remove_file(&hdr);
         let _ = std::fs::remove_file(&img);
     }

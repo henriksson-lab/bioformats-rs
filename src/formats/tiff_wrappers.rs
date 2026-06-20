@@ -6969,6 +6969,61 @@ impl ImprovisionTiffReader {
             }
         }
     }
+
+    fn tiff_header_comment_contains_improvision(header: &[u8]) -> bool {
+        (|| -> Option<bool> {
+            if header.len() < 8 {
+                return Some(false);
+            }
+            let little = match &header[..4] {
+                b"II*\0" => true,
+                b"MM\0*" => false,
+                _ => return Some(false),
+            };
+            let read_u16 = |offset: usize| -> Option<u16> {
+                let bytes = header.get(offset..offset + 2)?;
+                Some(if little {
+                    u16::from_le_bytes([bytes[0], bytes[1]])
+                } else {
+                    u16::from_be_bytes([bytes[0], bytes[1]])
+                })
+            };
+            let read_u32 = |offset: usize| -> Option<u32> {
+                let bytes = header.get(offset..offset + 4)?;
+                Some(if little {
+                    u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+                } else {
+                    u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+                })
+            };
+
+            let ifd_offset = read_u32(4)? as usize;
+            let entry_count = read_u16(ifd_offset)? as usize;
+            let entries_start = ifd_offset.checked_add(2)?;
+            for entry_index in 0..entry_count {
+                let entry = entries_start.checked_add(entry_index.checked_mul(12)?)?;
+                let tag = read_u16(entry)?;
+                if tag != crate::tiff::ifd::tag::IMAGE_DESCRIPTION {
+                    continue;
+                }
+                let field_type = read_u16(entry + 2)?;
+                let count = read_u32(entry + 4)? as usize;
+                if field_type != 2 || count == 0 {
+                    return Some(false);
+                }
+                let value_or_offset = header.get(entry + 8..entry + 12)?;
+                let bytes = if count <= 4 {
+                    &value_or_offset[..count.min(value_or_offset.len())]
+                } else {
+                    let offset = read_u32(entry + 8)? as usize;
+                    header.get(offset..offset.checked_add(count)?)?
+                };
+                return Some(String::from_utf8_lossy(bytes).contains("Improvision"));
+            }
+            Some(false)
+        })()
+        .unwrap_or(false)
+    }
 }
 
 impl Default for ImprovisionTiffReader {
@@ -6986,8 +7041,8 @@ impl FormatReader for ImprovisionTiffReader {
         matches!(ext.as_deref(), Some("tif") | Some("tiff"))
     }
 
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
-        false
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        Self::tiff_header_comment_contains_improvision(header)
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
@@ -11673,6 +11728,15 @@ mod leica_scn_tests {
 mod improvision_tests {
     use super::*;
 
+    fn tiff_entry(tag: u16, typ: u16, count: u32, value: u32) -> [u8; 12] {
+        let mut entry = [0u8; 12];
+        entry[0..2].copy_from_slice(&tag.to_le_bytes());
+        entry[2..4].copy_from_slice(&typ.to_le_bytes());
+        entry[4..8].copy_from_slice(&count.to_le_bytes());
+        entry[8..12].copy_from_slice(&value.to_le_bytes());
+        entry
+    }
+
     // Comments shaped like Improvision/Volocity per-plane ImageDescription,
     // covering the keys Java's ImprovisionTiffReader parses into data fields.
     fn sample_comments() -> Vec<String> {
@@ -11737,6 +11801,59 @@ mod improvision_tests {
         // So directly assert the helper is a no-op without a series, matching
         // Java guarding on core.get(0,0).
         assert!(r.ome_images.is_empty());
+    }
+
+    #[test]
+    fn byte_detection_reads_java_improvision_tiff_comment() {
+        let path = std::env::temp_dir().join(format!(
+            "bioformats_rs_improvision_probe_{}.tif",
+            std::process::id()
+        ));
+        let mut desc = b"Improvision\nTotalChannels=1".to_vec();
+        desc.push(0);
+
+        let ifd_entry_count = 11u32;
+        let ifd_start = 8u32;
+        let desc_start = ifd_start + 2 + ifd_entry_count * 12 + 4;
+        let pixel_start = desc_start + desc.len() as u32;
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"II");
+        bytes.extend_from_slice(&42u16.to_le_bytes());
+        bytes.extend_from_slice(&ifd_start.to_le_bytes());
+        let entries = [
+            tiff_entry(256, 4, 1, 1),
+            tiff_entry(257, 4, 1, 1),
+            tiff_entry(258, 3, 1, 8),
+            tiff_entry(259, 3, 1, 1),
+            tiff_entry(262, 3, 1, 1),
+            tiff_entry(270, 2, desc.len() as u32, desc_start),
+            tiff_entry(273, 4, 1, pixel_start),
+            tiff_entry(277, 3, 1, 1),
+            tiff_entry(278, 4, 1, 1),
+            tiff_entry(279, 4, 1, 1),
+            tiff_entry(284, 3, 1, 1),
+        ];
+        bytes.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        for entry in entries {
+            bytes.extend_from_slice(&entry);
+        }
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&desc);
+        bytes.push(7);
+
+        std::fs::write(&path, &bytes).unwrap();
+        let file_bytes = std::fs::read(&path).unwrap();
+        assert!(ImprovisionTiffReader::new().is_this_type_by_bytes(&file_bytes));
+
+        let mut plain = file_bytes.clone();
+        let marker = plain
+            .windows("Improvision".len())
+            .position(|window| window == b"Improvision")
+            .unwrap();
+        plain[marker..marker + "Improvision".len()].copy_from_slice(b"plain-text!");
+        assert!(!ImprovisionTiffReader::new().is_this_type_by_bytes(&plain));
+        let _ = std::fs::remove_file(path);
     }
 }
 

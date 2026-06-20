@@ -2372,7 +2372,7 @@ impl FormatReader for IpwReader {
         std::fs::remove_file(&tmp).ok();
 
         let mut size_z = size_z.unwrap_or(1);
-        let size_c = size_c.unwrap_or(1).max(1);
+        let mut size_c = size_c.unwrap_or(1).max(1);
         let size_t = size_t.unwrap_or(1).max(1);
         if size_z == 0 {
             size_z = 1;
@@ -2380,6 +2380,9 @@ impl FormatReader for IpwReader {
         // Java: if axis product == 1 but multiple planes exist, treat as Z.
         if size_z * size_c * size_t == 1 && image_count != 1 {
             size_z = image_count;
+        }
+        if first_meta.is_rgb {
+            size_c = size_c.saturating_mul(first_meta.size_c.max(1));
         }
 
         let meta = ImageMetadata {
@@ -2600,7 +2603,8 @@ fn photoshop_clean_layer_name(bytes: &[u8]) -> String {
 /// and the layer count, mirroring the Java reader's `initFile` layer loop.
 pub struct PhotoshopTiffReader {
     inner: crate::tiff::TiffReader,
-    meta: Option<ImageMetadata>,
+    metas: Vec<ImageMetadata>,
+    current_series: usize,
     /// Decoded, ASCII-cleaned layer names (Java `layerNames`, filtered).
     layer_names: Vec<String>,
 }
@@ -2609,7 +2613,8 @@ impl PhotoshopTiffReader {
     pub fn new() -> Self {
         PhotoshopTiffReader {
             inner: crate::tiff::TiffReader::new(),
-            meta: None,
+            metas: Vec::new(),
+            current_series: 0,
             layer_names: Vec::new(),
         }
     }
@@ -2642,6 +2647,7 @@ impl PhotoshopTiffReader {
 
         // Series 0 ("Merged") is the inner TIFF; further series are layers.
         let mut series_count: usize = 1;
+        let mut layer_metas: Vec<ImageMetadata> = Vec::new();
 
         while tag.fp() < tag.len().saturating_sub(12) && tag.fp() > 0 {
             let _signature = tag.read_string(4);
@@ -2672,6 +2678,7 @@ impl PhotoshopTiffReader {
                     if layer_size_x == 0 || layer_size_y == 0 || (layer_size_c > 1 && !is_rgb) {
                         series_count = 1;
                         self.layer_names.clear();
+                        layer_metas.clear();
                         break;
                     }
 
@@ -2707,7 +2714,18 @@ impl PhotoshopTiffReader {
                     if layer_name.len() == name_length + pad
                         && !layer_name.eq_ignore_ascii_case(&synthetic)
                     {
+                        let mut layer_meta = self.inner.metadata().clone();
+                        layer_meta.size_x = layer_size_x as u32;
+                        layer_meta.size_y = layer_size_y as u32;
+                        layer_meta.size_c = layer_size_c.max(1) as u32;
+                        layer_meta.size_z = 1;
+                        layer_meta.size_t = 1;
+                        layer_meta.image_count = 1;
+                        layer_meta.is_rgb = is_rgb;
+                        layer_meta.is_interleaved = self.inner.metadata().is_interleaved;
+                        layer_meta.dimension_order = self.inner.metadata().dimension_order;
                         self.layer_names.push(layer_name);
+                        layer_metas.push(layer_meta);
                         series_count += 1;
                     }
 
@@ -2726,21 +2744,33 @@ impl PhotoshopTiffReader {
             }
         }
 
-        // Java: store.setImageName("Merged", 0) and per-layer names; expose the
-        // accepted layer names as a "Layer name" global-metadata list.
-        let mut meta = self.inner.metadata().clone();
+        // Java: store.setImageName("Merged", 0), then add one CoreMetadata per
+        // accepted layer. Pixel offsets are not decoded here, but the exposed
+        // series metadata/dimensions match the Java layer discovery path.
+        let mut merged = self.inner.metadata().clone();
+        let mut metas = vec![merged.clone()];
         for (i, name) in self.layer_names.iter().enumerate() {
-            meta.series_metadata.insert(
+            merged.series_metadata.insert(
                 format!("Layer name #{}", i + 1),
                 MetadataValue::String(name.clone()),
             );
+            let mut layer_meta = layer_metas
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| self.inner.metadata().clone());
+            layer_meta
+                .series_metadata
+                .insert("ImageName".into(), MetadataValue::String(name.clone()));
+            metas.push(layer_meta);
         }
-        meta.series_metadata.insert(
+        merged.series_metadata.insert(
             "Photoshop layer count".to_string(),
             MetadataValue::Int(self.layer_names.len() as i64),
         );
+        metas[0] = merged;
         let _ = series_count;
-        self.meta = Some(meta);
+        self.metas = metas;
+        self.current_series = 0;
     }
 }
 
@@ -2768,44 +2798,65 @@ impl FormatReader for PhotoshopTiffReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.close()?;
         self.inner.set_id(path)?;
         self.layer_names.clear();
         // Mirror Java openPixelTag()/initFile(): parse the layer payload when
         // the IMAGE_SOURCE_DATA tag is present, else fall back to plain TIFF.
         match self.open_pixel_tag() {
             Some(source_data) => self.init_file(&source_data),
-            None => self.meta = Some(self.inner.metadata().clone()),
+            None => self.metas = vec![self.inner.metadata().clone()],
         }
         Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
         self.layer_names.clear();
-        self.meta = None;
+        self.metas.clear();
+        self.current_series = 0;
         self.inner.close()
     }
 
     fn series_count(&self) -> usize {
-        self.inner.series_count()
+        self.metas.len()
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        self.inner.set_series(s)
+        if s >= self.metas.len() {
+            return Err(BioFormatsError::SeriesOutOfRange(s));
+        }
+        self.current_series = s;
+        if s == 0 {
+            self.inner.set_series(0)?;
+        }
+        Ok(())
     }
 
     fn series(&self) -> usize {
-        self.inner.series()
+        self.current_series
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().unwrap_or_else(|| self.inner.metadata())
+        self.metas
+            .get(self.current_series)
+            .unwrap_or_else(|| self.inner.metadata())
     }
 
     fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
+        if self.current_series != 0 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "Photoshop TIFF layer pixel decoding is not supported".into(),
+            ));
+        }
         self.inner.open_bytes(p)
     }
 
     fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+        if self.current_series != 0 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "Photoshop TIFF layer pixel decoding is not supported".into(),
+            ));
+        }
         self.inner.open_bytes_region(p, x, y, w, h)
     }
 
@@ -3797,6 +3848,7 @@ mod tests {
         reader.init_file(&payload);
 
         assert_eq!(reader.layer_names, vec!["Backgrnd".to_string()]);
+        assert_eq!(reader.series_count(), 2);
         let meta = reader.metadata();
         match meta.series_metadata.get("Layer name #1") {
             Some(MetadataValue::String(value)) => assert_eq!(value, "Backgrnd"),
@@ -3806,6 +3858,20 @@ mod tests {
             Some(MetadataValue::Int(value)) => assert_eq!(*value, 1),
             other => panic!("unexpected layer-count metadata: {other:?}"),
         }
+        reader.set_series(1).unwrap();
+        assert_eq!(
+            (
+                reader.metadata().size_x,
+                reader.metadata().size_y,
+                reader.metadata().size_c,
+                reader.metadata().image_count,
+            ),
+            (4, 4, 1, 1)
+        );
+        assert!(matches!(
+            reader.metadata().series_metadata.get("ImageName"),
+            Some(MetadataValue::String(value)) if value == "Backgrnd"
+        ));
     }
 
     #[test]

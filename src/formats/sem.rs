@@ -52,7 +52,7 @@ impl FormatReader for InrReader {
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
-        header.len() >= 13 && &header[0..13] == b"#INRIMAGE-4#{"
+        header.len() >= 9 && &header[0..9] == b"#INRIMAGE"
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
@@ -75,7 +75,6 @@ impl FormatReader for InrReader {
         let mut bpp: Option<u32> = None;
         // Java: isSigned = TYPE.toLowerCase().startsWith("signed")
         let mut is_signed = false;
-        let mut little_endian = true;
         let mut physical_size_x: Option<f64> = None;
         let mut physical_size_y: Option<f64> = None;
         let mut physical_size_z: Option<f64> = None;
@@ -119,12 +118,6 @@ impl FormatReader for InrReader {
                         // Java INRReader.java:127-129:
                         //   isSigned = value.toLowerCase().startsWith("signed")
                         is_signed = val.to_ascii_lowercase().starts_with("signed");
-                    }
-                    "CPU" => {
-                        little_endian = matches!(val, "decm" | "pc");
-                        if val == "sun" || val == "sgi" {
-                            little_endian = false;
-                        }
                     }
                     "VX" => {
                         physical_size_x = val.parse::<f64>().ok();
@@ -222,7 +215,7 @@ impl FormatReader for InrReader {
             is_rgb: false,
             is_interleaved: false,
             is_indexed: false,
-            is_little_endian: little_endian,
+            is_little_endian: false,
             resolution_count: 1,
             thumbnail: false,
             series_metadata,
@@ -2972,6 +2965,29 @@ mod inr_tests {
         assert_eq!(m.image_count, 12, "image_count = z*t*c");
         assert_eq!(m.dimension_order, DimensionOrder::XYZTC);
         assert_eq!(m.pixel_type, PixelType::Uint8);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn inr_detection_accepts_java_magic_prefix() {
+        let reader = InrReader::new();
+        assert!(reader.is_this_type_by_bytes(b"#INRIMAGE legacy header"));
+        assert!(reader.is_this_type_by_bytes(b"#INRIMAGE-4#{"));
+        assert!(!reader.is_this_type_by_bytes(b"#INRIMA"));
+    }
+
+    #[test]
+    fn inr_cpu_header_does_not_change_java_core_endianness() {
+        let tmp = std::env::temp_dir();
+        let body = "XDIM=1\nYDIM=1\nPIXSIZE=16 bits\nTYPE=unsigned fixed\nCPU=pc\n";
+        let path = write_inr(&tmp, "inr_cpu_endian_test.inr", body, &[0, 1]);
+
+        let mut r = InrReader::new();
+        r.set_id(&path).unwrap();
+        assert!(
+            !r.metadata().is_little_endian,
+            "Java INRReader leaves CoreMetadata.littleEndian at its default false value"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
