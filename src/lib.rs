@@ -33,6 +33,7 @@ pub mod error;
 pub mod formats;
 pub mod memoizer;
 pub mod metadata;
+mod metakit;
 pub mod pixel;
 pub mod reader;
 mod reader_order;

@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::common::codec::{decompress_deflate, decompress_lzw, decompress_packbits};
 use crate::common::error::{BioFormatsError, Result};
 use crate::common::io::read_bytes_at;
-use crate::common::metadata::{ImageMetadata, MetadataValue, ModuloAnnotation};
+use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue, ModuloAnnotation};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
 use crate::common::region::crop_full_plane;
@@ -8030,6 +8030,7 @@ impl FormatReader for ImarisReader {
 pub struct XlefReader {
     delegates: Vec<XlefDelegate>,
     lms_metadata: Vec<ImageMetadata>,
+    lms_pixels: Vec<XlefLmsPixelLeaf>,
     series_map: Vec<XlefSeriesRef>,
     project_metadata: Vec<ImageMetadata>,
     current_series: usize,
@@ -8044,6 +8045,16 @@ struct XlefDelegate {
     path: PathBuf,
 }
 
+#[derive(Clone)]
+struct XlefLmsPixelLeaf {
+    storage_path: PathBuf,
+    x_stride: usize,
+    row_stride: usize,
+    z_stride: usize,
+    c_stride: usize,
+    t_stride: usize,
+}
+
 #[derive(Clone, Copy)]
 enum XlefSeriesRef {
     Delegate {
@@ -8054,6 +8065,7 @@ enum XlefSeriesRef {
     },
     Lms {
         metadata: usize,
+        pixels: Option<usize>,
     },
 }
 
@@ -8062,6 +8074,7 @@ impl XlefReader {
         XlefReader {
             delegates: Vec::new(),
             lms_metadata: Vec::new(),
+            lms_pixels: Vec::new(),
             series_map: Vec::new(),
             project_metadata: Vec::new(),
             current_series: 0,
@@ -8164,7 +8177,12 @@ impl XlefReader {
                     Err(BioFormatsError::NotInitialized)
                 }
             }
-            XlefSeriesRef::Lms { .. } => Err(BioFormatsError::UnsupportedFormat(
+            XlefSeriesRef::Lms {
+                pixels: Some(_), ..
+            } => Err(BioFormatsError::Format(
+                "Leica XLEF LMS pixel leaf is not a delegate reader".into(),
+            )),
+            XlefSeriesRef::Lms { pixels: None, .. } => Err(BioFormatsError::UnsupportedFormat(
                 "Leica XLEF LMS metadata series has no pixel delegate yet".into(),
             )),
         }
@@ -8183,7 +8201,18 @@ impl XlefReader {
     fn current_lms_metadata(&self) -> Option<&ImageMetadata> {
         match self.series_map.get(self.current_series)? {
             XlefSeriesRef::Delegate { .. } => None,
-            XlefSeriesRef::Lms { metadata } => self.lms_metadata.get(*metadata),
+            XlefSeriesRef::Lms { metadata, .. } => self.lms_metadata.get(*metadata),
+        }
+    }
+
+    fn current_lms_pixel_leaf(&self) -> Option<&XlefLmsPixelLeaf> {
+        match self.series_map.get(self.current_series)? {
+            XlefSeriesRef::Delegate { .. } => None,
+            XlefSeriesRef::Lms {
+                pixels: Some(pixels),
+                ..
+            } => self.lms_pixels.get(*pixels),
+            XlefSeriesRef::Lms { pixels: None, .. } => None,
         }
     }
 
@@ -8193,6 +8222,9 @@ impl XlefReader {
     /// (Java LMSMainXmlNodes: ChannelDescription/DimensionDescription BytesInc plus
     /// Memory/Storage block nodes) so callers know exactly what was unsupported.
     fn lms_pixel_delegate_error(&self) -> Option<BioFormatsError> {
+        if self.current_lms_pixel_leaf().is_some() {
+            return None;
+        }
         let meta = self.current_lms_metadata()?;
         let int = |key: &str| match meta.series_metadata.get(key) {
             Some(crate::common::metadata::MetadataValue::Int(value)) => *value,
@@ -8287,7 +8319,7 @@ impl XlefReader {
                         Some(tile),
                     )
                 }
-                XlefSeriesRef::Lms { metadata } => {
+                XlefSeriesRef::Lms { metadata, .. } => {
                     let meta = self
                         .lms_metadata
                         .get(metadata)
@@ -8295,7 +8327,12 @@ impl XlefReader {
                         .clone();
                     let source_path =
                         xlef_lms_metadata_string(&meta, "xlef.lms.path").unwrap_or_default();
-                    (meta, source_path, "lms_metadata", None)
+                    let source_kind = if self.current_lms_pixel_for_mapping(mapping).is_some() {
+                        "lms_pixel"
+                    } else {
+                        "lms_metadata"
+                    };
+                    (meta, source_path, source_kind, None)
                 }
             };
 
@@ -8341,6 +8378,92 @@ impl XlefReader {
 
         self.project_metadata = metadata;
         Ok(())
+    }
+
+    fn current_lms_pixel_for_mapping(&self, mapping: XlefSeriesRef) -> Option<&XlefLmsPixelLeaf> {
+        match mapping {
+            XlefSeriesRef::Lms {
+                pixels: Some(pixels),
+                ..
+            } => self.lms_pixels.get(pixels),
+            _ => None,
+        }
+    }
+
+    fn open_lms_pixel_bytes(&self, plane_index: u32) -> Result<Vec<u8>> {
+        let meta = self
+            .current_lms_metadata()
+            .ok_or(BioFormatsError::NotInitialized)?;
+        if plane_index >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        self.open_lms_pixel_region(plane_index, 0, 0, meta.size_x, meta.size_y)
+    }
+
+    fn open_lms_pixel_region(
+        &self,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
+        let meta = self
+            .current_lms_metadata()
+            .ok_or(BioFormatsError::NotInitialized)?;
+        let pixels = self
+            .current_lms_pixel_leaf()
+            .ok_or(BioFormatsError::NotInitialized)?;
+        if plane_index >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        if x > meta.size_x
+            || y > meta.size_y
+            || w > meta.size_x.saturating_sub(x)
+            || h > meta.size_y.saturating_sub(y)
+        {
+            return Err(BioFormatsError::Format(format!(
+                "Leica XLEF LMS region ({x}, {y}, {w}, {h}) exceeds image bounds {}x{}",
+                meta.size_x, meta.size_y
+            )));
+        }
+        let sample_bytes = meta.pixel_type.bytes_per_sample();
+        let row_bytes = (w as usize)
+            .checked_mul(sample_bytes)
+            .ok_or_else(|| BioFormatsError::Format("Leica XLEF LMS row size overflows".into()))?;
+        let out_len = row_bytes.checked_mul(h as usize).ok_or_else(|| {
+            BioFormatsError::Format("Leica XLEF LMS region size overflows".into())
+        })?;
+        let plane_offset = xlef_lms_plane_offset(meta, pixels, plane_index)?;
+        let x_offset = (x as usize)
+            .checked_mul(pixels.x_stride)
+            .ok_or_else(|| BioFormatsError::Format("Leica XLEF LMS X offset overflows".into()))?;
+        let y_offset = (y as usize)
+            .checked_mul(pixels.row_stride)
+            .ok_or_else(|| BioFormatsError::Format("Leica XLEF LMS Y offset overflows".into()))?;
+        let start_offset = plane_offset
+            .checked_add(y_offset)
+            .and_then(|offset| offset.checked_add(x_offset))
+            .ok_or_else(|| {
+                BioFormatsError::Format("Leica XLEF LMS byte offset overflows".into())
+            })?;
+        let mut out = vec![0; out_len];
+        let mut file = File::open(&pixels.storage_path).map_err(BioFormatsError::Io)?;
+        for row in 0..h as usize {
+            let src_offset = start_offset
+                .checked_add(row.checked_mul(pixels.row_stride).ok_or_else(|| {
+                    BioFormatsError::Format("Leica XLEF LMS row offset overflows".into())
+                })?)
+                .ok_or_else(|| {
+                    BioFormatsError::Format("Leica XLEF LMS row offset overflows".into())
+                })?;
+            let dst_offset = row.checked_mul(row_bytes).ok_or_else(|| {
+                BioFormatsError::Format("Leica XLEF LMS output offset overflows".into())
+            })?;
+            let row_data = read_bytes_at(&mut file, src_offset as u64, row_bytes)?;
+            out[dst_offset..dst_offset + row_bytes].copy_from_slice(&row_data);
+        }
+        Ok(out)
     }
 
     fn set_delegate_series_for_current(&mut self) -> Result<()> {
@@ -8936,6 +9059,203 @@ fn xlef_lms_pixel_type_from_sample_bytes(bytes: i64) -> Option<PixelType> {
     }
 }
 
+fn xlef_lms_pixel_leaf_for_metadata(
+    lms_path: &Path,
+    meta: &ImageMetadata,
+) -> Result<Option<XlefLmsPixelLeaf>> {
+    let status = xlef_lms_metadata_string(meta, "xlef.lms.pixel_layout.status");
+    if status.as_deref() != Some("declared_unsupported") {
+        return Ok(None);
+    }
+    if xlef_lms_metadata_int(meta, "xlef.lms.pixel_layout.memory_count").unwrap_or(0) != 0 {
+        return Ok(None);
+    }
+    if xlef_lms_metadata_int(meta, "xlef.lms.pixel_layout.storage_count").unwrap_or(0) != 1 {
+        return Ok(None);
+    }
+    if xlef_lms_metadata_int(meta, "xlef.lms.pixel_layout.dimension_bytes_inc_count").unwrap_or(0)
+        < 2
+    {
+        return Ok(None);
+    }
+    if meta.is_rgb || meta.is_interleaved || meta.size_x == 0 || meta.size_y == 0 {
+        return Ok(None);
+    }
+    let Some(storage_reference) =
+        xlef_lms_metadata_string(meta, "xlef.lms.pixel_layout.storage_reference")
+    else {
+        return Ok(None);
+    };
+    let storage_path = xlef_lms_resolve_storage_path(lms_path, &storage_reference);
+    if !storage_path.exists() {
+        return Ok(None);
+    }
+    let bytes_per_sample = meta.pixel_type.bytes_per_sample();
+    if bytes_per_sample == 0 {
+        return Ok(None);
+    }
+    let Some(x_stride) = xlef_lms_positive_stride(meta, "xlef.lms.dimension.1.bytes_inc") else {
+        return Ok(None);
+    };
+    let Some(row_stride) = xlef_lms_positive_stride(meta, "xlef.lms.dimension.2.bytes_inc") else {
+        return Ok(None);
+    };
+    if x_stride != bytes_per_sample {
+        return Ok(None);
+    }
+    let row_bytes = (meta.size_x as usize)
+        .checked_mul(bytes_per_sample)
+        .ok_or_else(|| BioFormatsError::Format("Leica XLEF LMS row stride overflows".into()))?;
+    if row_stride < row_bytes {
+        return Ok(None);
+    }
+    let z_stride = xlef_lms_optional_dimension_stride(meta, 3)?;
+    let c_stride = xlef_lms_optional_dimension_stride(meta, 5)?;
+    let t_stride = xlef_lms_optional_dimension_stride(meta, 4)?;
+    let last_offset =
+        xlef_lms_extent_last_byte(meta, x_stride, row_stride, z_stride, c_stride, t_stride)?;
+    let actual = std::fs::metadata(&storage_path)
+        .map_err(BioFormatsError::Io)?
+        .len();
+    if actual < last_offset as u64 {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "Leica XLEF LMS storage file {} is shorter than declared strided pixel layout",
+            storage_path.display()
+        )));
+    }
+    Ok(Some(XlefLmsPixelLeaf {
+        storage_path,
+        x_stride,
+        row_stride,
+        z_stride,
+        c_stride,
+        t_stride,
+    }))
+}
+
+fn xlef_lms_positive_stride(meta: &ImageMetadata, key: &str) -> Option<usize> {
+    xlef_lms_metadata_int(meta, key)
+        .and_then(|value| usize::try_from(value).ok().filter(|v| *v > 0))
+}
+
+fn xlef_lms_optional_dimension_stride(meta: &ImageMetadata, dim_id: u32) -> Result<usize> {
+    let size = match dim_id {
+        3 => meta.size_z.max(1),
+        4 => meta.size_t.max(1),
+        5 => meta.size_c.max(1),
+        _ => 1,
+    };
+    let key = format!("xlef.lms.dimension.{dim_id}.bytes_inc");
+    match xlef_lms_metadata_int(meta, &key) {
+        Some(value) if value > 0 => usize::try_from(value).map_err(|_| {
+            BioFormatsError::Format("Leica XLEF LMS dimension stride overflows".into())
+        }),
+        Some(_) if size > 1 => Err(BioFormatsError::UnsupportedFormat(format!(
+            "Leica XLEF LMS dimension {dim_id} has multiple elements but no positive BytesInc"
+        ))),
+        _ => Ok(0),
+    }
+}
+
+fn xlef_lms_extent_last_byte(
+    meta: &ImageMetadata,
+    x_stride: usize,
+    row_stride: usize,
+    z_stride: usize,
+    c_stride: usize,
+    t_stride: usize,
+) -> Result<usize> {
+    let mut offset = 0usize;
+    for (size, stride) in [
+        (meta.size_x, x_stride),
+        (meta.size_y, row_stride),
+        (meta.size_z.max(1), z_stride),
+        (meta.size_c.max(1), c_stride),
+        (meta.size_t.max(1), t_stride),
+    ] {
+        if size > 0 {
+            offset = offset
+                .checked_add((size as usize - 1).checked_mul(stride).ok_or_else(|| {
+                    BioFormatsError::Format("Leica XLEF LMS pixel extent overflows".into())
+                })?)
+                .ok_or_else(|| {
+                    BioFormatsError::Format("Leica XLEF LMS pixel extent overflows".into())
+                })?;
+        }
+    }
+    offset
+        .checked_add(meta.pixel_type.bytes_per_sample())
+        .ok_or_else(|| BioFormatsError::Format("Leica XLEF LMS pixel extent overflows".into()))
+}
+
+fn xlef_lms_plane_offset(
+    meta: &ImageMetadata,
+    pixels: &XlefLmsPixelLeaf,
+    plane_index: u32,
+) -> Result<usize> {
+    let z = meta.size_z.max(1);
+    let c = meta.size_c.max(1);
+    let t = meta.size_t.max(1);
+    let (zi, ci, ti) = match meta.dimension_order {
+        DimensionOrder::XYZCT => {
+            let zi = plane_index % z;
+            let ci = (plane_index / z) % c;
+            let ti = plane_index / z / c;
+            (zi, ci, ti)
+        }
+        DimensionOrder::XYZTC => {
+            let zi = plane_index % z;
+            let ti = (plane_index / z) % t;
+            let ci = plane_index / z / t;
+            (zi, ci, ti)
+        }
+        DimensionOrder::XYCZT => {
+            let ci = plane_index % c;
+            let zi = (plane_index / c) % z;
+            let ti = plane_index / c / z;
+            (zi, ci, ti)
+        }
+        DimensionOrder::XYCTZ => {
+            let ci = plane_index % c;
+            let ti = (plane_index / c) % t;
+            let zi = plane_index / c / t;
+            (zi, ci, ti)
+        }
+        DimensionOrder::XYTCZ => {
+            let ti = plane_index % t;
+            let ci = (plane_index / t) % c;
+            let zi = plane_index / t / c;
+            (zi, ci, ti)
+        }
+        DimensionOrder::XYTZC => {
+            let ti = plane_index % t;
+            let zi = (plane_index / t) % z;
+            let ci = plane_index / t / z;
+            (zi, ci, ti)
+        }
+    };
+    let mut offset = 0usize;
+    for (index, stride) in [
+        (zi, pixels.z_stride),
+        (ci, pixels.c_stride),
+        (ti, pixels.t_stride),
+    ] {
+        offset = offset
+            .checked_add((index as usize).checked_mul(stride).ok_or_else(|| {
+                BioFormatsError::Format("Leica XLEF LMS plane offset overflows".into())
+            })?)
+            .ok_or_else(|| {
+                BioFormatsError::Format("Leica XLEF LMS plane offset overflows".into())
+            })?;
+    }
+    Ok(offset)
+}
+
+fn xlef_lms_resolve_storage_path(lms_path: &Path, storage_reference: &str) -> PathBuf {
+    let dir = lms_path.parent().unwrap_or_else(|| Path::new(""));
+    crate::formats::leica_lms::parse_file_path(dir, storage_reference.trim())
+}
+
 const XLEF_LMS_GRAPH_CAPTURE_LIMIT: usize = 16;
 
 fn xlef_lms_capture_graph_metadata(
@@ -9249,6 +9569,19 @@ fn xlef_lms_metadata_float(meta: &ImageMetadata, key: &str) -> Option<f64> {
         }
         Some(crate::common::metadata::MetadataValue::Int(value)) => Some(*value as f64),
         Some(crate::common::metadata::MetadataValue::String(value)) => xlef_parse_f64(value),
+        _ => None,
+    }
+}
+
+fn xlef_lms_metadata_int(meta: &ImageMetadata, key: &str) -> Option<i64> {
+    match meta.series_metadata.get(key) {
+        Some(crate::common::metadata::MetadataValue::Int(value)) => Some(*value),
+        Some(crate::common::metadata::MetadataValue::Float(value)) if value.is_finite() => {
+            Some(*value as i64)
+        }
+        Some(crate::common::metadata::MetadataValue::String(value)) => {
+            value.trim().parse::<i64>().ok()
+        }
         _ => None,
     }
 }
@@ -9746,11 +10079,30 @@ impl FormatReader for XlefReader {
                     if let Some(reader) = xlef_lms_delegate_for_reference(&reference)? {
                         self.add_initialized_delegate(&reference, 1, 0, reader)?;
                     } else {
-                        let metadata = xlef_lms_metadata_for_reference(&reference)?;
+                        let mut metadata = xlef_lms_metadata_for_reference(&reference)?;
                         let metadata_index = self.lms_metadata.len();
+                        let pixels = xlef_lms_pixel_leaf_for_metadata(&reference, &metadata)?;
+                        let pixel_index = pixels.map(|pixels| {
+                            metadata.series_metadata.insert(
+                                "xlef.lms.pixel_payload".into(),
+                                MetadataValue::String("raw_storage".into()),
+                            );
+                            metadata.series_metadata.insert(
+                                "xlef.lms.pixel_layout.status".into(),
+                                MetadataValue::String("supported_raw_storage".into()),
+                            );
+                            metadata.series_metadata.insert(
+                                "xlef.lms.pixel_layout.storage_path".into(),
+                                MetadataValue::String(pixels.storage_path.display().to_string()),
+                            );
+                            let index = self.lms_pixels.len();
+                            self.lms_pixels.push(pixels);
+                            index
+                        });
                         self.lms_metadata.push(metadata);
                         self.series_map.push(XlefSeriesRef::Lms {
                             metadata: metadata_index,
+                            pixels: pixel_index,
                         });
                     }
                 }
@@ -9768,6 +10120,7 @@ impl FormatReader for XlefReader {
         }
         self.delegates.clear();
         self.lms_metadata.clear();
+        self.lms_pixels.clear();
         self.series_map.clear();
         self.project_metadata.clear();
         self.xlif_lms_by_image.clear();
@@ -9805,16 +10158,30 @@ impl FormatReader for XlefReader {
         if let Some(error) = self.lms_pixel_delegate_error() {
             return Err(error);
         }
+        if self.current_lms_pixel_leaf().is_some() {
+            return self.open_lms_pixel_bytes(p);
+        }
         self.current_delegate_mut()?.open_bytes(p)
     }
     fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
         if let Some(error) = self.lms_pixel_delegate_error() {
             return Err(error);
         }
+        if self.current_lms_pixel_leaf().is_some() {
+            return self.open_lms_pixel_region(p, x, y, w, h);
+        }
         self.current_delegate_mut()?
             .open_bytes_region(p, x, y, w, h)
     }
     fn open_thumb_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
+        if self.current_lms_pixel_leaf().is_some() {
+            let meta = self.metadata();
+            let tw = meta.size_x.min(256);
+            let th = meta.size_y.min(256);
+            let tx = (meta.size_x - tw) / 2;
+            let ty = (meta.size_y - th) / 2;
+            return self.open_lms_pixel_region(p, tx, ty, tw, th);
+        }
         self.current_delegate_mut()?.open_thumb_bytes(p)
     }
     fn resolution_count(&self) -> usize {
@@ -9830,7 +10197,7 @@ impl FormatReader for XlefReader {
             XlefSeriesRef::Delegate { delegate, .. } => {
                 self.delegates.get(*delegate)?.reader.ome_metadata()
             }
-            XlefSeriesRef::Lms { metadata } => {
+            XlefSeriesRef::Lms { metadata, .. } => {
                 self.lms_metadata.get(*metadata).map(xlef_lms_ome_metadata)
             }
         }

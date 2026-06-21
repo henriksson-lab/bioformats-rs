@@ -22,8 +22,6 @@ const VOLOCITY_BLIND_MAGIC: &[u8; 16] = b"BFVOLOCITYMVD2\0\0";
 const VOLOCITY_BLIND_HEADER_LEN: usize = 48;
 const VOLOCITY_METAKIT_MAX_STRUCTURE: usize = 64 * 1024;
 const VOLOCITY_METAKIT_MAX_PREVIEW_BYTES: usize = 96;
-const VOLOCITY_METAKIT_MAX_DIAGNOSTIC_ROWS: usize = 512;
-const VOLOCITY_METAKIT_MAX_DIAGNOSTIC_VALUE_BYTES: usize = 4096;
 const VOLOCITY_MAX_COMPANION_SCAN_ENTRIES: usize = 4096;
 const VOLOCITY_MAX_COMPANION_SCAN_DEPTH: usize = 6;
 
@@ -132,6 +130,19 @@ enum VolocityMetakitValue {
     Long(i64),
 }
 
+impl From<crate::metakit::Value> for VolocityMetakitValue {
+    fn from(value: crate::metakit::Value) -> Self {
+        match value {
+            crate::metakit::Value::String(value) => Self::String(value),
+            crate::metakit::Value::Integer(value) => Self::Integer(value),
+            crate::metakit::Value::Float(value) => Self::Float(value),
+            crate::metakit::Value::Double(value) => Self::Double(value),
+            crate::metakit::Value::Bytes(value) => Self::Bytes(value),
+            crate::metakit::Value::Long(value) => Self::Long(value),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct VolocitySampleRow {
     id: i32,
@@ -174,6 +185,44 @@ fn volocity_library_from_companion(path: &Path) -> Option<PathBuf> {
     let library_name = library_dir.file_name()?;
     let candidate = library_dir.join(format!("{}.mvd2", library_name.to_string_lossy()));
     candidate.exists().then_some(candidate)
+}
+
+fn volocity_library_from_companion_for_init(path: &Path) -> Option<PathBuf> {
+    // Java initFile(String) uses a different, looser companion route than
+    // isThisType: climb two parents, recursively list that directory, and use
+    // the first .mvd2 found there.
+    let search_root = path.parent()?.parent()?;
+    let mut budget = VOLOCITY_MAX_COMPANION_SCAN_ENTRIES;
+    volocity_find_mvd2(search_root, VOLOCITY_MAX_COMPANION_SCAN_DEPTH, &mut budget)
+}
+
+fn volocity_find_mvd2(dir: &Path, depth: usize, budget: &mut usize) -> Option<PathBuf> {
+    if depth == 0 || *budget == 0 {
+        return None;
+    }
+    let entries = std::fs::read_dir(dir).ok()?;
+    let mut paths = entries
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .collect::<Vec<_>>();
+    paths.sort();
+
+    for path in &paths {
+        if *budget == 0 {
+            return None;
+        }
+        *budget -= 1;
+        if ext_lower(path).as_deref() == Some("mvd2") {
+            return Some(path.clone());
+        }
+    }
+    for path in paths {
+        if path.is_dir() {
+            if let Some(found) = volocity_find_mvd2(&path, depth - 1, budget) {
+                return Some(found);
+            }
+        }
+    }
+    None
 }
 
 fn volocity_error(path: Option<&Path>) -> BioFormatsError {
@@ -772,534 +821,6 @@ fn metakit_read_p_string(bytes: &[u8], offset: &mut usize) -> std::result::Resul
         .map_err(|err| format!("structure string is not UTF-8: {err}"))
 }
 
-fn metakit_row_count_at(bytes: &[u8], pointer: i32) -> Option<usize> {
-    let mut offset = usize::try_from(pointer.checked_add(1)?).ok()?;
-    usize::try_from(metakit_read_bp_int(bytes, &mut offset).ok()?).ok()
-}
-
-fn metakit_checked_offset(pointer: i32, add: i32) -> std::result::Result<usize, String> {
-    let offset = pointer
-        .checked_add(add)
-        .ok_or_else(|| "Metakit pointer offset overflows".to_string())?;
-    usize::try_from(offset).map_err(|_| format!("negative Metakit pointer: {offset}"))
-}
-
-fn metakit_bytes_at<'a>(
-    bytes: &'a [u8],
-    offset: usize,
-    len: usize,
-) -> std::result::Result<&'a [u8], String> {
-    let end = offset
-        .checked_add(len)
-        .ok_or_else(|| "Metakit vector read overflows".to_string())?;
-    bytes
-        .get(offset..end)
-        .ok_or_else(|| format!("truncated Metakit vector at offset {offset}"))
-}
-
-fn metakit_read_i16_at(
-    bytes: &[u8],
-    offset: usize,
-    little_endian: bool,
-) -> std::result::Result<i16, String> {
-    let data = metakit_bytes_at(bytes, offset, 2)?;
-    Ok(if little_endian {
-        i16::from_le_bytes([data[0], data[1]])
-    } else {
-        i16::from_be_bytes([data[0], data[1]])
-    })
-}
-
-fn metakit_read_i32_at(
-    bytes: &[u8],
-    offset: usize,
-    little_endian: bool,
-) -> std::result::Result<i32, String> {
-    let data = metakit_bytes_at(bytes, offset, 4)?;
-    Ok(if little_endian {
-        i32::from_le_bytes([data[0], data[1], data[2], data[3]])
-    } else {
-        i32::from_be_bytes([data[0], data[1], data[2], data[3]])
-    })
-}
-
-fn metakit_read_i64_at(
-    bytes: &[u8],
-    offset: usize,
-    little_endian: bool,
-) -> std::result::Result<i64, String> {
-    let data = metakit_bytes_at(bytes, offset, 8)?;
-    Ok(if little_endian {
-        i64::from_le_bytes([
-            data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
-        ])
-    } else {
-        i64::from_be_bytes([
-            data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
-        ])
-    })
-}
-
-fn parse_metakit_column_def(column: &str) -> std::result::Result<VolocityMetakitColumn, String> {
-    let separator = column
-        .find(':')
-        .ok_or_else(|| format!("invalid column definition: {column}"))?;
-    Ok(VolocityMetakitColumn {
-        name: column[..separator].to_string(),
-        type_string: column[separator + 1..].trim_end_matches(']').to_string(),
-    })
-}
-
-fn parse_metakit_table_defs(
-    structure: &str,
-) -> std::result::Result<Vec<(String, Vec<VolocityMetakitColumn>, bool)>, String> {
-    structure
-        .split("],")
-        .map(|table_def| {
-            let open = table_def
-                .find('[')
-                .ok_or_else(|| format!("invalid table definition: {table_def}"))?;
-            let name = &table_def[..open];
-            if name.is_empty() {
-                return Err("empty table name in structure definition".to_string());
-            }
-            let column_list = &table_def[open + 1..];
-            let has_subviews = column_list.contains('[');
-            let column_start = column_list.find('[').map_or(0, |index| index + 1);
-            let columns = column_list[column_start..]
-                .split(',')
-                .filter(|column| !column.is_empty())
-                .map(parse_metakit_column_def)
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            Ok((name.to_string(), columns, has_subviews))
-        })
-        .collect()
-}
-
-fn metakit_skip_column_map(
-    bytes: &[u8],
-    offset: &mut usize,
-    column: &VolocityMetakitColumn,
-) -> std::result::Result<(), String> {
-    let fixed_map = !matches!(column.type_string.as_bytes().first(), Some(b'S' | b'B'));
-    let ivec_size = metakit_read_bp_int(bytes, offset)?;
-    if fixed_map {
-        if ivec_size > 0 {
-            let _ivec_pointer = metakit_read_bp_int(bytes, offset)?;
-        }
-    } else {
-        let _ivec_pointer = metakit_read_bp_int(bytes, offset)?;
-        let _map_ivec_size = metakit_read_bp_int(bytes, offset)?;
-        let _map_ivec_pointer = metakit_read_bp_int(bytes, offset)?;
-        let catalog_ivec_size = metakit_read_bp_int(bytes, offset)?;
-        if catalog_ivec_size > 0 {
-            let _catalog_ivec_pointer = metakit_read_bp_int(bytes, offset)?;
-        }
-    }
-    Ok(())
-}
-
-fn metakit_read_first_packed_int(
-    bytes: &[u8],
-    vector_pointer: i32,
-    vector_size: i32,
-    row_count: usize,
-    little_endian: bool,
-) -> std::result::Result<i32, String> {
-    if vector_size <= 0 || row_count == 0 {
-        return Err("empty Metakit integer vector".to_string());
-    }
-    let vector_size =
-        usize::try_from(vector_size).map_err(|_| "negative integer vector size".to_string())?;
-    let bits = vector_size
-        .checked_mul(8)
-        .ok_or_else(|| "integer vector bit width overflows".to_string())?
-        / row_count;
-    let offset = metakit_checked_offset(vector_pointer, 0)?;
-
-    match bits {
-        1 | 2 | 4 => {
-            let byte = i32::from(*metakit_bytes_at(bytes, offset, 1)?.first().unwrap());
-            Ok(byte & ((1i32 << bits) - 1))
-        }
-        8 => Ok(i32::from(
-            *metakit_bytes_at(bytes, offset, 1)?.first().unwrap(),
-        )),
-        16 => Ok(i32::from(metakit_read_i16_at(
-            bytes,
-            offset,
-            little_endian,
-        )?)),
-        32 => metakit_read_i32_at(bytes, offset, little_endian),
-        _ => metakit_read_i32_at(bytes, offset, little_endian),
-    }
-}
-
-fn metakit_read_packed_int_at(
-    bytes: &[u8],
-    vector_pointer: i32,
-    vector_size: usize,
-    row_count: usize,
-    index: usize,
-    little_endian: bool,
-) -> std::result::Result<i32, String> {
-    if row_count == 0 || index >= row_count {
-        return Err("Metakit packed integer index is out of range".to_string());
-    }
-    let bits = vector_size
-        .checked_mul(8)
-        .ok_or_else(|| "integer vector bit width overflows".to_string())?
-        / row_count;
-    let vector_offset = metakit_checked_offset(vector_pointer, 0)?;
-
-    match bits {
-        1 | 2 | 4 => {
-            let byte_offset = vector_offset
-                .checked_add(index * bits / 8)
-                .ok_or_else(|| "packed integer byte offset overflows".to_string())?;
-            let byte = i32::from(*metakit_bytes_at(bytes, byte_offset, 1)?.first().unwrap());
-            let mask = (1i32 << bits) - 1;
-            let bit_index = index % (8 / bits);
-            Ok((byte & (mask << (bit_index * bits))) >> ((8 - (bit_index * bits)) % 8))
-        }
-        8 => {
-            let offset = vector_offset
-                .checked_add(index)
-                .ok_or_else(|| "8-bit integer offset overflows".to_string())?;
-            Ok(i32::from(
-                *metakit_bytes_at(bytes, offset, 1)?.first().unwrap(),
-            ))
-        }
-        16 => {
-            let offset = vector_offset
-                .checked_add(index * 2)
-                .ok_or_else(|| "16-bit integer offset overflows".to_string())?;
-            Ok(i32::from(metakit_read_i16_at(
-                bytes,
-                offset,
-                little_endian,
-            )?))
-        }
-        _ => {
-            let offset = vector_offset
-                .checked_add(index * 4)
-                .ok_or_else(|| "32-bit integer offset overflows".to_string())?;
-            metakit_read_i32_at(bytes, offset, little_endian)
-        }
-    }
-}
-
-fn metakit_read_first_fixed_scalar(
-    bytes: &[u8],
-    offset: &mut usize,
-    column: &VolocityMetakitColumn,
-    row_count: usize,
-    little_endian: bool,
-) -> std::result::Result<Option<String>, String> {
-    let fixed_map = !matches!(column.type_string.as_bytes().first(), Some(b'S' | b'B'));
-    let ivec_size = metakit_read_bp_int(bytes, offset)?;
-    if !fixed_map {
-        let _ivec_pointer = metakit_read_bp_int(bytes, offset)?;
-        let _map_ivec_size = metakit_read_bp_int(bytes, offset)?;
-        let _map_ivec_pointer = metakit_read_bp_int(bytes, offset)?;
-        let catalog_ivec_size = metakit_read_bp_int(bytes, offset)?;
-        if catalog_ivec_size > 0 {
-            let _catalog_ivec_pointer = metakit_read_bp_int(bytes, offset)?;
-        }
-        return Ok(None);
-    }
-    if ivec_size <= 0 {
-        return Ok(None);
-    }
-    let ivec_pointer = metakit_read_bp_int(bytes, offset)?;
-    let value_offset = metakit_checked_offset(ivec_pointer, 0)?;
-
-    match column.type_string.as_bytes().first().copied() {
-        Some(b'I') => Ok(Some(
-            metakit_read_first_packed_int(
-                bytes,
-                ivec_pointer,
-                ivec_size,
-                row_count,
-                little_endian,
-            )?
-            .to_string(),
-        )),
-        Some(b'L') => Ok(Some(
-            metakit_read_i64_at(bytes, value_offset, little_endian)?.to_string(),
-        )),
-        Some(b'F') => Ok(Some(
-            f32::from_bits(metakit_read_i32_at(bytes, value_offset, little_endian)? as u32)
-                .to_string(),
-        )),
-        Some(b'D') => Ok(Some(
-            f64::from_bits(metakit_read_i64_at(bytes, value_offset, little_endian)? as u64)
-                .to_string(),
-        )),
-        _ => Ok(None),
-    }
-}
-
-fn metakit_read_fixed_value_at(
-    bytes: &[u8],
-    column: &VolocityMetakitColumn,
-    vector_pointer: i32,
-    vector_size: usize,
-    row_count: usize,
-    index: usize,
-    little_endian: bool,
-) -> std::result::Result<Option<VolocityMetakitValue>, String> {
-    let value_offset = metakit_checked_offset(vector_pointer, 0)?;
-    match column.type_string.as_bytes().first().copied() {
-        Some(b'I') => Ok(Some(VolocityMetakitValue::Integer(
-            metakit_read_packed_int_at(
-                bytes,
-                vector_pointer,
-                vector_size,
-                row_count,
-                index,
-                little_endian,
-            )?,
-        ))),
-        Some(b'L') => {
-            let offset = value_offset
-                .checked_add(index * 8)
-                .ok_or_else(|| "64-bit integer offset overflows".to_string())?;
-            Ok(Some(VolocityMetakitValue::Long(metakit_read_i64_at(
-                bytes,
-                offset,
-                little_endian,
-            )?)))
-        }
-        Some(b'F') => {
-            let offset = value_offset
-                .checked_add(index * 4)
-                .ok_or_else(|| "float offset overflows".to_string())?;
-            Ok(Some(VolocityMetakitValue::Float(f32::from_bits(
-                metakit_read_i32_at(bytes, offset, little_endian)? as u32,
-            ))))
-        }
-        Some(b'D') => {
-            let offset = value_offset
-                .checked_add(index * 8)
-                .ok_or_else(|| "double offset overflows".to_string())?;
-            Ok(Some(VolocityMetakitValue::Double(f64::from_bits(
-                metakit_read_i64_at(bytes, offset, little_endian)? as u64,
-            ))))
-        }
-        _ => Ok(None),
-    }
-}
-
-fn metakit_read_column_values(
-    bytes: &[u8],
-    offset: &mut usize,
-    column: &VolocityMetakitColumn,
-    row_count: usize,
-    little_endian: bool,
-) -> std::result::Result<Vec<Option<VolocityMetakitValue>>, String> {
-    if row_count > VOLOCITY_METAKIT_MAX_DIAGNOSTIC_ROWS {
-        return Err(format!(
-            "Metakit diagnostic row count {row_count} exceeds safety limit"
-        ));
-    }
-
-    let fixed_map = !matches!(column.type_string.as_bytes().first(), Some(b'S' | b'B'));
-    let ivec_size = metakit_read_bp_int(bytes, offset)?;
-    if fixed_map {
-        if ivec_size <= 0 {
-            return Ok(vec![None; row_count]);
-        }
-        let ivec_pointer = metakit_read_bp_int(bytes, offset)?;
-        let vector_size =
-            usize::try_from(ivec_size).map_err(|_| "negative vector size".to_string())?;
-        return (0..row_count)
-            .map(|index| {
-                metakit_read_fixed_value_at(
-                    bytes,
-                    column,
-                    ivec_pointer,
-                    vector_size,
-                    row_count,
-                    index,
-                    little_endian,
-                )
-            })
-            .collect();
-    }
-
-    let _ivec_size = ivec_size;
-    let ivec_pointer = metakit_read_bp_int(bytes, offset)?;
-    let map_ivec_size = metakit_read_bp_int(bytes, offset)?;
-    let map_ivec_pointer = metakit_read_bp_int(bytes, offset)?;
-    let catalog_ivec_size = metakit_read_bp_int(bytes, offset)?;
-    if catalog_ivec_size > 0 {
-        let _catalog_ivec_pointer = metakit_read_bp_int(bytes, offset)?;
-    }
-    if row_count == 0 || map_ivec_size <= 0 {
-        return Ok(vec![None; row_count]);
-    }
-    let map_ivec_size =
-        usize::try_from(map_ivec_size).map_err(|_| "negative map vector size".to_string())?;
-    let mut byte_counts = Vec::with_capacity(row_count);
-    for index in 0..row_count {
-        let count = metakit_read_packed_int_at(
-            bytes,
-            map_ivec_pointer,
-            map_ivec_size,
-            row_count,
-            index,
-            little_endian,
-        )?;
-        byte_counts.push(usize::try_from(count).map_err(|_| {
-            format!(
-                "negative variable-length byte count in column {}",
-                column.name
-            )
-        })?);
-    }
-
-    let mut value_offset = metakit_checked_offset(ivec_pointer, 0)?;
-    let mut values = Vec::with_capacity(row_count);
-    for byte_count in byte_counts {
-        let value_end = value_offset
-            .checked_add(byte_count)
-            .ok_or_else(|| "variable-length value offset overflows".to_string())?;
-        if byte_count > VOLOCITY_METAKIT_MAX_DIAGNOSTIC_VALUE_BYTES {
-            let _ = metakit_bytes_at(bytes, value_offset, byte_count)?;
-            values.push(None);
-            value_offset = value_end;
-            continue;
-        }
-        let value_bytes = metakit_bytes_at(bytes, value_offset, byte_count)?;
-        value_offset = value_end;
-        match column.type_string.as_bytes().first().copied() {
-            Some(b'S') => values.push(Some(VolocityMetakitValue::String(
-                std::str::from_utf8(value_bytes)
-                    .map_err(|err| format!("Metakit string value is not UTF-8: {err}"))?
-                    .to_string(),
-            ))),
-            Some(b'B') => values.push(Some(VolocityMetakitValue::Bytes(value_bytes.to_vec()))),
-            _ => values.push(None),
-        }
-    }
-
-    Ok(values)
-}
-
-fn metakit_rows_from_columns(
-    columns: Vec<Vec<Option<VolocityMetakitValue>>>,
-    row_count: usize,
-) -> Vec<Vec<Option<VolocityMetakitValue>>> {
-    (0..row_count)
-        .map(|row| {
-            columns
-                .iter()
-                .map(|column| column.get(row).cloned().flatten())
-                .collect()
-        })
-        .collect()
-}
-
-fn metakit_rows_at(
-    bytes: &[u8],
-    pointer: i32,
-    row_count: Option<usize>,
-    columns: &[VolocityMetakitColumn],
-    little_endian: bool,
-) -> std::result::Result<Vec<Vec<Option<VolocityMetakitValue>>>, String> {
-    let Some(row_count) = row_count else {
-        return Ok(Vec::new());
-    };
-    if row_count == 0 {
-        return Ok(Vec::new());
-    }
-    if row_count > VOLOCITY_METAKIT_MAX_DIAGNOSTIC_ROWS {
-        return Err(format!(
-            "Metakit diagnostic row count {row_count} exceeds safety limit"
-        ));
-    }
-
-    let mut offset = metakit_checked_offset(pointer, 1)?;
-    let declared_count = usize::try_from(metakit_read_bp_int(bytes, &mut offset)?)
-        .map_err(|_| "negative Metakit row count".to_string())?;
-    if declared_count != row_count {
-        return Err(format!(
-            "Metakit row count changed from {row_count} to {declared_count}"
-        ));
-    }
-
-    let mut column_values = Vec::with_capacity(columns.len());
-    for column in columns {
-        column_values.push(metakit_read_column_values(
-            bytes,
-            &mut offset,
-            column,
-            row_count,
-            little_endian,
-        )?);
-    }
-    Ok(metakit_rows_from_columns(column_values, row_count))
-}
-
-fn metakit_subview_rows_at(
-    bytes: &[u8],
-    pointer: i32,
-    columns: &[VolocityMetakitColumn],
-    little_endian: bool,
-) -> std::result::Result<Vec<Vec<Option<VolocityMetakitValue>>>, String> {
-    let mut offset = metakit_checked_offset(pointer, 1)?;
-    let subview_count = usize::try_from(metakit_read_bp_int(bytes, &mut offset)?)
-        .map_err(|_| "negative Metakit subview count".to_string())?;
-    if subview_count > VOLOCITY_METAKIT_MAX_DIAGNOSTIC_ROWS {
-        return Err(format!(
-            "Metakit diagnostic subview count {subview_count} exceeds safety limit"
-        ));
-    }
-
-    let mut rows = Vec::new();
-    for subview in 0..subview_count {
-        if subview == 0 {
-            let _size = metakit_read_bp_int(bytes, &mut offset)?;
-            let subview_pointer = metakit_read_bp_int(bytes, &mut offset)?;
-            offset = metakit_checked_offset(subview_pointer, 0)?;
-        }
-
-        let _marker = metakit_read_bp_int(bytes, &mut offset)?;
-        let count = usize::try_from(metakit_read_bp_int(bytes, &mut offset)?)
-            .map_err(|_| "negative Metakit subview row count".to_string())?;
-        if count > 1 {
-            if rows.len().saturating_add(count) > VOLOCITY_METAKIT_MAX_DIAGNOSTIC_ROWS {
-                return Err("Metakit diagnostic flattened row count exceeds safety limit".into());
-            }
-            let mut column_values = Vec::with_capacity(columns.len());
-            for column in columns {
-                column_values.push(metakit_read_column_values(
-                    bytes,
-                    &mut offset,
-                    column,
-                    count,
-                    little_endian,
-                )?);
-            }
-            rows.extend(metakit_rows_from_columns(column_values, count));
-        }
-    }
-
-    Ok(rows)
-}
-
-fn metakit_format_string_preview(bytes: &[u8]) -> std::result::Result<String, String> {
-    let mut value = std::str::from_utf8(bytes)
-        .map_err(|err| format!("Metakit string value is not UTF-8: {err}"))?
-        .escape_debug()
-        .to_string();
-    if bytes.len() > VOLOCITY_METAKIT_MAX_PREVIEW_BYTES {
-        value.push_str("...");
-    }
-    Ok(format!("\"{value}\""))
-}
-
 fn metakit_format_bytes_preview(bytes: &[u8], total_len: usize) -> String {
     let preview = bytes
         .iter()
@@ -1313,222 +834,43 @@ fn metakit_format_bytes_preview(bytes: &[u8], total_len: usize) -> String {
     }
 }
 
-fn metakit_read_first_scalar_preview(
-    bytes: &[u8],
-    offset: &mut usize,
-    column: &VolocityMetakitColumn,
-    row_count: usize,
-    little_endian: bool,
-) -> std::result::Result<Option<String>, String> {
-    let fixed_map = !matches!(column.type_string.as_bytes().first(), Some(b'S' | b'B'));
-    if fixed_map {
-        return metakit_read_first_fixed_scalar(bytes, offset, column, row_count, little_endian);
-    }
-
-    let _ivec_size = metakit_read_bp_int(bytes, offset)?;
-    let ivec_pointer = metakit_read_bp_int(bytes, offset)?;
-    let map_ivec_size = metakit_read_bp_int(bytes, offset)?;
-    let map_ivec_pointer = metakit_read_bp_int(bytes, offset)?;
-    let catalog_ivec_size = metakit_read_bp_int(bytes, offset)?;
-    if catalog_ivec_size > 0 {
-        let _catalog_ivec_pointer = metakit_read_bp_int(bytes, offset)?;
-    }
-    if row_count == 0 || map_ivec_size <= 0 {
-        return Ok(None);
-    }
-
-    let first_len = metakit_read_first_packed_int(
-        bytes,
-        map_ivec_pointer,
-        map_ivec_size,
-        row_count,
-        little_endian,
-    )?;
-    if first_len <= 0 {
-        return Ok(None);
-    }
-    let first_len =
-        usize::try_from(first_len).map_err(|_| "negative Metakit value length".to_string())?;
-    let preview_len = first_len.min(VOLOCITY_METAKIT_MAX_PREVIEW_BYTES);
-    let value_offset = metakit_checked_offset(ivec_pointer, 0)?;
-    let value_bytes = metakit_bytes_at(bytes, value_offset, preview_len)?;
-
-    match column.type_string.as_bytes().first().copied() {
-        Some(b'S') => Ok(Some(metakit_format_string_preview(value_bytes)?)),
-        Some(b'B') => Ok(Some(metakit_format_bytes_preview(value_bytes, first_len))),
-        _ => Ok(None),
-    }
-}
-
-fn metakit_first_row_values_at(
-    bytes: &[u8],
-    pointer: i32,
-    row_count: Option<usize>,
-    columns: &[VolocityMetakitColumn],
-    little_endian: bool,
-) -> Vec<(String, String)> {
-    let Some(row_count) = row_count else {
-        return Vec::new();
-    };
-    if row_count == 0 {
-        return Vec::new();
-    }
-    let mut offset = match metakit_checked_offset(pointer, 1) {
-        Ok(offset) => offset,
-        Err(_) => return Vec::new(),
-    };
-    if usize::try_from(metakit_read_bp_int(bytes, &mut offset).unwrap_or(-1)).ok()
-        != Some(row_count)
-    {
-        return Vec::new();
-    }
-
-    columns
-        .iter()
-        .filter_map(|column| {
-            let value = metakit_read_first_scalar_preview(
-                bytes,
-                &mut offset,
-                column,
-                row_count,
-                little_endian,
-            )
-            .ok()
-            .flatten()?;
-            Some((column.name.clone(), value))
-        })
-        .collect()
-}
-
-fn metakit_single_row_scalars_at(
-    bytes: &[u8],
-    pointer: i32,
-    row_count: Option<usize>,
-    columns: &[VolocityMetakitColumn],
-    little_endian: bool,
-) -> Vec<(String, String)> {
-    if row_count != Some(1) {
-        return Vec::new();
-    }
-    let mut offset = match metakit_checked_offset(pointer, 1) {
-        Ok(offset) => offset,
-        Err(_) => return Vec::new(),
-    };
-    if metakit_read_bp_int(bytes, &mut offset).ok() != Some(1) {
-        return Vec::new();
-    }
-
-    columns
-        .iter()
-        .filter_map(|column| {
-            let value =
-                metakit_read_first_fixed_scalar(bytes, &mut offset, column, 1, little_endian)
-                    .ok()
-                    .flatten()?;
-            Some((column.name.clone(), value))
-        })
-        .collect()
-}
-
-fn metakit_subview_row_count_at(
-    bytes: &[u8],
-    pointer: i32,
-    columns: &[VolocityMetakitColumn],
-) -> Option<usize> {
-    let mut offset = usize::try_from(pointer.checked_add(1)?).ok()?;
-    let subview_count = usize::try_from(metakit_read_bp_int(bytes, &mut offset).ok()?).ok()?;
-    let mut total = 0usize;
-
-    for subview in 0..subview_count {
-        if subview == 0 {
-            let _size = metakit_read_bp_int(bytes, &mut offset).ok()?;
-            let subview_pointer = metakit_read_bp_int(bytes, &mut offset).ok()?;
-            offset = usize::try_from(subview_pointer).ok()?;
-        }
-
-        let _marker = metakit_read_bp_int(bytes, &mut offset).ok()?;
-        let count = usize::try_from(metakit_read_bp_int(bytes, &mut offset).ok()?).ok()?;
-        if count > 1 {
-            total = total.checked_add(count)?;
-            for column in columns {
-                metakit_skip_column_map(bytes, &mut offset, column).ok()?;
-            }
-        }
-    }
-
-    Some(total)
-}
-
-fn metakit_first_subview_row_scalars_at(
-    bytes: &[u8],
-    pointer: i32,
-    columns: &[VolocityMetakitColumn],
-    little_endian: bool,
-) -> Vec<(String, String)> {
-    let mut offset = match usize::try_from(pointer.checked_add(1).unwrap_or(-1)) {
-        Ok(offset) => offset,
-        Err(_) => return Vec::new(),
-    };
-    let subview_count = match usize::try_from(match metakit_read_bp_int(bytes, &mut offset) {
-        Ok(value) => value,
-        Err(_) => return Vec::new(),
-    }) {
-        Ok(count) => count,
-        Err(_) => return Vec::new(),
-    };
-
-    for subview in 0..subview_count {
-        if subview == 0 {
-            if metakit_read_bp_int(bytes, &mut offset).is_err() {
-                return Vec::new();
-            }
-            let subview_pointer = match metakit_read_bp_int(bytes, &mut offset) {
-                Ok(pointer) => pointer,
-                Err(_) => return Vec::new(),
-            };
-            offset = match usize::try_from(subview_pointer) {
-                Ok(offset) => offset,
-                Err(_) => return Vec::new(),
-            };
-        }
-
-        if metakit_read_bp_int(bytes, &mut offset).is_err() {
-            return Vec::new();
-        }
-        let count = match usize::try_from(match metakit_read_bp_int(bytes, &mut offset) {
-            Ok(value) => value,
-            Err(_) => return Vec::new(),
-        }) {
-            Ok(count) => count,
-            Err(_) => return Vec::new(),
-        };
-        if count > 1 {
-            return columns
-                .iter()
-                .filter_map(|column| {
-                    let value = metakit_read_first_scalar_preview(
-                        bytes,
-                        &mut offset,
-                        column,
-                        count,
-                        little_endian,
-                    )
-                    .ok()
-                    .flatten()?;
-                    Some((column.name.clone(), value))
-                })
-                .collect();
-        }
-    }
-
-    Vec::new()
-}
-
 fn volocity_value_i32(value: &Option<VolocityMetakitValue>) -> Option<i32> {
     match value {
         Some(VolocityMetakitValue::Integer(value)) => Some(*value),
         _ => None,
     }
+}
+
+fn volocity_metakit_value_summary(value: &VolocityMetakitValue) -> String {
+    match value {
+        VolocityMetakitValue::String(value) => {
+            let preview = value.replace('\0', "\\0");
+            format!("\"{}\"", preview.chars().take(48).collect::<String>())
+        }
+        VolocityMetakitValue::Integer(value) => value.to_string(),
+        VolocityMetakitValue::Float(value) => value.to_string(),
+        VolocityMetakitValue::Double(value) => value.to_string(),
+        VolocityMetakitValue::Bytes(bytes) => {
+            let preview_len = bytes.len().min(VOLOCITY_METAKIT_MAX_PREVIEW_BYTES);
+            metakit_format_bytes_preview(&bytes[..preview_len], bytes.len())
+        }
+        VolocityMetakitValue::Long(value) => value.to_string(),
+    }
+}
+
+fn volocity_metakit_row_scalar_summary(
+    row: &[Option<VolocityMetakitValue>],
+    columns: &[VolocityMetakitColumn],
+) -> Vec<(String, String)> {
+    columns
+        .iter()
+        .zip(row.iter())
+        .filter_map(|(column, value)| {
+            value
+                .as_ref()
+                .map(|value| (column.name.clone(), volocity_metakit_value_summary(value)))
+        })
+        .collect()
 }
 
 fn volocity_column_index(columns: &[VolocityMetakitColumn], name: &str) -> Option<usize> {
@@ -2000,62 +1342,50 @@ fn probe_volocity_metakit(
     let _toc_marker = metakit_read_bp_int(bytes, &mut offset)?;
     let structure = metakit_read_p_string(bytes, &mut offset)?;
     let structure_len = structure.len();
-    let table_defs = parse_metakit_table_defs(&structure)?;
-    let _row_count_marker = metakit_read_bp_int(bytes, &mut offset)?;
 
-    let mut tables = Vec::with_capacity(table_defs.len());
+    let reader = crate::metakit::MetakitReader::from_bytes(bytes)
+        .map_err(|err| format!("MetakitReader failed: {err}"))?;
+    let mut tables = Vec::with_capacity(reader.table_count());
     let mut sample_rows = Vec::new();
     let mut string_rows = Vec::new();
     let mut file_rows = Vec::new();
-    for (name, columns, has_subviews) in table_defs {
-        let _table_marker = metakit_read_bp_int(bytes, &mut offset)?;
-        let pointer = metakit_read_bp_int(bytes, &mut offset)?;
-        let row_count = if has_subviews {
-            metakit_subview_row_count_at(bytes, pointer, &columns)
+    for table in reader.tables() {
+        let name = table.name().to_string();
+        let columns = table
+            .columns()
+            .iter()
+            .map(|column| VolocityMetakitColumn {
+                name: column.name().to_string(),
+                type_string: column.type_string().to_string(),
+            })
+            .collect::<Vec<_>>();
+        let rows = table
+            .rows()
+            .into_iter()
+            .map(|row| {
+                row.into_iter()
+                    .map(|value| value.map(VolocityMetakitValue::from))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let first_row_values = rows.first().map_or_else(Vec::new, |row| {
+            volocity_metakit_row_scalar_summary(row, &columns)
+        });
+        let scalar_values = if table.row_count() == 1 {
+            first_row_values.clone()
         } else {
-            metakit_row_count_at(bytes, pointer)
-        };
-        let scalar_values = if has_subviews {
             Vec::new()
-        } else {
-            metakit_single_row_scalars_at(bytes, pointer, row_count, &columns, little_endian)
-        };
-        let first_row_values = if has_subviews {
-            metakit_first_subview_row_scalars_at(bytes, pointer, &columns, little_endian)
-        } else {
-            metakit_first_row_values_at(bytes, pointer, row_count, &columns, little_endian)
         };
         if name == "samplesViewR" {
-            let rows = if has_subviews {
-                metakit_subview_rows_at(bytes, pointer, &columns, little_endian)
-            } else {
-                metakit_rows_at(bytes, pointer, row_count, &columns, little_endian)
-            };
-            if let Ok(rows) = rows {
-                sample_rows = volocity_sample_rows_from_metakit(&rows, &columns);
-            }
+            sample_rows = volocity_sample_rows_from_metakit(&rows, &columns);
         } else if name == "stringsViewR" {
-            let rows = if has_subviews {
-                metakit_subview_rows_at(bytes, pointer, &columns, little_endian)
-            } else {
-                metakit_rows_at(bytes, pointer, row_count, &columns, little_endian)
-            };
-            if let Ok(rows) = rows {
-                string_rows = volocity_string_rows_from_metakit(&rows, &columns);
-            }
+            string_rows = volocity_string_rows_from_metakit(&rows, &columns);
         } else if name == "filesViewR" {
-            let rows = if has_subviews {
-                metakit_subview_rows_at(bytes, pointer, &columns, little_endian)
-            } else {
-                metakit_rows_at(bytes, pointer, row_count, &columns, little_endian)
-            };
-            if let Ok(rows) = rows {
-                file_rows = volocity_file_rows_from_metakit(&rows, &columns);
-            }
+            file_rows = volocity_file_rows_from_metakit(&rows, &columns);
         }
         tables.push(VolocityMetakitTable {
             name,
-            row_count,
+            row_count: Some(table.row_count()),
             columns,
             scalar_values,
             first_row_values,
@@ -2936,7 +2266,7 @@ impl FormatReader for VolocityReader {
         let root = if ext_lower(path).as_deref() == Some("mvd2") {
             path.to_path_buf()
         } else {
-            volocity_library_from_companion(path).unwrap_or_else(|| path.to_path_buf())
+            volocity_library_from_companion_for_init(path).unwrap_or_else(|| path.to_path_buf())
         };
         self.path = None;
         self.meta = None;
@@ -3070,6 +2400,22 @@ impl FormatReader for VolocityReader {
     }
     fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
         let full = self.open_bytes(p)?;
+        if !self.stacks.is_empty() {
+            let stack = self
+                .stacks
+                .get(self.current_series)
+                .ok_or(BioFormatsError::NotInitialized)?;
+            return crop_full_plane(
+                "Volocity MVD2",
+                &full,
+                self.metadata(),
+                volocity_rgb_channel_count(stack).max(1) as usize,
+                x,
+                y,
+                w,
+                h,
+            );
+        }
         let meta = self.metadata();
         let rgb = if meta.is_rgb { meta.size_c.max(1) } else { 1 };
         crop_full_plane("Volocity MVD2", &full, meta, rgb as usize, x, y, w, h)
@@ -3112,7 +2458,7 @@ mod tests {
 
     #[test]
     fn volocity_detects_bounded_native_metakit_stream() {
-        let bytes = include_bytes!("../ome-metakit/tests/data/test.mk");
+        let bytes = include_bytes!("../metakit/tests/data/test.mk");
         let reader = VolocityReader::new();
         assert!(reader.is_this_type_by_bytes(bytes));
 
@@ -3528,7 +2874,7 @@ mod tests {
     #[test]
     fn volocity_native_metakit_error_reports_table_shape() {
         let path = temp_dir("native.mvd2");
-        std::fs::write(&path, include_bytes!("../ome-metakit/tests/data/test.mk")).unwrap();
+        std::fs::write(&path, include_bytes!("../metakit/tests/data/test.mk")).unwrap();
 
         let err = VolocityReader::new().set_id(&path).unwrap_err();
         assert!(matches!(
@@ -3570,7 +2916,7 @@ mod tests {
         std::fs::create_dir_all(&stack_dir).unwrap();
         std::fs::write(stack_dir.join("1.aisf"), b"aisf").unwrap();
         let path = root.join("Library.mvd2");
-        std::fs::write(&path, include_bytes!("../ome-metakit/tests/data/test.mk")).unwrap();
+        std::fs::write(&path, include_bytes!("../metakit/tests/data/test.mk")).unwrap();
 
         let err = VolocityReader::new().set_id(&path).unwrap_err();
         assert!(matches!(
@@ -3628,6 +2974,80 @@ mod tests {
         ));
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn volocity_set_id_uses_java_initfile_companion_search() {
+        let root = temp_dir("companion-init");
+        let library = root.join("Library");
+        let data_dir = library.join("Data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let companion = data_dir.join("1.dat");
+        std::fs::write(&companion, b"pixels").unwrap();
+        let mvd2 = library.join("Library.mvd2");
+        std::fs::write(&mvd2, include_bytes!("../metakit/tests/data/test.mk")).unwrap();
+
+        let reader = VolocityReader::new();
+        // Java isThisType walks three parents and requires
+        // "<parent>/<parent>.mvd2"; for this direct Data child that is false.
+        assert!(!reader.is_this_type_by_name(&companion));
+
+        // Java initFile is looser: it walks two parents and recursively picks
+        // the .mvd2 under that directory. set_id must therefore route to the
+        // Metakit library instead of reporting the companion path itself.
+        let err = VolocityReader::new().set_id(&companion).unwrap_err();
+        assert!(matches!(
+            err,
+            BioFormatsError::UnsupportedFormat(message)
+                if message.contains("native Metakit decoding is unsupported")
+                    && message.contains("Library.mvd2")
+                    && !message.contains("1.dat")
+        ));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn volocity_native_region_uses_rgb_channel_count_not_total_size_c() {
+        let stack = VolocityStack {
+            pixels_files: vec![VolocityPixels::Embedded(vec![
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
+            ])],
+            timestamp_file: None,
+            plane_padding: 0,
+            block_size: 0,
+            clipping_data: false,
+            channel_names: vec!["R".to_string(), "G".to_string()],
+            name: "RGB split".to_string(),
+            description: None,
+            size_x: 2,
+            size_y: 2,
+            size_z: 1,
+            // Java keeps imageCount at sizeZ * original_channel_count * sizeT
+            // but multiplies sizeC by 3 for RGB .aisf stacks; the effective
+            // crop samples-per-pixel is therefore sizeC / effectiveSizeC = 3.
+            size_c: 6,
+            size_t: 1,
+            image_count: 2,
+            pixel_type: PixelType::Uint8,
+            rgb: true,
+            little_endian: true,
+        };
+        let mut reader = VolocityReader {
+            path: None,
+            meta: None,
+            bytes: Vec::new(),
+            layout: None,
+            stacks: vec![stack.clone()],
+            series_meta: vec![volocity_stack_metadata(&stack)],
+            current_series: 0,
+        };
+
+        assert_eq!(
+            reader.open_bytes_region(0, 1, 0, 1, 2).unwrap(),
+            vec![4, 5, 6, 10, 11, 12]
+        );
     }
 
     fn blind_mvd2(width: u32, height: u32, z: u32, c: u32, t: u32, payload: &[u8]) -> Vec<u8> {

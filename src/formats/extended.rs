@@ -1676,6 +1676,13 @@ struct ImspectorStack {
     payload_offset: usize,
     plane_len: usize,
     decoded_payload: Option<Vec<u8>>,
+    is_flim: bool,
+}
+
+#[derive(Clone, Debug)]
+struct ImspectorMsrBlock {
+    payload_offset: usize,
+    planes: u32,
 }
 
 fn parse_imspector_header(bytes: &[u8]) -> Result<ImspectorHeader> {
@@ -2115,7 +2122,220 @@ fn imspector_msr_skip_tags(bytes: &[u8], offset: &mut usize, count: i32) -> Resu
     Ok(())
 }
 
-fn parse_imspector_msr_stack(bytes: &[u8]) -> Result<Option<ImspectorStack>> {
+fn imspector_msr_skip_tag_block(bytes: &[u8], offset: &mut usize) -> Result<usize> {
+    imspector_msr_skip(bytes, offset, 1, "tag block marker")?;
+    let len = imspector_msr_read_u16(bytes, offset, "tag block length")? as usize;
+    imspector_msr_skip(bytes, offset, len, "tag block")?;
+    Ok(len)
+}
+
+fn imspector_msr_read_stack_header(bytes: &[u8], offset: &mut usize) -> Result<()> {
+    let mut count = imspector_msr_read_i32(bytes, offset, "stack tag count")?;
+    if count > 0xffff {
+        *offset = offset.saturating_sub(2);
+        let len = imspector_msr_read_u16(bytes, offset, "stack tag length")? as usize;
+        imspector_msr_skip(bytes, offset, len, "stack tag")?;
+        count = imspector_msr_read_i32(bytes, offset, "stack tag count")? + 1;
+    }
+    if count < 0 {
+        return Err(BioFormatsError::Format(
+            "Imspector MSR stack tag count is negative".into(),
+        ));
+    }
+    imspector_msr_skip_tags(bytes, offset, count)?;
+    imspector_msr_skip_tag_block(bytes, offset)?;
+    Ok(())
+}
+
+fn imspector_msr_parse_pmt_block(
+    bytes: &[u8],
+    offset: &mut usize,
+    plane_len: usize,
+    base_size_z: u32,
+    base_size_t: u32,
+    unique_pmts: &mut Vec<String>,
+    blocks: &mut Vec<ImspectorMsrBlock>,
+) -> Result<()> {
+    imspector_msr_read_stack_header(bytes, offset)?;
+
+    let mut pmt_check = imspector_msr_read_u16(bytes, offset, "PMT marker search")?;
+    while pmt_check != 3 && pmt_check != 2 {
+        *offset = offset.saturating_sub(1);
+        pmt_check = imspector_msr_read_u16(bytes, offset, "PMT marker search")?;
+        if pmt_check == 2 {
+            let probe = imspector_msr_read_u16(bytes, offset, "PMT marker probe")?;
+            if probe == 0 {
+                *offset = offset.saturating_sub(2);
+            } else {
+                pmt_check = 0;
+            }
+        }
+    }
+
+    imspector_msr_skip(bytes, offset, 26, "PMT header")?;
+    let len = imspector_msr_read_u8(bytes, offset, "PMT name length")? as usize;
+    let pmt = imspector_msr_read_string(bytes, offset, len, "PMT name")?;
+    if !unique_pmts.contains(&pmt) && (pmt.starts_with("PMT") || pmt.contains("TCSPC")) {
+        unique_pmts.push(pmt);
+    }
+    let no_pmt = len == 0;
+
+    imspector_msr_skip(bytes, offset, 14, "dimension preamble")?;
+    let new_t = imspector_positive_dim(
+        imspector_msr_read_i32(bytes, offset, "block size T")?,
+        "block size T",
+    )?;
+    let new_z = imspector_positive_dim(
+        imspector_msr_read_i32(bytes, offset, "block size Z")?,
+        "block size Z",
+    )?;
+    let planes = new_z.checked_mul(new_t).ok_or_else(|| {
+        BioFormatsError::Format("Imspector MSR block image count overflows".into())
+    })?;
+
+    imspector_msr_skip(
+        bytes,
+        offset,
+        if no_pmt { 12 } else { 16 },
+        "PMT settings header",
+    )?;
+    for _ in 0..4 {
+        let len = imspector_msr_read_u8(bytes, offset, "PMT setting length")? as usize;
+        imspector_msr_skip(bytes, offset, len, "PMT setting")?;
+    }
+    if no_pmt {
+        return Ok(());
+    }
+
+    let payload_offset = *offset;
+    let payload_len = plane_len.checked_mul(planes as usize).ok_or_else(|| {
+        BioFormatsError::Format("Imspector MSR block payload size overflows".into())
+    })?;
+    let payload_end = payload_offset.checked_add(payload_len).ok_or_else(|| {
+        BioFormatsError::Format("Imspector MSR block payload end overflows".into())
+    })?;
+    if payload_end > bytes.len() {
+        return Err(BioFormatsError::Format(
+            "Imspector MSR block pixel data overruns input".into(),
+        ));
+    }
+    if new_z >= base_size_z || new_t >= base_size_t {
+        blocks.push(ImspectorMsrBlock {
+            payload_offset,
+            planes,
+        });
+    }
+    *offset = payload_end.saturating_add(2).min(bytes.len());
+    Ok(())
+}
+
+fn imspector_msr_scan_blocks(
+    bytes: &[u8],
+    mut offset: usize,
+    plane_len: usize,
+    base_size_z: u32,
+    base_size_t: u32,
+    unique_pmts: &mut Vec<String>,
+    blocks: &mut Vec<ImspectorMsrBlock>,
+) -> Result<()> {
+    while bytes.len().saturating_sub(offset) >= 6 {
+        let check = u16::from_le_bytes([bytes[offset], bytes[offset + 1]]);
+        offset += 2;
+        let length = if check != 0x8003 {
+            offset = offset.saturating_add(2);
+            if bytes.len().saturating_sub(offset) < 2 {
+                break;
+            }
+            let value = u16::from_le_bytes([bytes[offset], bytes[offset + 1]]) as usize;
+            offset += 2;
+            value
+        } else {
+            if offset >= bytes.len() {
+                break;
+            }
+            let value = bytes[offset] as usize;
+            offset += 1;
+            value
+        };
+
+        if length == 0 && check == 0xffff {
+            if bytes.len().saturating_sub(offset) < 46 {
+                break;
+            }
+            offset += 46;
+            let tag_block_size = imspector_msr_skip_tag_block(bytes, &mut offset)?;
+            let extra = if tag_block_size == 0 { 26 } else { 50 };
+            if bytes.len().saturating_sub(offset) < extra {
+                break;
+            }
+            offset += extra;
+            imspector_msr_parse_pmt_block(
+                bytes,
+                &mut offset,
+                plane_len,
+                base_size_z,
+                base_size_t,
+                unique_pmts,
+                blocks,
+            )?;
+            continue;
+        }
+
+        if length == 3 && check == 0xffff {
+            offset = offset.saturating_sub(2);
+            imspector_msr_parse_pmt_block(
+                bytes,
+                &mut offset,
+                plane_len,
+                base_size_z,
+                base_size_t,
+                unique_pmts,
+                blocks,
+            )?;
+            continue;
+        }
+
+        offset = offset.saturating_add(length).min(bytes.len());
+    }
+    Ok(())
+}
+
+fn imspector_msr_tile_count(metadata: &str) -> u32 {
+    let mut tile_x = 1u32;
+    let mut tile_y = 1u32;
+    let values: Vec<&str> = metadata.split("::").collect();
+    for pair in values.chunks_exact(2) {
+        match pair[0] {
+            "Stitching X" | "StitchingX" => {
+                if let Ok(value) = pair[1].parse::<u32>() {
+                    tile_x = value;
+                }
+            }
+            "Stitching Y" | "StitchingY" => {
+                if let Ok(value) = pair[1].parse::<u32>() {
+                    tile_y = value;
+                }
+            }
+            _ => {}
+        }
+    }
+    tile_x.saturating_mul(tile_y)
+}
+
+fn imspector_msr_logical_plane_index(
+    no: u32,
+    size_z: u32,
+    size_c: u32,
+    size_t: u32,
+) -> (u32, u32, u32) {
+    let z = no % size_z;
+    let rem = no / size_z;
+    let c = rem % size_c;
+    let t = (rem / size_c) % size_t;
+    (z, c, t)
+}
+
+fn parse_imspector_msr_stack(bytes: &[u8]) -> Result<Option<Vec<ImspectorStack>>> {
     if !imspector_is_java_msr(bytes) {
         return Ok(None);
     }
@@ -2208,57 +2428,204 @@ fn parse_imspector_msr_stack(bytes: &[u8]) -> Result<Option<ImspectorStack>> {
         ));
     }
 
-    let mut meta = ImageMetadata {
-        size_x,
-        size_y,
-        size_z,
-        size_c: 1,
-        size_t,
-        pixel_type: PixelType::Uint16,
-        bits_per_pixel: 16,
-        image_count: planes,
-        dimension_order: DimensionOrder::XYZCT,
-        is_rgb: false,
-        is_interleaved: false,
-        is_indexed: false,
-        is_little_endian: true,
-        resolution_count: 1,
-        ..ImageMetadata::default()
-    };
-    meta.series_metadata.insert(
-        "imspector_version_subset".into(),
-        MetadataValue::String("java-msr-cdatastack-first-block".into()),
-    );
-    meta.series_metadata.insert(
-        "imspector_msr_root_tag".into(),
-        MetadataValue::String(root_tag),
-    );
+    let mut unique_pmts = Vec::new();
     if !pmt.is_empty() {
-        meta.series_metadata
-            .insert("imspector_msr_pmt".into(), MetadataValue::String(pmt));
+        unique_pmts.push(pmt.clone());
     }
-    for (i, value) in pmt_settings.into_iter().enumerate() {
-        if !value.is_empty() {
-            meta.series_metadata.insert(
-                format!("imspector_msr_pmt_setting_{i}"),
-                MetadataValue::String(value),
-            );
+    let mut blocks = vec![ImspectorMsrBlock {
+        payload_offset,
+        planes,
+    }];
+    imspector_msr_scan_blocks(
+        bytes,
+        payload_end.saturating_add(2).min(bytes.len()),
+        plane_len,
+        size_z,
+        size_t,
+        &mut unique_pmts,
+        &mut blocks,
+    )?;
+
+    let mut logical_size_z = size_z;
+    let mut logical_size_t = size_t;
+    let mut logical_size_c = if unique_pmts.len() <= blocks.len() {
+        unique_pmts.len().max(1) as u32
+    } else {
+        1
+    };
+    let mut logical_image_count = blocks.iter().try_fold(0u32, |acc, block| {
+        acc.checked_add(block.planes)
+            .ok_or_else(|| BioFormatsError::Format("Imspector MSR image count overflows".into()))
+    })?;
+    let expected_count = logical_size_z
+        .checked_mul(logical_size_c)
+        .and_then(|n| n.checked_mul(logical_size_t))
+        .ok_or_else(|| BioFormatsError::Format("Imspector MSR image count overflows".into()))?;
+    if logical_image_count != expected_count {
+        if blocks.len() > 1 {
+            logical_size_z = blocks.iter().map(|block| block.planes).max().unwrap_or(1);
+            logical_image_count = logical_size_z
+                .checked_mul(logical_size_c)
+                .and_then(|n| n.checked_mul(logical_size_t))
+                .ok_or_else(|| {
+                    BioFormatsError::Format("Imspector MSR image count overflows".into())
+                })?;
+        } else {
+            logical_size_z = logical_image_count / logical_size_c;
+            logical_size_t = logical_image_count / (logical_size_z * logical_size_c);
         }
     }
-    let values: Vec<&str> = metadata.split("::").collect();
-    for pair in values.chunks_exact(2) {
-        meta.series_metadata.insert(
-            pair[0].to_string(),
-            MetadataValue::String(pair[1].to_string()),
-        );
+
+    let mut tile_count = imspector_msr_tile_count(&metadata);
+    if tile_count == 0 || logical_image_count % tile_count != 0 {
+        tile_count = 1;
+    }
+    if tile_count > 1 {
+        logical_image_count /= tile_count;
+        if logical_size_t >= tile_count {
+            logical_size_t /= tile_count;
+        } else if logical_size_c >= tile_count {
+            logical_size_c /= tile_count;
+        } else {
+            logical_size_z /= tile_count;
+        }
     }
 
-    Ok(Some(ImspectorStack {
-        meta,
-        payload_offset,
-        plane_len,
-        decoded_payload: None,
-    }))
+    let mut stacks = Vec::new();
+    let series_count = tile_count as usize;
+    let series_payload_len = plane_len
+        .checked_mul(logical_image_count as usize)
+        .ok_or_else(|| BioFormatsError::Format("Imspector MSR payload size overflows".into()))?;
+    for series in 0..series_count {
+        let mut decoded = vec![0u8; series_payload_len];
+        for no in 0..logical_image_count {
+            let (z, c, t) = imspector_msr_logical_plane_index(
+                no,
+                logical_size_z,
+                logical_size_c,
+                logical_size_t,
+            );
+            let block_index = series
+                .checked_mul(logical_size_c as usize)
+                .and_then(|n| n.checked_add(c as usize))
+                .ok_or_else(|| {
+                    BioFormatsError::Format("Imspector MSR block index overflows".into())
+                })?;
+            let plane = z
+                .checked_add(t.checked_mul(logical_size_z).ok_or_else(|| {
+                    BioFormatsError::Format("Imspector MSR plane index overflows".into())
+                })?)
+                .ok_or_else(|| {
+                    BioFormatsError::Format("Imspector MSR plane index overflows".into())
+                })?;
+            if let Some(block) = blocks.get(block_index) {
+                if plane < block.planes {
+                    let src = block
+                        .payload_offset
+                        .checked_add(plane_len.checked_mul(plane as usize).ok_or_else(|| {
+                            BioFormatsError::Format(
+                                "Imspector MSR source plane offset overflows".into(),
+                            )
+                        })?)
+                        .ok_or_else(|| {
+                            BioFormatsError::Format(
+                                "Imspector MSR source plane offset overflows".into(),
+                            )
+                        })?;
+                    let src_end = src.checked_add(plane_len).ok_or_else(|| {
+                        BioFormatsError::Format("Imspector MSR source plane end overflows".into())
+                    })?;
+                    let dst = plane_len.checked_mul(no as usize).ok_or_else(|| {
+                        BioFormatsError::Format(
+                            "Imspector MSR destination plane offset overflows".into(),
+                        )
+                    })?;
+                    decoded[dst..dst + plane_len].copy_from_slice(&bytes[src..src_end]);
+                }
+            }
+        }
+
+        let mut meta = ImageMetadata {
+            size_x,
+            size_y,
+            size_z: logical_size_z,
+            size_c: logical_size_c,
+            size_t: logical_size_t,
+            pixel_type: PixelType::Uint16,
+            bits_per_pixel: 16,
+            image_count: logical_image_count,
+            dimension_order: if logical_size_c > 1 && logical_size_t != 1 {
+                DimensionOrder::XYZTC
+            } else {
+                DimensionOrder::XYZCT
+            },
+            is_rgb: false,
+            is_interleaved: false,
+            is_indexed: false,
+            is_little_endian: true,
+            resolution_count: 1,
+            ..ImageMetadata::default()
+        };
+        meta.series_metadata.insert(
+            "imspector_version_subset".into(),
+            MetadataValue::String("java-msr-cdatastack-bounded-blocks".into()),
+        );
+        meta.series_metadata.insert(
+            "imspector_msr_root_tag".into(),
+            MetadataValue::String(root_tag.clone()),
+        );
+        meta.series_metadata.insert(
+            "imspector_msr_block_count".into(),
+            MetadataValue::Int(blocks.len() as i64),
+        );
+        meta.series_metadata.insert(
+            "imspector_msr_tile_count".into(),
+            MetadataValue::Int(tile_count as i64),
+        );
+        if tile_count > 1 {
+            meta.series_metadata.insert(
+                "imspector_msr_tile_index".into(),
+                MetadataValue::Int(series as i64),
+            );
+        }
+        if !unique_pmts.is_empty() {
+            meta.series_metadata.insert(
+                "imspector_msr_pmts".into(),
+                MetadataValue::String(unique_pmts.join(",")),
+            );
+        }
+        if !pmt.is_empty() {
+            meta.series_metadata.insert(
+                "imspector_msr_pmt".into(),
+                MetadataValue::String(pmt.clone()),
+            );
+        }
+        for (i, value) in pmt_settings.iter().enumerate() {
+            if !value.is_empty() {
+                meta.series_metadata.insert(
+                    format!("imspector_msr_pmt_setting_{i}"),
+                    MetadataValue::String(value.clone()),
+                );
+            }
+        }
+        let values: Vec<&str> = metadata.split("::").collect();
+        for pair in values.chunks_exact(2) {
+            meta.series_metadata.insert(
+                pair[0].to_string(),
+                MetadataValue::String(pair[1].to_string()),
+            );
+        }
+
+        stacks.push(ImspectorStack {
+            meta,
+            payload_offset: 0,
+            plane_len,
+            decoded_payload: Some(decoded),
+            is_flim: false,
+        });
+    }
+
+    Ok(Some(stacks))
 }
 
 fn parse_imspector_native_stack(
@@ -2498,11 +2865,17 @@ fn parse_imspector_native_stack(
             BioFormatsError::Format("Imspector OBF/MSR native footer offset overflows".into())
         })?;
     let mut dimension_labels = Vec::new();
+    let mut raw_labels = Vec::with_capacity(num_dims);
+    let mut flim_axis = None;
     for d in 0..num_dims {
         let label = imspector_read_len_string(bytes, &mut label_offset)?;
+        if label.starts_with("SPCM") {
+            flim_axis = Some(d);
+        }
         if !label.is_empty() {
             dimension_labels.push(format!("{d}:{label}"));
         }
+        raw_labels.push(label);
     }
     let mut step_axes = Vec::new();
     let mut step_previews = Vec::new();
@@ -2700,9 +3073,29 @@ fn parse_imspector_native_stack(
         None
     };
 
-    let size_x = sizes[0] as u32;
-    let size_y = if num_dims > 1 { sizes[1] as u32 } else { 1 };
-    let size_z = if num_dims > 2 { sizes[2] as u32 } else { 1 };
+    let first_is_flim = raw_labels
+        .first()
+        .is_some_and(|label| label.starts_with("SPCM"));
+    let is_flim = flim_axis.is_some();
+    let size_x = if first_is_flim && num_dims > 1 {
+        sizes[1] as u32
+    } else {
+        sizes[0] as u32
+    };
+    let size_y = if first_is_flim && num_dims > 2 {
+        sizes[2] as u32
+    } else if num_dims > 1 {
+        sizes[1] as u32
+    } else {
+        1
+    };
+    let size_z = if let Some(axis) = flim_axis {
+        sizes[axis] as u32
+    } else if num_dims > 2 {
+        sizes[2] as u32
+    } else {
+        1
+    };
     let size_c = if num_dims > 3 { sizes[3] as u32 } else { 1 };
     let size_t = if num_dims > 4 { sizes[4] as u32 } else { 1 };
     let image_count = size_z
@@ -2913,6 +3306,7 @@ fn parse_imspector_native_stack(
             },
             plane_len,
             decoded_payload,
+            is_flim,
         },
         next_stack_offset,
     )))
@@ -3033,6 +3427,7 @@ fn parse_imspector_synthetic_stack(bytes: &[u8]) -> Result<Option<ImspectorStack
         payload_offset: if compressed { 0 } else { payload_offset },
         plane_len,
         decoded_payload,
+        is_flim: false,
     }))
 }
 
@@ -3087,10 +3482,10 @@ impl FormatReader for ImspectorReader {
         let header = match parse_imspector_header(&bytes) {
             Ok(header) => Some(header),
             Err(obf_error) => {
-                if let Some(stack) = parse_imspector_msr_stack(&bytes)? {
+                if let Some(stacks) = parse_imspector_msr_stack(&bytes)? {
                     self.path = Some(path.to_path_buf());
                     self.bytes = bytes;
-                    self.stacks = vec![stack];
+                    self.stacks = stacks;
                     return Ok(());
                 }
                 return Err(obf_error);
@@ -3205,6 +3600,64 @@ impl FormatReader for ImspectorReader {
             BioFormatsError::Format("Imspector OBF/MSR plane end offset overflows".into())
         })?;
         let source = stack.decoded_payload.as_deref().unwrap_or(&self.bytes);
+        if stack.is_flim {
+            let bps = stack.meta.pixel_type.bytes_per_sample();
+            let width = stack.meta.size_x as usize;
+            let height = stack.meta.size_y as usize;
+            let lifetime_count = stack.meta.size_z as usize;
+            let lifetime = plane_index as usize;
+            if lifetime >= lifetime_count {
+                return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+            }
+            let mut plane = vec![0u8; stack.plane_len];
+            for yy in 0..height {
+                for xx in 0..width {
+                    let pixel = yy
+                        .checked_mul(width)
+                        .and_then(|v| v.checked_add(xx))
+                        .ok_or_else(|| {
+                            BioFormatsError::Format(
+                                "Imspector OBF/MSR FLIM pixel offset overflows".into(),
+                            )
+                        })?;
+                    let src = stack
+                        .payload_offset
+                        .checked_add(
+                            pixel
+                                .checked_mul(lifetime_count)
+                                .and_then(|v| v.checked_add(lifetime))
+                                .and_then(|v| v.checked_mul(bps))
+                                .ok_or_else(|| {
+                                    BioFormatsError::Format(
+                                        "Imspector OBF/MSR FLIM source offset overflows".into(),
+                                    )
+                                })?,
+                        )
+                        .ok_or_else(|| {
+                            BioFormatsError::Format(
+                                "Imspector OBF/MSR FLIM source offset overflows".into(),
+                            )
+                        })?;
+                    let dst = pixel.checked_mul(bps).ok_or_else(|| {
+                        BioFormatsError::Format(
+                            "Imspector OBF/MSR FLIM destination offset overflows".into(),
+                        )
+                    })?;
+                    let src_end = src.checked_add(bps).ok_or_else(|| {
+                        BioFormatsError::Format(
+                            "Imspector OBF/MSR FLIM source end overflows".into(),
+                        )
+                    })?;
+                    if src_end > source.len() {
+                        return Err(BioFormatsError::Format(
+                            "Imspector OBF/MSR FLIM plane overruns pixel data".into(),
+                        ));
+                    }
+                    plane[dst..dst + bps].copy_from_slice(&source[src..src_end]);
+                }
+            }
+            return Ok(plane);
+        }
         if end > source.len() {
             return Err(BioFormatsError::Format(
                 "Imspector OBF/MSR plane overruns pixel data".into(),
@@ -3417,6 +3870,38 @@ mod imspector_tests {
         bytes
     }
 
+    fn append_java_msr_followup_block(
+        bytes: &mut Vec<u8>,
+        pmt: &str,
+        z: i32,
+        t: i32,
+        pixels: &[u8],
+    ) {
+        bytes.extend_from_slice(&0xffffu16.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; 46]);
+        bytes.push(0);
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; 26]);
+        bytes.extend_from_slice(&0i32.to_le_bytes());
+        bytes.push(0);
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&3u16.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; 26]);
+        bytes.push(pmt.len() as u8);
+        bytes.extend_from_slice(pmt.as_bytes());
+        bytes.extend_from_slice(&[0u8; 14]);
+        bytes.extend_from_slice(&t.to_le_bytes());
+        bytes.extend_from_slice(&z.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; 16]);
+        for _ in 0..4 {
+            bytes.push(0);
+        }
+        bytes.extend_from_slice(pixels);
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+    }
+
     fn native_v1_stack_with_step_tables() -> Vec<u8> {
         let mut bytes = imspector_header(1);
         let stack_offset = 32u64;
@@ -3465,6 +3950,92 @@ mod imspector_tests {
         bytes.extend_from_slice(&0.25f64.to_le_bytes());
         push_len_string(&mut bytes, "top");
         push_len_string(&mut bytes, "bottom");
+        bytes
+    }
+
+    fn native_v1_flim_stack() -> Vec<u8> {
+        let mut bytes = imspector_header(1);
+        let stack_offset = 32u64;
+        bytes.extend_from_slice(&stack_offset.to_le_bytes());
+        bytes.extend_from_slice(&0i32.to_le_bytes());
+        bytes.resize(stack_offset as usize, 0);
+
+        bytes.extend_from_slice(IMSPECTOR_SYNTHETIC_STACK_MAGIC);
+        bytes.extend_from_slice(&IMSPECTOR_MAGIC_NUMBER.to_le_bytes());
+        bytes.extend_from_slice(&1i32.to_le_bytes());
+        bytes.extend_from_slice(&5i32.to_le_bytes());
+        for size in [3i32, 2, 2, 1, 1] {
+            bytes.extend_from_slice(&size.to_le_bytes());
+        }
+        for _ in 5..15 {
+            bytes.extend_from_slice(&1i32.to_le_bytes());
+        }
+        for _ in 0..30 {
+            bytes.extend_from_slice(&0f64.to_bits().to_le_bytes());
+        }
+        bytes.extend_from_slice(&0x01i32.to_le_bytes());
+        bytes.extend_from_slice(&0i32.to_le_bytes());
+        bytes.extend_from_slice(&0i32.to_le_bytes());
+        bytes.extend_from_slice(&0i32.to_le_bytes());
+        bytes.extend_from_slice(&0i32.to_le_bytes());
+        bytes.extend_from_slice(&0i64.to_le_bytes());
+
+        // Java OBFReader.readFlimFrame layout: all lifetime samples for an XY
+        // pixel are contiguous and requested lifetime planes are de-interleaved.
+        let payload = [10u8, 20, 30, 11, 21, 31, 12, 22, 32, 13, 23, 33];
+        bytes.extend_from_slice(&(payload.len() as i64).to_le_bytes());
+        bytes.extend_from_slice(&0i64.to_le_bytes());
+        bytes.extend_from_slice(&payload);
+
+        bytes.extend_from_slice(&124i32.to_le_bytes());
+        for _ in 0..30 {
+            bytes.extend_from_slice(&0i32.to_le_bytes());
+        }
+        for label in ["SPCM-TCSPC", "Pixel X", "Pixel Y", "C", "T"] {
+            push_len_string(&mut bytes, label);
+        }
+        bytes
+    }
+
+    fn native_v1_flim_stack_spcm_z_axis() -> Vec<u8> {
+        let mut bytes = imspector_header(1);
+        let stack_offset = 32u64;
+        bytes.extend_from_slice(&stack_offset.to_le_bytes());
+        bytes.extend_from_slice(&0i32.to_le_bytes());
+        bytes.resize(stack_offset as usize, 0);
+
+        bytes.extend_from_slice(IMSPECTOR_SYNTHETIC_STACK_MAGIC);
+        bytes.extend_from_slice(&IMSPECTOR_MAGIC_NUMBER.to_le_bytes());
+        bytes.extend_from_slice(&1i32.to_le_bytes());
+        bytes.extend_from_slice(&5i32.to_le_bytes());
+        for size in [2i32, 2, 3, 1, 1] {
+            bytes.extend_from_slice(&size.to_le_bytes());
+        }
+        for _ in 5..15 {
+            bytes.extend_from_slice(&1i32.to_le_bytes());
+        }
+        for _ in 0..30 {
+            bytes.extend_from_slice(&0f64.to_bits().to_le_bytes());
+        }
+        bytes.extend_from_slice(&0x01i32.to_le_bytes());
+        bytes.extend_from_slice(&0i32.to_le_bytes());
+        bytes.extend_from_slice(&0i32.to_le_bytes());
+        bytes.extend_from_slice(&0i32.to_le_bytes());
+        bytes.extend_from_slice(&0i32.to_le_bytes());
+        bytes.extend_from_slice(&0i64.to_le_bytes());
+
+        let payload = [10u8, 20, 30, 11, 21, 31, 12, 22, 32, 13, 23, 33];
+        bytes.extend_from_slice(&(payload.len() as i64).to_le_bytes());
+        bytes.extend_from_slice(&0i64.to_le_bytes());
+        bytes.extend_from_slice(&payload);
+
+        bytes.extend_from_slice(&124i32.to_le_bytes());
+        for _ in 0..30 {
+            bytes.extend_from_slice(&0i32.to_le_bytes());
+        }
+        for label in ["Pixel X", "Pixel Y", "SPCM-TCSPC", "C", "T"] {
+            push_len_string(&mut bytes, label);
+        }
         bytes
     }
 
@@ -3809,6 +4380,66 @@ mod imspector_tests {
     }
 
     #[test]
+    fn imspector_native_flim_stack_uses_spcm_lifetime_layout() {
+        let path = temp_path("native_v1_flim.obf");
+        std::fs::write(&path, native_v1_flim_stack()).unwrap();
+
+        let mut reader = ImspectorReader::new();
+        reader.set_id(&path).unwrap();
+        let meta = reader.metadata();
+        assert_eq!(meta.size_x, 2);
+        assert_eq!(meta.size_y, 2);
+        assert_eq!(meta.size_z, 3);
+        assert_eq!(meta.size_c, 1);
+        assert_eq!(meta.size_t, 1);
+        assert_eq!(meta.image_count, 3);
+        match meta.series_metadata.get("imspector_dimension_labels") {
+            Some(crate::common::metadata::MetadataValue::String(value)) => {
+                assert_eq!(value, "0:SPCM-TCSPC;1:Pixel X;2:Pixel Y;3:C;4:T")
+            }
+            other => panic!("unexpected imspector_dimension_labels metadata: {other:?}"),
+        }
+
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![10, 11, 12, 13]);
+        assert_eq!(reader.open_bytes(1).unwrap(), vec![20, 21, 22, 23]);
+        assert_eq!(reader.open_bytes(2).unwrap(), vec![30, 31, 32, 33]);
+        assert_eq!(
+            reader.open_bytes_region(2, 1, 0, 1, 2).unwrap(),
+            vec![31, 33]
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn imspector_native_flim_stack_uses_non_first_spcm_axis_like_java() {
+        let path = temp_path("native_v1_flim_z_axis.obf");
+        std::fs::write(&path, native_v1_flim_stack_spcm_z_axis()).unwrap();
+
+        let mut reader = ImspectorReader::new();
+        reader.set_id(&path).unwrap();
+        let meta = reader.metadata();
+        assert_eq!(meta.size_x, 2);
+        assert_eq!(meta.size_y, 2);
+        assert_eq!(meta.size_z, 3);
+        assert_eq!(meta.size_c, 1);
+        assert_eq!(meta.size_t, 1);
+        assert_eq!(meta.image_count, 3);
+        match meta.series_metadata.get("imspector_dimension_labels") {
+            Some(crate::common::metadata::MetadataValue::String(value)) => {
+                assert_eq!(value, "0:Pixel X;1:Pixel Y;2:SPCM-TCSPC;3:C;4:T")
+            }
+            other => panic!("unexpected imspector_dimension_labels metadata: {other:?}"),
+        }
+
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![10, 11, 12, 13]);
+        assert_eq!(reader.open_bytes(1).unwrap(), vec![20, 21, 22, 23]);
+        assert_eq!(reader.open_bytes(2).unwrap(), vec![30, 31, 32, 33]);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn imspector_java_msr_first_cdatastack_matches_reference_layout() {
         use crate::common::metadata::MetadataValue;
 
@@ -3842,6 +4473,128 @@ mod imspector_tests {
         assert_eq!(
             reader.open_bytes_region(1, 1, 0, 1, 2).unwrap(),
             vec![6, 0, 8, 0]
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn imspector_java_msr_multi_pmt_blocks_map_to_channels() {
+        use crate::common::metadata::MetadataValue;
+
+        let path = temp_path("java_msr_multi_pmt.msr");
+        let mut bytes = java_msr_stack(
+            2,
+            2,
+            2,
+            1,
+            &[1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0, 7, 0, 8, 0],
+        );
+        append_java_msr_followup_block(
+            &mut bytes,
+            "PMT2",
+            2,
+            1,
+            &[11, 0, 12, 0, 13, 0, 14, 0, 15, 0, 16, 0, 17, 0, 18, 0],
+        );
+        std::fs::write(&path, bytes).unwrap();
+
+        let mut reader = ImspectorReader::new();
+        reader.set_id(&path).unwrap();
+        let meta = reader.metadata();
+        assert_eq!(reader.series_count(), 1);
+        assert_eq!(meta.size_z, 2);
+        assert_eq!(meta.size_c, 2);
+        assert_eq!(meta.size_t, 1);
+        assert_eq!(meta.image_count, 4);
+        assert_eq!(meta.dimension_order, DimensionOrder::XYZCT);
+        match meta.series_metadata.get("imspector_msr_block_count") {
+            Some(MetadataValue::Int(value)) => assert_eq!(*value, 2),
+            other => panic!("unexpected block count metadata: {other:?}"),
+        }
+        match meta.series_metadata.get("imspector_msr_pmts") {
+            Some(MetadataValue::String(value)) => assert_eq!(value, "PMT1,PMT2"),
+            other => panic!("unexpected PMT list metadata: {other:?}"),
+        }
+
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 0, 2, 0, 3, 0, 4, 0]);
+        assert_eq!(reader.open_bytes(1).unwrap(), vec![5, 0, 6, 0, 7, 0, 8, 0]);
+        assert_eq!(
+            reader.open_bytes(2).unwrap(),
+            vec![11, 0, 12, 0, 13, 0, 14, 0]
+        );
+        assert_eq!(
+            reader.open_bytes(3).unwrap(),
+            vec![15, 0, 16, 0, 17, 0, 18, 0]
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn imspector_java_msr_mosaic_blocks_expose_one_series_per_tile() {
+        use crate::common::metadata::MetadataValue;
+
+        let path = temp_path("java_msr_mosaic.msr");
+        let mut bytes = java_msr_stack(
+            2,
+            2,
+            2,
+            1,
+            &[1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0, 7, 0, 8, 0],
+        );
+        let old_metadata = b"Instrument Mode::Frame Imaging::Time Time Resolution::1";
+        let metadata = b"Instrument Mode::Frame Imaging::Stitching X::2::Stitching Y::1";
+        let old_start = bytes
+            .windows(old_metadata.len())
+            .position(|window| window == old_metadata)
+            .unwrap();
+        let len_offset = old_start - 2;
+        let old_len = u16::from_le_bytes([bytes[len_offset], bytes[len_offset + 1]]) as usize;
+        bytes.splice(
+            len_offset..old_start + old_len,
+            (metadata.len() as u16)
+                .to_le_bytes()
+                .into_iter()
+                .chain(metadata.iter().copied()),
+        );
+        append_java_msr_followup_block(
+            &mut bytes,
+            "PMT1",
+            2,
+            1,
+            &[21, 0, 22, 0, 23, 0, 24, 0, 25, 0, 26, 0, 27, 0, 28, 0],
+        );
+        std::fs::write(&path, bytes).unwrap();
+
+        let mut reader = ImspectorReader::new();
+        reader.set_id(&path).unwrap();
+        assert_eq!(reader.series_count(), 2);
+
+        reader.set_series(0).unwrap();
+        let meta = reader.metadata();
+        assert_eq!(meta.size_z, 1);
+        assert_eq!(meta.size_c, 1);
+        assert_eq!(meta.image_count, 1);
+        match meta.series_metadata.get("imspector_msr_tile_count") {
+            Some(MetadataValue::Int(value)) => assert_eq!(*value, 2),
+            other => panic!("unexpected tile count metadata: {other:?}"),
+        }
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 0, 2, 0, 3, 0, 4, 0]);
+
+        reader.set_series(1).unwrap();
+        assert_eq!(reader.metadata().size_z, 1);
+        match reader
+            .metadata()
+            .series_metadata
+            .get("imspector_msr_tile_index")
+        {
+            Some(MetadataValue::Int(value)) => assert_eq!(*value, 1),
+            other => panic!("unexpected tile index metadata: {other:?}"),
+        }
+        assert_eq!(
+            reader.open_bytes(0).unwrap(),
+            vec![21, 0, 22, 0, 23, 0, 24, 0]
         );
 
         let _ = std::fs::remove_file(path);

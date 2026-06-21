@@ -17,7 +17,6 @@ include = [
 
 [workspace]
 resolver = "2"
-members = ["src/ome-metakit"]
 exclude = ["bench"]
 
 [dependencies]

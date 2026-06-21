@@ -301,17 +301,22 @@ so they are not rated here — see
 | SlideBook 7 | `.sld` `.sldy` `.sldyz` | ✅ | Java native metadata and pixel routing paths audited faithful |
 | iVision IPM | `.ipm` | ✅ | Java native header probing, data-type metadata, RGB/interleaved flags, unsupported color16/square-root behavior, padding reads, and plist metadata audited faithful |
 
-### True stubs and metadata-only leaves
+### Bounded native leftovers
 
-Detection works; `set_id` returns a descriptive `UnsupportedFormat` (or only a
-synthetic subset is read). Partial readers with bounded native pixel support are
-listed in the status tables above instead of here.
+These formats have faithful entry-point behavior plus bounded native support, but
+still have proprietary or fixture-dependent branches that intentionally return a
+descriptive `UnsupportedFormat` instead of guessed pixels.
 
 | Format | Extensions | Reason |
 |--------|-----------|--------|
-| Volocity | `.mvd2` plus `.aisf` `.aiix` `.dat` `.atsf` companions | Java VolocityReader entry point audited for native stream gating, companion routing, stack/channel metadata, diagnostics, and explicit raw fixture provenance; native Metakit pixel decoding remains metadata-only |
-| Imspector synthetic OBF/MSR subset | `.obf` `.msr` | Java MSR CDataStack behavior and OBF/MSR detection audited; explicit `BFIMSPECTOR_RAW_STACK_V1` uncompressed/zlib synthetic payloads are additive. Bio-Formats-style OBF is handled separately by `ObfReader`. |
-| Leica XLEF LMS leaves | `.xlef` / `.xlif` projects containing `.lms` leaves | LMS metadata leaves expose bounded metadata/OME scalars and original-metadata annotations when no pixel delegate supports them; pixel reads return `UnsupportedFormat` |
+| Volocity | `.mvd2` plus `.aisf` `.aiix` `.dat` `.atsf` companions | Java VolocityReader entry point audited for native stream gating, detection-vs-init companion routing, stack/channel metadata, diagnostics, bounded native plane reads, and explicit raw fixture provenance; fixture-complete validation remains blocked on proprietary Volocity datasets/specs |
+| Imspector bounded OBF/MSR subset | `.obf` `.msr` | Java MSR CDataStack first-block plus bounded multi-PMT and mosaic block traversal are decoded, and bounded native OBF v1-v6 contiguous/chunked raw/zlib stacks are decoded, including SPCM-labeled FLIM lifetime layout; explicit `BFIMSPECTOR_RAW_STACK_V1` synthetic payloads remain additive. Bio-Formats-style OBF is handled separately by `ObfReader`. |
+| Leica XLEF LMS leaves | `.xlef` / `.xlif` projects containing `.lms` leaves | LMS metadata leaves expose bounded metadata/OME scalars and original-metadata annotations; uncompressed external raw-storage leaves can read declared strided X/Y/Z/C/T pixels, while compressed/internal Memory-block payloads still return `UnsupportedFormat` |
+
+The internal Metakit table reader used for Volocity is translated from
+`ome.metakit.MetakitReader` in
+[`ome/ome-metakit`](https://github.com/ome/ome-metakit) at commit
+`b8b3a629a6dd9bf422949f6b175b9e310ba6e252`.
 
 Various no-Java-reference camera/SPM readers remain best-effort extensions; when
 native layout is unknown they return `UnsupportedFormat` instead of guessed

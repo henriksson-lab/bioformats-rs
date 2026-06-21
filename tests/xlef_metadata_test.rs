@@ -454,6 +454,205 @@ fn xlef_lms_metadata_only_series_reports_unsupported_pixel_layout_diagnostics() 
 }
 
 #[test]
+fn xlef_lms_raw_storage_leaf_reads_tightly_packed_xy_pixels() {
+    let xlef = temp_path("raw_storage_project.xlef");
+    let lms = xlef.with_extension("lms");
+    let raw = xlef.with_file_name("pixel data.raw");
+    let pixels = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+    std::fs::write(&raw, &pixels).unwrap();
+    std::fs::write(
+        &lms,
+        r#"<LMSDataContainerHeader><Element Name="raw storage"><Data><Image Name="raw scan">
+<ImageDescription>
+<Channels><ChannelDescription Name="DAPI" Resolution="8" BytesInc="0"/></Channels>
+<Dimensions>
+<DimensionDescription DimID="1" NumberOfElements="4" BytesInc="1"/>
+<DimensionDescription DimID="2" NumberOfElements="3" BytesInc="4"/>
+</Dimensions>
+<Storage FileName="pixel%20data.raw"/>
+</ImageDescription>
+</Image></Data></Element></LMSDataContainerHeader>"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &xlef,
+        format!(
+            r#"<XLEF><Image File="{}"/></XLEF>"#,
+            lms.file_name().unwrap().to_string_lossy()
+        ),
+    )
+    .unwrap();
+
+    let mut reader = XlefReader::new();
+    reader.set_id(&xlef).unwrap();
+    let meta = reader.metadata();
+    assert_eq!((meta.size_x, meta.size_y, meta.size_c), (4, 3, 1));
+    assert_eq!(meta.pixel_type, PixelType::Uint8);
+    assert_string(
+        &meta.series_metadata,
+        "xlef.lms.pixel_payload",
+        "raw_storage",
+    );
+    assert_string(
+        &meta.series_metadata,
+        "xlef.lms.pixel_layout.status",
+        "supported_raw_storage",
+    );
+    assert_string(
+        &meta.series_metadata,
+        "xlef.project.source_kind",
+        "lms_pixel",
+    );
+    assert!(matches!(
+        meta.series_metadata.get("xlef.lms.pixel_layout.storage_path"),
+        Some(MetadataValue::String(path)) if path.ends_with("pixel data.raw")
+    ));
+    assert_eq!(reader.open_bytes(0).unwrap(), pixels);
+    assert_eq!(
+        reader.open_bytes_region(0, 1, 1, 2, 2).unwrap(),
+        vec![6, 7, 10, 11]
+    );
+
+    let _ = std::fs::remove_file(xlef);
+    let _ = std::fs::remove_file(lms);
+    let _ = std::fs::remove_file(raw);
+}
+
+#[test]
+fn xlef_lms_raw_storage_reads_padded_rows_from_declared_strides() {
+    let xlef = temp_path("raw_storage_padded_project.xlef");
+    let lms = xlef.with_extension("lms");
+    let raw = xlef.with_file_name("padded.raw");
+    std::fs::write(
+        &raw,
+        [
+            1u8, 2, 3, 4, 200, 201, 202, 203, 5, 6, 7, 8, 204, 205, 206, 207, 9, 10, 11, 12, 208,
+            209, 210, 211,
+        ],
+    )
+    .unwrap();
+    std::fs::write(
+        &lms,
+        r#"<LMSDataContainerHeader><Element Name="padded raw storage"><Data><Image Name="raw scan">
+<ImageDescription>
+<Channels><ChannelDescription Resolution="8" BytesInc="0"/></Channels>
+<Dimensions>
+<DimensionDescription DimID="1" NumberOfElements="4" BytesInc="1"/>
+<DimensionDescription DimID="2" NumberOfElements="3" BytesInc="8"/>
+</Dimensions>
+<Storage FileName="padded.raw"/>
+</ImageDescription>
+</Image></Data></Element></LMSDataContainerHeader>"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &xlef,
+        format!(
+            r#"<XLEF><Image File="{}"/></XLEF>"#,
+            lms.file_name().unwrap().to_string_lossy()
+        ),
+    )
+    .unwrap();
+
+    let mut reader = XlefReader::new();
+    reader.set_id(&xlef).unwrap();
+    let meta = reader.metadata();
+    assert_string(
+        &meta.series_metadata,
+        "xlef.lms.pixel_payload",
+        "raw_storage",
+    );
+    assert_string(
+        &meta.series_metadata,
+        "xlef.project.source_kind",
+        "lms_pixel",
+    );
+    assert_eq!(
+        reader.open_bytes(0).unwrap(),
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+    );
+    assert_eq!(
+        reader.open_bytes_region(0, 1, 1, 2, 2).unwrap(),
+        vec![6, 7, 10, 11]
+    );
+
+    let _ = std::fs::remove_file(xlef);
+    let _ = std::fs::remove_file(lms);
+    let _ = std::fs::remove_file(raw);
+}
+
+#[test]
+fn xlef_lms_raw_storage_reads_multiplane_declared_strides() {
+    let xlef = temp_path("raw_storage_multiplane_project.xlef");
+    let lms = xlef.with_extension("lms");
+    let raw = xlef.with_file_name("multiplane.raw");
+    let mut pixels = vec![0u8; 32];
+    for (offset, values) in [
+        (0usize, [1u8, 2, 3, 4]),
+        (8usize, [11u8, 12, 13, 14]),
+        (16usize, [21u8, 22, 23, 24]),
+        (24usize, [31u8, 32, 33, 34]),
+    ] {
+        pixels[offset..offset + 2].copy_from_slice(&values[0..2]);
+        pixels[offset + 4..offset + 6].copy_from_slice(&values[2..4]);
+    }
+    std::fs::write(&raw, &pixels).unwrap();
+    std::fs::write(
+        &lms,
+        r#"<LMSDataContainerHeader><Element Name="multiplane raw storage"><Data><Image Name="raw scan">
+<ImageDescription>
+<Channels>
+<ChannelDescription Name="C0" Resolution="8" BytesInc="0"/>
+<ChannelDescription Name="C1" Resolution="8" BytesInc="16"/>
+</Channels>
+<Dimensions>
+<DimensionDescription DimID="1" NumberOfElements="2" BytesInc="1"/>
+<DimensionDescription DimID="2" NumberOfElements="2" BytesInc="4"/>
+<DimensionDescription DimID="3" NumberOfElements="2" BytesInc="8"/>
+<DimensionDescription DimID="5" NumberOfElements="2" BytesInc="16"/>
+</Dimensions>
+<Storage FileName="multiplane.raw"/>
+</ImageDescription>
+</Image></Data></Element></LMSDataContainerHeader>"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &xlef,
+        format!(
+            r#"<XLEF><Image File="{}"/></XLEF>"#,
+            lms.file_name().unwrap().to_string_lossy()
+        ),
+    )
+    .unwrap();
+
+    let mut reader = XlefReader::new();
+    reader.set_id(&xlef).unwrap();
+    let meta = reader.metadata();
+    assert_eq!(
+        (meta.size_x, meta.size_y, meta.size_z, meta.size_c),
+        (2, 2, 2, 2)
+    );
+    assert_eq!(meta.image_count, 4);
+    assert_string(
+        &meta.series_metadata,
+        "xlef.lms.pixel_payload",
+        "raw_storage",
+    );
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 3, 4]);
+    assert_eq!(reader.open_bytes(1).unwrap(), vec![11, 12, 13, 14]);
+    assert_eq!(reader.open_bytes(2).unwrap(), vec![21, 22, 23, 24]);
+    assert_eq!(reader.open_bytes(3).unwrap(), vec![31, 32, 33, 34]);
+    assert_eq!(
+        reader.open_bytes_region(3, 1, 0, 1, 2).unwrap(),
+        vec![32, 34]
+    );
+
+    let _ = std::fs::remove_file(xlef);
+    let _ = std::fs::remove_file(lms);
+    let _ = std::fs::remove_file(raw);
+}
+
+#[test]
 fn xlef_lms_roi_shape_aliases_project_to_ome_shapes() {
     let xlef = temp_path("roi_shapes_project.xlef");
     let lms = xlef.with_extension("lms");
