@@ -121,7 +121,8 @@ Additional write-capable formats (read support listed elsewhere): OME-XML
 
 ## Translation status (all readers)
 
-A per-reader audit of the Java-to-Rust translation is tracked in `TOAUDIT.md`.
+A per-reader audit of the Java-to-Rust translation is tracked in
+[`TOAUDIT.md`](https://github.com/henriksson-lab/bioformats-rs/blob/main/TOAUDIT.md).
 Rows marked complete there have passed two clean audits against the corresponding
 Bio-Formats Java reader/writer or are documented Rust-only additions.
 
