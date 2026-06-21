@@ -8,7 +8,7 @@ The internal Metakit table reader used for Volocity is translated from
 [`ome/ome-metakit`](https://github.com/ome/ome-metakit) at commit
 `b8b3a629a6dd9bf422949f6b175b9e310ba6e252`.
 
-* 2026-06-21: Tracked translation audit complete. Every tracked reader, writer, wrapper, dispatch path, and shared component has passed two clean audits without remarks. Not all readers have been tested on read files though
+* 2026-06-21: Tracked translation audit complete. Every component has passed two clean audits without remarks. Not all readers have been tested on real files though
 * 2026-06-20: Close to all files audited. some left
 * 2026-06-19: Extensive reaudit with conservative LLM (many problems fixed). About half files now reaudited, passing only if clean twice in a row - the rest to come
 * 2026-06-17: Some more stragglers found. Definitely need a final audit, but using a different LLM
