@@ -8029,6 +8029,7 @@ impl FormatReader for ImarisReader {
 /// series.
 pub struct XlefReader {
     delegates: Vec<XlefDelegate>,
+    multi_images: Vec<XlefMultiImage>,
     lms_metadata: Vec<ImageMetadata>,
     lms_pixels: Vec<XlefLmsPixelLeaf>,
     series_map: Vec<XlefSeriesRef>,
@@ -8045,6 +8046,10 @@ struct XlefDelegate {
     path: PathBuf,
 }
 
+struct XlefMultiImage {
+    delegates: Vec<usize>,
+}
+
 #[derive(Clone)]
 struct XlefLmsPixelLeaf {
     storage_path: PathBuf,
@@ -8055,7 +8060,7 @@ struct XlefLmsPixelLeaf {
     t_stride: usize,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum XlefSeriesRef {
     Delegate {
         delegate: usize,
@@ -8067,12 +8072,16 @@ enum XlefSeriesRef {
         metadata: usize,
         pixels: Option<usize>,
     },
+    MultiImage {
+        multi: usize,
+    },
 }
 
 impl XlefReader {
     pub fn new() -> Self {
         XlefReader {
             delegates: Vec::new(),
+            multi_images: Vec::new(),
             lms_metadata: Vec::new(),
             lms_pixels: Vec::new(),
             series_map: Vec::new(),
@@ -8185,6 +8194,9 @@ impl XlefReader {
             XlefSeriesRef::Lms { pixels: None, .. } => Err(BioFormatsError::UnsupportedFormat(
                 "Leica XLEF LMS metadata series has no pixel delegate yet".into(),
             )),
+            XlefSeriesRef::MultiImage { .. } => Err(BioFormatsError::Format(
+                "Leica XLEF multi-image series is not a single delegate reader".into(),
+            )),
         }
     }
 
@@ -8195,6 +8207,12 @@ impl XlefReader {
                 .get(*delegate)
                 .map(|delegate| delegate.reader.as_ref()),
             XlefSeriesRef::Lms { .. } => None,
+            XlefSeriesRef::MultiImage { multi } => self
+                .multi_images
+                .get(*multi)
+                .and_then(|multi| multi.delegates.first())
+                .and_then(|delegate| self.delegates.get(*delegate))
+                .map(|delegate| delegate.reader.as_ref()),
         }
     }
 
@@ -8202,6 +8220,7 @@ impl XlefReader {
         match self.series_map.get(self.current_series)? {
             XlefSeriesRef::Delegate { .. } => None,
             XlefSeriesRef::Lms { metadata, .. } => self.lms_metadata.get(*metadata),
+            XlefSeriesRef::MultiImage { .. } => None,
         }
     }
 
@@ -8213,6 +8232,7 @@ impl XlefReader {
                 ..
             } => self.lms_pixels.get(*pixels),
             XlefSeriesRef::Lms { pixels: None, .. } => None,
+            XlefSeriesRef::MultiImage { .. } => None,
         }
     }
 
@@ -8295,12 +8315,39 @@ impl XlefReader {
         Ok(())
     }
 
+    fn add_multi_image(&mut self, references: &[PathBuf]) -> Result<()> {
+        if references.is_empty() {
+            return Ok(());
+        }
+        let mut delegates = Vec::with_capacity(references.len());
+        for reference in references {
+            let mut reader = xlef_delegate_for_reference(reference);
+            reader.set_id(reference)?;
+            if reader.series_count() == 0 {
+                return Err(BioFormatsError::UnsupportedFormat(format!(
+                    "Leica XLEF referenced image {} exposes no readable series",
+                    reference.display()
+                )));
+            }
+            let delegate_index = self.delegates.len();
+            self.delegates.push(XlefDelegate {
+                reader,
+                path: reference.clone(),
+            });
+            delegates.push(delegate_index);
+        }
+        let multi = self.multi_images.len();
+        self.multi_images.push(XlefMultiImage { delegates });
+        self.series_map.push(XlefSeriesRef::MultiImage { multi });
+        Ok(())
+    }
+
     fn rebuild_project_metadata(&mut self, project_path: &Path) -> Result<()> {
         let series_count = self.series_map.len();
         let mut metadata = Vec::with_capacity(series_count);
 
         for series_index in 0..series_count {
-            let mapping = self.series_map[series_index];
+            let mapping = self.series_map[series_index].clone();
             let (mut meta, source_path, source_kind, tile) = match mapping {
                 XlefSeriesRef::Delegate {
                     delegate,
@@ -8333,6 +8380,29 @@ impl XlefReader {
                         "lms_metadata"
                     };
                     (meta, source_path, source_kind, None)
+                }
+                XlefSeriesRef::MultiImage { multi } => {
+                    let multi = self
+                        .multi_images
+                        .get(multi)
+                        .ok_or(BioFormatsError::NotInitialized)?;
+                    let first_delegate = *multi
+                        .delegates
+                        .first()
+                        .ok_or(BioFormatsError::NotInitialized)?;
+                    let delegate = self
+                        .delegates
+                        .get_mut(first_delegate)
+                        .ok_or(BioFormatsError::NotInitialized)?;
+                    delegate.reader.set_series(0)?;
+                    let mut meta = delegate.reader.metadata().clone();
+                    meta.image_count = multi.delegates.len() as u32;
+                    (
+                        meta,
+                        delegate.path.display().to_string(),
+                        "pixel_delegate",
+                        None,
+                    )
                 }
             };
 
@@ -8388,6 +8458,71 @@ impl XlefReader {
             } => self.lms_pixels.get(pixels),
             _ => None,
         }
+    }
+
+    fn open_multi_image_bytes(&mut self, multi: usize, plane_index: u32) -> Result<Vec<u8>> {
+        let delegate = {
+            let multi = self
+                .multi_images
+                .get(multi)
+                .ok_or(BioFormatsError::NotInitialized)?;
+            *multi
+                .delegates
+                .get(plane_index as usize)
+                .ok_or(BioFormatsError::PlaneOutOfRange(plane_index))?
+        };
+        let delegate = self
+            .delegates
+            .get_mut(delegate)
+            .ok_or(BioFormatsError::NotInitialized)?;
+        delegate.reader.set_series(0)?;
+        delegate.reader.open_bytes(0)
+    }
+
+    fn open_multi_image_region(
+        &mut self,
+        multi: usize,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
+        let delegate = {
+            let multi = self
+                .multi_images
+                .get(multi)
+                .ok_or(BioFormatsError::NotInitialized)?;
+            *multi
+                .delegates
+                .get(plane_index as usize)
+                .ok_or(BioFormatsError::PlaneOutOfRange(plane_index))?
+        };
+        let delegate = self
+            .delegates
+            .get_mut(delegate)
+            .ok_or(BioFormatsError::NotInitialized)?;
+        delegate.reader.set_series(0)?;
+        delegate.reader.open_bytes_region(0, x, y, w, h)
+    }
+
+    fn open_multi_image_thumb(&mut self, multi: usize, plane_index: u32) -> Result<Vec<u8>> {
+        let delegate = {
+            let multi = self
+                .multi_images
+                .get(multi)
+                .ok_or(BioFormatsError::NotInitialized)?;
+            *multi
+                .delegates
+                .get(plane_index as usize)
+                .ok_or(BioFormatsError::PlaneOutOfRange(plane_index))?
+        };
+        let delegate = self
+            .delegates
+            .get_mut(delegate)
+            .ok_or(BioFormatsError::NotInitialized)?;
+        delegate.reader.set_series(0)?;
+        delegate.reader.open_thumb_bytes(0)
     }
 
     fn open_lms_pixel_bytes(&self, plane_index: u32) -> Result<Vec<u8>> {
@@ -8469,7 +8604,7 @@ impl XlefReader {
     fn set_delegate_series_for_current(&mut self) -> Result<()> {
         if let Some(XlefSeriesRef::Delegate {
             delegate, series, ..
-        }) = self.series_map.get(self.current_series).copied()
+        }) = self.series_map.get(self.current_series).cloned()
         {
             self.delegates[delegate].reader.set_series(series)?;
         }
@@ -8484,6 +8619,7 @@ enum XlefReference {
         tile_count: u32,
         tile_index_base: usize,
     },
+    ImageSet(Vec<PathBuf>),
     Lms(PathBuf),
 }
 
@@ -8521,6 +8657,20 @@ fn xlef_collect_referenced_images(
         doc_tile_count > 1 && direct_supported_images > 1 && xlef_is_xlif_path(path);
     let mut tile_image_index = 0usize;
     let mut images: Vec<XlefReference> = Vec::new();
+    let group_direct_xlif_images = xlef_is_xlif_path(path)
+        && !direct_xlif_tile_images
+        && direct_supported_images > 1
+        && xlef_supported_references_are_same_format(&references);
+    if group_direct_xlif_images {
+        let paths: Vec<PathBuf> = references
+            .iter()
+            .filter(|reference| xlef_is_supported_image_reference(reference))
+            .cloned()
+            .collect();
+        if !paths.is_empty() {
+            images.push(XlefReference::ImageSet(paths));
+        }
+    }
     for reference in references {
         if xlef_is_project_reference(&reference) {
             if reference.exists() {
@@ -8533,6 +8683,9 @@ fn xlef_collect_referenced_images(
                 unsupported.push(reference);
             }
         } else if xlef_is_supported_image_reference(&reference) {
+            if group_direct_xlif_images {
+                continue;
+            }
             let tile_index_base = if direct_xlif_tile_images {
                 let index = tile_image_index;
                 tile_image_index += 1;
@@ -8566,6 +8719,42 @@ fn xlef_collect_referenced_images(
         }
     }
     Ok(images)
+}
+
+fn xlef_supported_references_are_same_format(paths: &[PathBuf]) -> bool {
+    let mut format: Option<&'static str> = None;
+    for path in paths
+        .iter()
+        .filter(|path| xlef_is_supported_image_reference(path))
+    {
+        let Some(next) = xlef_supported_reference_format(path) else {
+            continue;
+        };
+        if let Some(format) = format {
+            if format != next {
+                return false;
+            }
+        } else {
+            format = Some(next);
+        }
+    }
+    format.is_some()
+}
+
+fn xlef_supported_reference_format(path: &Path) -> Option<&'static str> {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("tif") | Some("tiff") => Some("tif"),
+        Some("lof") => Some("lof"),
+        Some("jpg") | Some("jpeg") => Some("jpeg"),
+        Some("png") => Some("png"),
+        Some("bmp") => Some("bmp"),
+        _ => None,
+    }
 }
 
 fn xlef_is_xlif_path(path: &Path) -> bool {
@@ -10075,6 +10264,9 @@ impl FormatReader for XlefReader {
                         xlef_delegate_for_reference(&path),
                     )?;
                 }
+                XlefReference::ImageSet(paths) => {
+                    self.add_multi_image(&paths)?;
+                }
                 XlefReference::Lms(reference) => {
                     if let Some(reader) = xlef_lms_delegate_for_reference(&reference)? {
                         self.add_initialized_delegate(&reference, 1, 0, reader)?;
@@ -10119,6 +10311,7 @@ impl FormatReader for XlefReader {
             delegate.reader.close()?;
         }
         self.delegates.clear();
+        self.multi_images.clear();
         self.lms_metadata.clear();
         self.lms_pixels.clear();
         self.series_map.clear();
@@ -10131,10 +10324,11 @@ impl FormatReader for XlefReader {
         self.series_map.len()
     }
     fn set_series(&mut self, s: usize) -> Result<()> {
-        let mapping = *self
+        let mapping = self
             .series_map
             .get(s)
-            .ok_or(BioFormatsError::SeriesOutOfRange(s))?;
+            .ok_or(BioFormatsError::SeriesOutOfRange(s))?
+            .clone();
         if let XlefSeriesRef::Delegate {
             delegate, series, ..
         } = mapping
@@ -10158,6 +10352,11 @@ impl FormatReader for XlefReader {
         if let Some(error) = self.lms_pixel_delegate_error() {
             return Err(error);
         }
+        if let Some(XlefSeriesRef::MultiImage { multi }) =
+            self.series_map.get(self.current_series).cloned()
+        {
+            return self.open_multi_image_bytes(multi, p);
+        }
         if self.current_lms_pixel_leaf().is_some() {
             return self.open_lms_pixel_bytes(p);
         }
@@ -10167,6 +10366,11 @@ impl FormatReader for XlefReader {
         if let Some(error) = self.lms_pixel_delegate_error() {
             return Err(error);
         }
+        if let Some(XlefSeriesRef::MultiImage { multi }) =
+            self.series_map.get(self.current_series).cloned()
+        {
+            return self.open_multi_image_region(multi, p, x, y, w, h);
+        }
         if self.current_lms_pixel_leaf().is_some() {
             return self.open_lms_pixel_region(p, x, y, w, h);
         }
@@ -10174,6 +10378,11 @@ impl FormatReader for XlefReader {
             .open_bytes_region(p, x, y, w, h)
     }
     fn open_thumb_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
+        if let Some(XlefSeriesRef::MultiImage { multi }) =
+            self.series_map.get(self.current_series).cloned()
+        {
+            return self.open_multi_image_thumb(multi, p);
+        }
         if self.current_lms_pixel_leaf().is_some() {
             let meta = self.metadata();
             let tw = meta.size_x.min(256);
@@ -10190,6 +10399,25 @@ impl FormatReader for XlefReader {
             .unwrap_or(1)
     }
     fn set_resolution(&mut self, level: usize) -> Result<()> {
+        if let Some(XlefSeriesRef::MultiImage { multi }) =
+            self.series_map.get(self.current_series).cloned()
+        {
+            let delegates = self
+                .multi_images
+                .get(multi)
+                .ok_or(BioFormatsError::NotInitialized)?
+                .delegates
+                .clone();
+            for delegate in delegates {
+                let delegate = self
+                    .delegates
+                    .get_mut(delegate)
+                    .ok_or(BioFormatsError::NotInitialized)?;
+                delegate.reader.set_series(0)?;
+                delegate.reader.set_resolution(level)?;
+            }
+            return Ok(());
+        }
         self.current_delegate_mut()?.set_resolution(level)
     }
     fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
@@ -10199,6 +10427,9 @@ impl FormatReader for XlefReader {
             }
             XlefSeriesRef::Lms { metadata, .. } => {
                 self.lms_metadata.get(*metadata).map(xlef_lms_ome_metadata)
+            }
+            XlefSeriesRef::MultiImage { .. } => {
+                Some(crate::common::ome_metadata::OmeMetadata::from_image_metadata(self.metadata()))
             }
         }
     }

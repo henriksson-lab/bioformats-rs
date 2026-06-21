@@ -793,6 +793,53 @@ fn xlef_mixed_project_adds_project_grouping_metadata_to_each_series() {
 }
 
 #[test]
+fn xlef_xlif_multiple_frame_files_are_one_java_style_series() {
+    let xlef = temp_path("multi_frame_project.xlef");
+    let xlif = xlef.with_file_name("stack.xlif");
+    let bmp_a = xlef.with_file_name("frame_a.bmp");
+    let bmp_b = xlef.with_file_name("frame_b.bmp");
+    write_one_pixel_bmp(&bmp_a, 11, 12, 13);
+    write_one_pixel_bmp(&bmp_b, 21, 22, 23);
+    std::fs::write(
+        &xlif,
+        r#"<XLIF><Element Name="Z stack"><Data><Image Name="Stack">
+<ImageDescription>
+<Channels><ChannelDescription Resolution="8"/></Channels>
+<Dimensions>
+<DimensionDescription DimID="1" NumberOfElements="1" BytesInc="1"/>
+<DimensionDescription DimID="2" NumberOfElements="1" BytesInc="1"/>
+<DimensionDescription DimID="3" NumberOfElements="2" BytesInc="1"/>
+</Dimensions>
+<Frame File="frame_a.bmp"/>
+<Frame File="frame_b.bmp"/>
+</ImageDescription>
+</Image></Data></Element></XLIF>"#,
+    )
+    .unwrap();
+    std::fs::write(&xlef, r#"<XLEF><Reference File="stack.xlif"/></XLEF>"#).unwrap();
+
+    let mut reader = XlefReader::new();
+    reader.set_id(&xlef).unwrap();
+    assert_eq!(reader.series_count(), 1);
+    let meta = reader.metadata();
+    assert_eq!(meta.size_z, 2);
+    assert_eq!(meta.image_count, 2);
+    reader.set_resolution(0).unwrap();
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![11, 12, 13]);
+    assert_eq!(reader.open_bytes(1).unwrap(), vec![21, 22, 23]);
+    assert_eq!(reader.open_thumb_bytes(1).unwrap(), vec![21, 22, 23]);
+    assert!(matches!(
+        reader.open_bytes(2),
+        Err(bioformats::BioFormatsError::PlaneOutOfRange(2))
+    ));
+
+    let _ = std::fs::remove_file(xlef);
+    let _ = std::fs::remove_file(xlif);
+    let _ = std::fs::remove_file(bmp_a);
+    let _ = std::fs::remove_file(bmp_b);
+}
+
+#[test]
 fn xlef_mixed_project_rejects_unsupported_attribute_leaf_before_partial_open() {
     let xlef = temp_path("unsupported_mixed.xlef");
     let bmp = xlef.with_extension("bmp");

@@ -3,12 +3,12 @@
 A pure-Rust translation of [Bio-Formats](https://www.openmicroscopy.org/bio-formats/) 
 — a library for reading (and writing) scientific image formats used in microscopy, medical imaging, and astronomy.
 
-**This package has limited real data testing, and some optional codecs/features
-still need broader real-world coverage.**
+The internal Metakit table reader used for Volocity is translated from
+`ome.metakit.MetakitReader` in
+[`ome/ome-metakit`](https://github.com/ome/ome-metakit) at commit
+`b8b3a629a6dd9bf422949f6b175b9e310ba6e252`.
 
-**The tracked translation audit is currently clean; see `TOAUDIT.md`.**
-
-* 2026-06-21: Each file now passes two runs of audit without remarks. More audit to be done but this is a new baseline
+* 2026-06-21: Tracked translation audit complete. Every tracked reader, writer, wrapper, dispatch path, and shared component has passed two clean audits without remarks. Not all readers have been tested on read files though
 * 2026-06-20: Close to all files audited. some left
 * 2026-06-19: Extensive reaudit with conservative LLM (many problems fixed). About half files now reaudited, passing only if clean twice in a row - the rest to come
 * 2026-06-17: Some more stragglers found. Definitely need a final audit, but using a different LLM
@@ -183,9 +183,10 @@ so they are not rated here — see
 | Nikon ND2 | `.nd2` | ✅ | Chunk-map validation/fallback, ImageDataSeq ordering, XML/LV/text metadata, channel colors/LUTs, zlib/JPEG2000/lossless paths, scanline padding, and plane mapping |
 | Prairie View | `.xml` `.cfg` `.env` `.tif` | ✅ | Channels/metadata + stage-position multi-series |
 | MetaMorph STK | `.stk` `.nd` | ✅ | Per-plane UIC metadata + multi-STK `.nd` file-group series |
-| Leica XLEF | `.xlef` | ✅ | XLEF/XLIF graph traversal, tilescan file-tile mapping, supported delegate routing, LMS metadata overlay, and used-file behavior; bounded LMS support is additive |
+| Leica XLEF | `.xlef` `.xlif` `.lms` | ✅ | XLEF/XLIF graph traversal, Java-style multi-image frame grouping, thumbnail/resolution routing, LMS metadata overlay, used-file metadata, and bounded external raw-storage LMS pixel reads; compressed/internal LMS Memory blocks return `UnsupportedFormat` |
 | Imaris IMS | `.ims` | ✅ | HDF5 resolution grouping, hyperslab plane decode, unsigned fixed-point type reporting, channel LUTs, and metadata parsing |
 | Leica LIF | `.lif` | ✅ | LIF/LOF detection, UTF-16 XML, memory-block ID/file-order/size fallback, tile expansion/stride, missing/truncated blank reads, BGR swap, RGB layouts, and dimension-order mapping |
+| Volocity | `.mvd2` `.aisf` `.aiix` `.dat` `.atsf` | ✅ | Java VolocityReader behavior audited for companion routing, Metakit stack/channel metadata, addSeriesMeta-style metadata exposure, and bounded native plane reads; proprietary fixture-complete validation remains dataset-limited |
 
 ### High-content screening (HCS)
 
@@ -297,26 +298,10 @@ so they are not rated here — see
 | Imaris TIFF / SlideBook TIFF | `.ims` `.tif` | ✅ | Imaris TIFF and SlideBook TIFF wrapper detection, metadata projection, and TIFF delegation audited faithful |
 | BigDataViewer | `.h5` | ✅ | XML parsing, timepoint pattern behavior, setup/channel collapse, HDF5 plane mapping, signed i32 cells, and TIFF interactions audited faithful |
 | Olympus OIR / Volocity clipping | `.oir` `.acff` | ✅ | Native payload readers with explicit clipping/plane bounds |
+| Imspector OBF/MSR | `.obf` `.msr` | ✅ | Java MSR CDataStack, bounded multi-PMT/mosaic traversal, native OBF v1-v6 contiguous/chunked raw/zlib stacks, and SPCM-labeled FLIM lifetime layout audited faithful; Bio-Formats-style OBF is handled separately by `ObfReader` |
 | Amnis IM3 | `.im3` | ✅ | Java native cookie, record traversal, Shape/Data metadata, spectral library parsing, and channel extraction audited faithful |
 | SlideBook 7 | `.sld` `.sldy` `.sldyz` | ✅ | Java native metadata and pixel routing paths audited faithful |
 | iVision IPM | `.ipm` | ✅ | Java native header probing, data-type metadata, RGB/interleaved flags, unsupported color16/square-root behavior, padding reads, and plist metadata audited faithful |
-
-### Bounded native leftovers
-
-These formats have faithful entry-point behavior plus bounded native support, but
-still have proprietary or fixture-dependent branches that intentionally return a
-descriptive `UnsupportedFormat` instead of guessed pixels.
-
-| Format | Extensions | Reason |
-|--------|-----------|--------|
-| Volocity | `.mvd2` plus `.aisf` `.aiix` `.dat` `.atsf` companions | Java VolocityReader entry point audited for native stream gating, detection-vs-init companion routing, stack/channel metadata, diagnostics, bounded native plane reads, and explicit raw fixture provenance; fixture-complete validation remains blocked on proprietary Volocity datasets/specs |
-| Imspector bounded OBF/MSR subset | `.obf` `.msr` | Java MSR CDataStack first-block plus bounded multi-PMT and mosaic block traversal are decoded, and bounded native OBF v1-v6 contiguous/chunked raw/zlib stacks are decoded, including SPCM-labeled FLIM lifetime layout; explicit `BFIMSPECTOR_RAW_STACK_V1` synthetic payloads remain additive. Bio-Formats-style OBF is handled separately by `ObfReader`. |
-| Leica XLEF LMS leaves | `.xlef` / `.xlif` projects containing `.lms` leaves | LMS metadata leaves expose bounded metadata/OME scalars and original-metadata annotations; uncompressed external raw-storage leaves can read declared strided X/Y/Z/C/T pixels, while compressed/internal Memory-block payloads still return `UnsupportedFormat` |
-
-The internal Metakit table reader used for Volocity is translated from
-`ome.metakit.MetakitReader` in
-[`ome/ome-metakit`](https://github.com/ome/ome-metakit) at commit
-`b8b3a629a6dd9bf422949f6b175b9e310ba6e252`.
 
 Various no-Java-reference camera/SPM readers remain best-effort extensions; when
 native layout is unknown they return `UnsupportedFormat` instead of guessed

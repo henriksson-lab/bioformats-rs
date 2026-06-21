@@ -11,7 +11,7 @@
 use std::hint::black_box;
 use std::path::Path;
 use std::process::Command;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 
@@ -149,7 +149,7 @@ fn bench_rust(c: &mut Criterion) {
 
     // Measure how many bytes we read per iteration (all planes)
     let bytes_per_iter: u64 = {
-        let mut reader = bioformats::ImageReader::open(&tif).unwrap();
+        let reader = bioformats::ImageReader::open(&tif).unwrap();
         let m = reader.metadata().clone();
         (m.size_x as u64)
             * (m.size_y as u64)

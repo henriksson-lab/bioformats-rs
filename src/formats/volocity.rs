@@ -189,8 +189,9 @@ fn volocity_library_from_companion(path: &Path) -> Option<PathBuf> {
 
 fn volocity_library_from_companion_for_init(path: &Path) -> Option<PathBuf> {
     // Java initFile(String) uses a different, looser companion route than
-    // isThisType: climb two parents, recursively list that directory, and use
-    // the first .mvd2 found there.
+    // isThisType: `file.getParentFile().getParentFile().list(true)` is scanned
+    // for the first .mvd2. Direct Data children route to the library directory;
+    // deeper stack children route only to the Data directory, matching Java.
     let search_root = path.parent()?.parent()?;
     let mut budget = VOLOCITY_MAX_COMPANION_SCAN_ENTRIES;
     volocity_find_mvd2(search_root, VOLOCITY_MAX_COMPANION_SCAN_DEPTH, &mut budget)
@@ -1552,6 +1553,14 @@ struct VolocityStack {
     channel_names: Vec<String>,
     name: String,
     description: Option<String>,
+    physical_x: Option<f64>,
+    physical_y: Option<f64>,
+    physical_z: Option<f64>,
+    magnification: Option<f64>,
+    detector: Option<String>,
+    x_location: f64,
+    y_location: f64,
+    z_location: f64,
 
     // Core metadata for this series.
     size_x: u32,
@@ -1760,6 +1769,14 @@ fn volocity_build_stacks(
             },
             name: candidate.stack_name.clone(),
             description: candidate.metadata.description.clone(),
+            physical_x: candidate.metadata.physical_x,
+            physical_y: candidate.metadata.physical_y,
+            physical_z: candidate.metadata.physical_z,
+            magnification: candidate.metadata.magnification,
+            detector: candidate.metadata.detector.clone(),
+            x_location: candidate.metadata.x_location.unwrap_or(0.0),
+            y_location: candidate.metadata.y_location.unwrap_or(0.0),
+            z_location: candidate.metadata.z_location.unwrap_or(0.0),
             size_x: 0,
             size_y: 0,
             size_z: 1,
@@ -2077,15 +2094,55 @@ fn volocity_stack_metadata(stack: &VolocityStack) -> ImageMetadata {
     };
     meta.series_metadata
         .insert("Name".into(), MetadataValue::String(stack.name.clone()));
+    if let Some(physical_x) = stack.physical_x {
+        meta.series_metadata.insert(
+            "Pixel width (in microns)".into(),
+            MetadataValue::Float(physical_x),
+        );
+    }
+    if let Some(physical_y) = stack.physical_y {
+        meta.series_metadata.insert(
+            "Pixel height (in microns)".into(),
+            MetadataValue::Float(physical_y),
+        );
+    }
+    if let Some(physical_z) = stack.physical_z {
+        meta.series_metadata.insert(
+            "Z step (in microns)".into(),
+            MetadataValue::Float(physical_z),
+        );
+    }
+    if let Some(magnification) = stack.magnification {
+        meta.series_metadata.insert(
+            "Objective magnification".into(),
+            MetadataValue::Float(magnification),
+        );
+    }
+    if let Some(detector) = &stack.detector {
+        meta.series_metadata.insert(
+            "Camera/Detector".into(),
+            MetadataValue::String(detector.clone()),
+        );
+    }
     if let Some(description) = &stack.description {
         meta.series_metadata.insert(
             "Description".into(),
             MetadataValue::String(description.clone()),
         );
     }
-    for channel in &stack.channel_names {
+    meta.series_metadata
+        .insert("X Location".into(), MetadataValue::Float(stack.x_location));
+    meta.series_metadata
+        .insert("Y Location".into(), MetadataValue::Float(stack.y_location));
+    meta.series_metadata
+        .insert("Z Location".into(), MetadataValue::Float(stack.z_location));
+    for (index, channel) in stack.channel_names.iter().enumerate() {
         meta.series_metadata.insert(
             format!("Channel {}", channel),
+            MetadataValue::String(channel.clone()),
+        );
+        meta.series_metadata.insert(
+            format!("Channel {index} Name"),
             MetadataValue::String(channel.clone()),
         );
     }
@@ -2961,16 +3018,22 @@ mod tests {
         assert!(!reader.is_this_type_by_name(&companion));
 
         let mvd2 = library.join("Library.mvd2");
-        std::fs::write(&mvd2, b"JL").unwrap();
+        std::fs::write(&mvd2, include_bytes!("../metakit/tests/data/test.mk")).unwrap();
         assert!(reader.is_this_type_by_name(&mvd2));
         assert!(reader.is_this_type_by_name(&companion));
 
+        // Java isThisType and initFile use different companion routes. For a
+        // nested Data/Stack companion, detection sees the owning Library.mvd2,
+        // but initFile only searches under Data and therefore initializes the
+        // companion itself.
         let err = VolocityReader::new().set_id(&companion).unwrap_err();
         assert!(matches!(
             err,
             BioFormatsError::UnsupportedFormat(message)
-                if message.contains("native Metakit decoding is unsupported")
-                    && message.contains("Library.mvd2")
+                if message.contains("Metakit stream signature was present")
+                    && message.contains("Metakit header is truncated")
+                    && message.contains("1.aisf")
+                    && !message.contains("Library.mvd2")
         ));
 
         let _ = std::fs::remove_dir_all(root);
@@ -3021,6 +3084,14 @@ mod tests {
             channel_names: vec!["R".to_string(), "G".to_string()],
             name: "RGB split".to_string(),
             description: None,
+            physical_x: Some(0.25),
+            physical_y: Some(0.5),
+            physical_z: Some(1.5),
+            magnification: Some(20.0),
+            detector: Some("CCD".to_string()),
+            x_location: 10.0,
+            y_location: 20.0,
+            z_location: 30.0,
             size_x: 2,
             size_y: 2,
             size_z: 1,
@@ -3048,6 +3119,34 @@ mod tests {
             reader.open_bytes_region(0, 1, 0, 1, 2).unwrap(),
             vec![4, 5, 6, 10, 11, 12]
         );
+        assert!(matches!(
+            reader.metadata().series_metadata.get("Pixel width (in microns)"),
+            Some(MetadataValue::Float(value)) if (*value - 0.25).abs() < f64::EPSILON
+        ));
+        assert!(matches!(
+            reader.metadata().series_metadata.get("Pixel height (in microns)"),
+            Some(MetadataValue::Float(value)) if (*value - 0.5).abs() < f64::EPSILON
+        ));
+        assert!(matches!(
+            reader.metadata().series_metadata.get("Z step (in microns)"),
+            Some(MetadataValue::Float(value)) if (*value - 1.5).abs() < f64::EPSILON
+        ));
+        assert!(matches!(
+            reader.metadata().series_metadata.get("Objective magnification"),
+            Some(MetadataValue::Float(value)) if (*value - 20.0).abs() < f64::EPSILON
+        ));
+        assert!(matches!(
+            reader.metadata().series_metadata.get("Camera/Detector"),
+            Some(MetadataValue::String(value)) if value == "CCD"
+        ));
+        assert!(matches!(
+            reader.metadata().series_metadata.get("X Location"),
+            Some(MetadataValue::Float(value)) if (*value - 10.0).abs() < f64::EPSILON
+        ));
+        assert!(matches!(
+            reader.metadata().series_metadata.get("Channel 0 Name"),
+            Some(MetadataValue::String(value)) if value == "R"
+        ));
     }
 
     fn blind_mvd2(width: u32, height: u32, z: u32, c: u32, t: u32, payload: &[u8]) -> Vec<u8> {

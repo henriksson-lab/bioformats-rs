@@ -1,0 +1,99 @@
+Bio-Formats / libhdf5 full-precision scaleoffset bug (BDV s08/0, s08/1)
+======================================================================
+
+SUMMARY
+-------
+The Java↔Rust parity harness flags two BigDataViewer planes as mismatching
+Java. The mismatch is NOT a bug in our code — it is a bug in the libhdf5 C
+library that Bio-Formats bundles. Our pure-Rust reader decodes these planes
+correctly; Bio-Formats (and stock h5py) do not. This is documented and
+classified as "⚠ Java-bug" in tests/java_parity_test.rs, not a failure.
+
+
+THE DATA
+--------
+File   : testdata/bdv/HisYFP-SPIM.h5  (BDV SPIM, ~357 MB; download_test_data.sh bdv)
+Planes : /t00018/s08/0/cells  (parity series 31)
+         /t00018/s08/1/cells  (parity series 32)
+Format : int16, filter pipeline = scaleoffset (HDF5 filter id 6) + deflate (id 1),
+         chunked 16x16x16. (NB: filter id 6 is scaleoffset, NOT shuffle — an
+         earlier investigation misread this.)
+The deconvolved setup-8 levels contain "full-precision" scaleoffset chunks:
+chunks whose value range needs all 16 bits, so minbits == size*8 and the values
+are stored verbatim (the filter achieves zero compression for that chunk). s08/0
+has 417 such chunks, s08/1 has 50, s08/2 has none.
+
+
+THE BUG (in libhdf5, C library)
+-------------------------------
+libhdf5's scaleoffset read path (src/H5Zscaleoffset.c) guards with
+    if (minbits >= p.size * 8) HGOTO_ERROR(... "minimum number of bits exceeds size of type");
+placed BEFORE the
+    if (minbits == p.size * 8) { memcpy verbatim; }   /* full-precision */
+branch. The `>=` makes the verbatim branch dead code, so libhdf5 cannot read
+back full-precision scaleoffset chunks — including ones its OWN writer produces.
+It is an off-by-one; the guard should be `>`.
+
+REPRODUCED with libhdf5's own writer+reader (h5py 3.12 / libhdf5 1.14.5),
+~12 lines, no Bio-Formats and no Rust involved:
+  - write an int16 dataset with the scaleoffset filter, one chunk spanning the
+    full int16 range (forces full precision) -> reading it back raises
+    "Can't synchronously read data (filter returned failure during read)".
+  - the same dataset with NO full-range chunk round-trips fine.
+So the trigger is specifically the full-precision case. It has gone unnoticed
+because full-precision scaleoffset is a degenerate corner (the filter compresses
+nothing) that real data and HDF5's own test suite rarely hit; BDV deconvolution
+output happens to produce such chunks.
+
+
+VERSION MATRIX (verified against H5Zscaleoffset.c at each release tag)
+---------------------------------------------------------------------
+  libhdf5 1.14.5   guard `>=`   BROKEN  (our system h5py; hard-errors on read)
+  libhdf5 1.14.6   guard `>=`   BROKEN  (last 1.14.x; fix NOT backported)
+  libhdf5 2.0.0    guard `>`    FIXED
+  libhdf5 2.1.1    guard `>`    FIXED   (latest tagged release, Mar 2026)
+  libhdf5 2.2.0    guard `>`    FIXED   (dev line)
+The `>=`->`>` fix landed only in the 2.0.0 major release.
+
+
+WHAT EACH READER USES, AND WHY THEY DIFFER
+------------------------------------------
+  hdf5-pure-rust (our crate): translated from a vendored HDF5 *2.2.0* C checkout
+    (hdf5/src/H5public.h -> H5_VERS 2.2.0; H5Zscaleoffset.c uses the fixed `>`),
+    so it decodes full-precision chunks CORRECTLY.
+
+  Bio-Formats 8.5.0 (our bioformats_package.jar, a CURRENT release): reads HDF5
+    via CISD/sis-JHDF5 *19.04.1* (BUILD-jhdf5.INFO: 19.04.1, 2022-07-25), whose
+    bundled native libjhdf5.so reports "HDF5 Version: 1.10.5" (binary dated 2020).
+    libhdf5 1.10.5 is pre-2.0 -> BUGGY. sis-JHDF5 is effectively abandoned (frozen
+    on the 1.10.x line), so newer Bio-Formats versions do NOT fix this.
+
+  stock h5py 3.12: libhdf5 1.14.5 -> BUGGY, but a NEWER pre-2.0 than Bio-Formats.
+
+This explains the observed behaviors:
+  - 1.10.5 (Bio-Formats) silently MIS-decodes the full-precision chunks (produces
+    bytes that differ from correct by a few values -> the ~6-byte region diff the
+    parity harness sees).
+  - 1.14.5 (h5py) added the strict HGOTO_ERROR, so it HARD-FAILS the read.
+  - 2.2.0 (our Rust port) is correct.
+All three behaviors are consistent with the same root cause at different
+pre-/post-fix versions. The genuine negative int16 values in these datasets are
+real (deconvolution output), confirmed on chunks all pre-2.0 readers agree on;
+"intensities must be non-negative" was never ground truth.
+
+
+RESOLUTION
+----------
+  * Nothing to fix in our code. Our reader is correct (and the most modern of the
+    three). Verified byte-exact for these datasets against an independent
+    reconstruction in the hdf5-pure-rust repo (its tests/bdv_scaleoffset_deflate_test.rs
+    pins the exact int16 sums; see that repo's hdf5.txt post-mortem).
+  * Parity harness: the two planes are listed in JAVA_LIBHDF5_DIVERGENCE in
+    tests/java_parity_test.rs and reported as "⚠ Java-bug", not "✗". This is the
+    correct, durable classification: it will hold until Bio-Formats ships a
+    libhdf5 >= 2.0.0, which is not on the horizon given the frozen JHDF5 backend.
+  * The real fix is upstream and already done (HDF5 2.0.0); it would only reach
+    Bio-Formats if its HDF5 backend were swapped or rebuilt against 2.x.
+
+See also: memory note hdf5-scaleoffset-fullprecision-bug, and the hdf5-pure-rust
+repo (hdf5.txt, tests/bdv_scaleoffset_deflate_test.rs).
