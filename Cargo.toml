@@ -1,6 +1,6 @@
 [package]
 name = "bioformats"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 description = "Pure Rust translation of Bio-Formats — read/write scientific image formats"
 license = "GPL-2.0-or-later"
@@ -11,7 +11,17 @@ keywords = ["microscopy", "bioformats", "image", "tiff", "ome"]
 categories = ["science", "multimedia::images", "parser-implementations"]
 include = [
     "/src/**/*.rs",
+    "/src/**/*.txt",
+    "/src/metakit/tests/data/test.mk",
+    "/benches/read_ome_tiff.rs",
+    "/examples/**/*.rs",
+    "/tests/**/*.rs",
+    "/tests/fixtures/**",
+    "/external-fixtures/manifests/**",
+    "/parity/BfParityOracle.java",
     "/README.md",
+    "/TOAUDIT.md",
+    "/bioformats_bug.txt",
     "/LICENSE.txt",
 ]
 
@@ -29,7 +39,7 @@ weezl        = "0.2"
 jpeg-decoder = "0.3"
 zune-jpeg    = "0.5"
 zune-core    = "0.5"
-zstd-pure-rs = "0.1"
+zstd-pure-rs = "0.1.2"
 quick-xml    = "0.40"
 encoding_rs  = "0.8"
 cfb          = "0.14"
