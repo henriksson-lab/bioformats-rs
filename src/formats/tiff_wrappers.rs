@@ -2689,6 +2689,19 @@ impl NikonElementsTiffReader {
 const NIKON_ELEMENTS_XML_TAG: u16 = 65332;
 const NIKON_ELEMENTS_XML_TAG_2: u16 = 65333;
 
+fn tiff_header_has_nikon_elements_xml_tag(header: &[u8]) -> bool {
+    let cursor = std::io::Cursor::new(header);
+    let mut parser = match crate::tiff::parser::TiffParser::new(cursor) {
+        Ok(parser) => parser,
+        Err(_) => return false,
+    };
+    let ifd = match parser.read_ifd(parser.first_ifd_offset) {
+        Ok((ifd, _)) => ifd,
+        Err(_) => return false,
+    };
+    ifd.get(NIKON_ELEMENTS_XML_TAG).is_some()
+}
+
 fn nikon_elements_private_xml_from_ifd(ifd: &crate::tiff::ifd::Ifd) -> Option<String> {
     nikon_elements_ifd_text_value(ifd, NIKON_ELEMENTS_XML_TAG)
         .and_then(|xml| nikon_elements_prepare_private_xml(&xml))
@@ -4278,16 +4291,12 @@ impl Default for NikonElementsTiffReader {
 }
 
 impl FormatReader for NikonElementsTiffReader {
-    fn is_this_type_by_name(&self, path: &Path) -> bool {
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_ascii_lowercase());
-        matches!(ext.as_deref(), Some("tif") | Some("tiff"))
+    fn is_this_type_by_name(&self, _path: &Path) -> bool {
+        false
     }
 
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
-        false
+    fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        tiff_header_has_nikon_elements_xml_tag(header)
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
@@ -4423,6 +4432,43 @@ fn parse_f64_option(value: Option<&String>) -> Option<f64> {
     value.and_then(|v| v.trim().parse::<f64>().ok())
 }
 
+fn fei_format_java_date(value: &str) -> Option<String> {
+    let mut parts = value.split_whitespace();
+    let date = parts.next()?;
+    let time = parts.next()?;
+    let am_pm = parts.next()?.to_ascii_uppercase();
+    if parts.next().is_some() {
+        return None;
+    }
+
+    let mut date_parts = date.split('/');
+    let month = date_parts.next()?.parse::<u32>().ok()?;
+    let day = date_parts.next()?.parse::<u32>().ok()?;
+    let year = date_parts.next()?.parse::<u32>().ok()?;
+    if date_parts.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+
+    let mut time_parts = time.split(':');
+    let mut hour = time_parts.next()?.parse::<u32>().ok()?;
+    let minute = time_parts.next()?.parse::<u32>().ok()?;
+    let second = time_parts.next()?.parse::<u32>().ok()?;
+    if time_parts.next().is_some() || hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+    match am_pm.as_str() {
+        "AM" if hour == 12 => hour = 0,
+        "AM" => {}
+        "PM" if hour < 12 => hour += 12,
+        "PM" => {}
+        _ => return None,
+    }
+
+    Some(format!(
+        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}"
+    ))
+}
+
 impl FeiTiffReader {
     pub fn new() -> Self {
         FeiTiffReader {
@@ -4550,7 +4596,7 @@ impl FeiTiffReader {
             titan = false;
         }
 
-        self.helios = helios && !titan;
+        self.helios = helios;
         let software = if titan {
             "Titan"
         } else if helios {
@@ -4670,7 +4716,6 @@ impl FeiTiffReader {
             {
                 self.size_x = Some(mag * FEI_MAG_MULTIPLIER);
                 self.size_y = Some(mag * FEI_MAG_MULTIPLIER);
-                self.magnification = Some(mag);
             }
             if let Some(scan) = ini.get("Vector.Sysscan") {
                 self.stage_x = parse_f64_option(scan.get("PositionX"));
@@ -4788,12 +4833,19 @@ impl FeiTiffReader {
             OmeObjective, OmePlane,
         };
 
+        let physical_size_x = self
+            .size_x
+            .map(|v| if self.helios { v * 1_000_000.0 } else { v });
+        let physical_size_y = self
+            .size_y
+            .map(|v| if self.helios { v * 1_000_000.0 } else { v });
+
         let mut image = OmeImage {
             name: self.image_name.clone(),
             description: self.image_description.clone(),
-            acquisition_date: self.date.clone(),
-            physical_size_x: self.size_x,
-            physical_size_y: self.size_y,
+            acquisition_date: self.date.as_deref().and_then(fei_format_java_date),
+            physical_size_x,
+            physical_size_y,
             time_increment: self.time_increment,
             ..Default::default()
         };
@@ -5198,7 +5250,9 @@ impl SisReader {
         let camera_name_length =
             read_i16_at(&bytes, meta + 44, little).unwrap_or(0).max(0) as usize;
         let channel_name = read_c_string(&bytes, meta + 46).trim().to_string();
-        if channel_name.len() <= 128 {
+        if channel_name.len() > 128 {
+            self.channel_name = Some(String::new());
+        } else {
             if camera_name_length > 0 {
                 let end = camera_name_length.min(channel_name.len());
                 self.camera_name = Some(channel_name[..end].to_string());
@@ -5248,21 +5302,25 @@ impl SisReader {
             OmeObjective,
         };
 
-        let mut image = OmeImage {
-            name: self.image_name.clone(),
-            acquisition_date: self.acquisition_date.clone(),
-            physical_size_x: self.physical_size_x,
-            physical_size_y: self.physical_size_y,
-            instrument_ref: Some(0),
-            objective_ref: Some(0),
-            ..Default::default()
-        };
-        image.channels.push(OmeChannel {
-            name: self.channel_name.clone(),
-            samples_per_pixel: 1,
-            detector_ref: Some(create_lsid("Detector", &[0, 0])),
-            ..Default::default()
-        });
+        let mut ome = OmeMetadata::from_image_metadata(self.metadata());
+        if ome.images.is_empty() {
+            ome.images.push(OmeImage::default());
+        }
+        let image = &mut ome.images[0];
+        image.name = self.image_name.clone();
+        image.acquisition_date = self.acquisition_date.clone();
+        image.physical_size_x = self.physical_size_x;
+        image.physical_size_y = self.physical_size_y;
+        image.instrument_ref = Some(0);
+        image.objective_ref = Some(0);
+        if image.channels.is_empty() {
+            image.channels.push(OmeChannel {
+                samples_per_pixel: 1,
+                ..Default::default()
+            });
+        }
+        image.channels[0].name = self.channel_name.clone();
+        image.channels[0].detector_ref = Some(create_lsid("Detector", &[0, 0]));
         let instrument = OmeInstrument {
             id: Some(create_lsid("Instrument", &[0])),
             objectives: vec![OmeObjective {
@@ -5280,11 +5338,12 @@ impl SisReader {
             }],
             ..Default::default()
         };
-        OmeMetadata {
-            images: vec![image],
-            instruments: vec![instrument],
-            ..Default::default()
+        if ome.instruments.is_empty() {
+            ome.instruments.push(instrument);
+        } else {
+            ome.instruments[0] = instrument;
         }
+        ome
     }
 }
 
@@ -5295,12 +5354,8 @@ impl Default for SisReader {
 }
 
 impl FormatReader for SisReader {
-    fn is_this_type_by_name(&self, path: &Path) -> bool {
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_ascii_lowercase());
-        matches!(ext.as_deref(), Some("tif") | Some("tiff"))
+    fn is_this_type_by_name(&self, _path: &Path) -> bool {
+        false
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
@@ -5475,6 +5530,25 @@ impl NikonTiffReader {
         }
     }
 
+    fn reset_standard_metadata_fields(&mut self) {
+        self.physical_size_x = 0.0;
+        self.physical_size_y = 0.0;
+        self.physical_size_z = 0.0;
+        self.filter_models.clear();
+        self.dichroic_models.clear();
+        self.laser_ids.clear();
+        self.magnification = None;
+        self.lens_na = 0.0;
+        self.working_distance = 0.0;
+        self.pinhole_size = 0.0;
+        self.correction = None;
+        self.immersion = None;
+        self.gain.clear();
+        self.wavelength.clear();
+        self.em_wave.clear();
+        self.ex_wave.clear();
+    }
+
     /// Mirror Java `NikonTiffReader.isThisType(RandomAccessInputStream)`:
     /// parse the first IFD, read its SOFTWARE tag, and require that it contains
     /// the substring `EZ-C1`. Operates on whatever header bytes are available;
@@ -5505,6 +5579,7 @@ impl NikonTiffReader {
     /// (ImageDescription) into the typed acquisition fields and the global
     /// metadata table.
     fn init_standard_metadata(&mut self) {
+        self.reset_standard_metadata_fields();
         let comment = {
             let series = self.inner.series_list();
             if series.is_empty() {
@@ -5810,12 +5885,10 @@ impl Default for NikonTiffReader {
 }
 
 impl FormatReader for NikonTiffReader {
-    fn is_this_type_by_name(&self, path: &Path) -> bool {
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_ascii_lowercase());
-        matches!(ext.as_deref(), Some("tif") | Some("tiff"))
+    fn is_this_type_by_name(&self, _path: &Path) -> bool {
+        // Java sets suffixSufficient=false; this reader is selected by the
+        // SOFTWARE tag signature, not by the broad .tif/.tiff suffix.
+        false
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
@@ -5829,6 +5902,7 @@ impl FormatReader for NikonTiffReader {
     }
 
     fn close(&mut self) -> Result<()> {
+        self.reset_standard_metadata_fields();
         self.inner.close()
     }
     fn series_count(&self) -> usize {
@@ -6142,32 +6216,14 @@ impl MetamorphTiffReader {
         let mut x_positions: Vec<Option<f64>> = Vec::new();
         let mut y_positions: Vec<Option<f64>> = Vec::new();
 
-        let comments: Vec<Option<String>> = {
-            let series = self.inner.series_list();
-            series
-                .iter()
-                .map(|s| {
-                    s.metadata
-                        .series_metadata
-                        .get("ImageDescription")
-                        .and_then(|v| {
-                            if let crate::common::metadata::MetadataValue::String(s) = v {
-                                Some(s.clone())
-                            } else {
-                                None
-                            }
-                        })
-                })
-                .collect()
-        };
-        // Java keys off ifds (one comment per plane); the inner reader exposes one
-        // ImageDescription per series entry. For single-IFD/single-series files
-        // this is the first (and only) comment, re-parsed once.
-        let ifd_comments: Vec<String> = if comments.iter().any(|c| c.is_some()) {
-            comments.into_iter().flatten().collect()
-        } else {
-            Vec::new()
-        };
+        let ifd_comments: Vec<String> = (0..self.inner.ifd_count())
+            .filter_map(|i| {
+                self.inner
+                    .ifd(i)
+                    .and_then(|ifd| ifd.get_str(crate::tiff::ifd::tag::IMAGE_DESCRIPTION))
+                    .map(str::to_owned)
+            })
+            .collect();
 
         for xml in &ifd_comments {
             let tags = xml_scan_tags(xml);
@@ -6987,58 +7043,19 @@ impl ImprovisionTiffReader {
     }
 
     fn tiff_header_comment_contains_improvision(header: &[u8]) -> bool {
-        (|| -> Option<bool> {
-            if header.len() < 8 {
-                return Some(false);
-            }
-            let little = match &header[..4] {
-                b"II*\0" => true,
-                b"MM\0*" => false,
-                _ => return Some(false),
-            };
-            let read_u16 = |offset: usize| -> Option<u16> {
-                let bytes = header.get(offset..offset + 2)?;
-                Some(if little {
-                    u16::from_le_bytes([bytes[0], bytes[1]])
-                } else {
-                    u16::from_be_bytes([bytes[0], bytes[1]])
-                })
-            };
-            let read_u32 = |offset: usize| -> Option<u32> {
-                let bytes = header.get(offset..offset + 4)?;
-                Some(if little {
-                    u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
-                } else {
-                    u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
-                })
-            };
-
-            let ifd_offset = read_u32(4)? as usize;
-            let entry_count = read_u16(ifd_offset)? as usize;
-            let entries_start = ifd_offset.checked_add(2)?;
-            for entry_index in 0..entry_count {
-                let entry = entries_start.checked_add(entry_index.checked_mul(12)?)?;
-                let tag = read_u16(entry)?;
-                if tag != crate::tiff::ifd::tag::IMAGE_DESCRIPTION {
-                    continue;
-                }
-                let field_type = read_u16(entry + 2)?;
-                let count = read_u32(entry + 4)? as usize;
-                if field_type != 2 || count == 0 {
-                    return Some(false);
-                }
-                let value_or_offset = header.get(entry + 8..entry + 12)?;
-                let bytes = if count <= 4 {
-                    &value_or_offset[..count.min(value_or_offset.len())]
-                } else {
-                    let offset = read_u32(entry + 8)? as usize;
-                    header.get(offset..offset.checked_add(count)?)?
-                };
-                return Some(String::from_utf8_lossy(bytes).contains("Improvision"));
-            }
-            Some(false)
-        })()
-        .unwrap_or(false)
+        let cursor = std::io::Cursor::new(header);
+        let mut parser = match crate::tiff::parser::TiffParser::new(cursor) {
+            Ok(parser) => parser,
+            Err(_) => return false,
+        };
+        let ifd = match parser.read_ifd(parser.first_ifd_offset) {
+            Ok((ifd, _)) => ifd,
+            Err(_) => return false,
+        };
+        matches!(
+            ifd.get_str(crate::tiff::ifd::tag::IMAGE_DESCRIPTION),
+            Some(comment) if comment.contains(Self::IMPROVISION_MAGIC_STRING)
+        )
     }
 
     fn sample_uuid_from_path(path: &Path) -> Result<Option<String>> {
@@ -7083,9 +7100,6 @@ impl ImprovisionTiffReader {
         let mut files = Vec::new();
         for name in entries {
             let candidate = parent.join(name);
-            if !self.is_this_type_by_name(&candidate) {
-                continue;
-            }
             let Ok(Some(uuid)) = Self::sample_uuid_from_path(&candidate) else {
                 continue;
             };
@@ -7208,12 +7222,8 @@ impl Default for ImprovisionTiffReader {
 }
 
 impl FormatReader for ImprovisionTiffReader {
-    fn is_this_type_by_name(&self, path: &Path) -> bool {
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_ascii_lowercase());
-        matches!(ext.as_deref(), Some("tif") | Some("tiff"))
+    fn is_this_type_by_name(&self, _path: &Path) -> bool {
+        false
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
@@ -9870,6 +9880,72 @@ mod nikon_elements_tiff_tests {
         std::fs::write(path, bytes).unwrap();
     }
 
+    fn write_minimal_sis_tiff_with_binary_metadata(path: &Path, channel_name: &str) {
+        let mut software = b"analySIS 5.0".to_vec();
+        software.push(0);
+
+        let mut sis_metadata = vec![0u8; 260];
+        sis_metadata[10..12].copy_from_slice(&34i16.to_le_bytes());
+        sis_metadata[12..14].copy_from_slice(&12i16.to_le_bytes());
+        sis_metadata[14..16].copy_from_slice(&2i16.to_le_bytes());
+        sis_metadata[16..18].copy_from_slice(&0i16.to_le_bytes());
+        sis_metadata[18..20].copy_from_slice(&120i16.to_le_bytes());
+        sis_metadata[26..33].copy_from_slice(b"Sample\0");
+
+        let meta = 68usize;
+        sis_metadata[meta + 10..meta + 12].copy_from_slice(&(-6i16).to_le_bytes());
+        sis_metadata[meta + 12..meta + 20].copy_from_slice(&1.0f64.to_le_bytes());
+        sis_metadata[meta + 20..meta + 28].copy_from_slice(&1.0f64.to_le_bytes());
+        sis_metadata[meta + 36..meta + 44].copy_from_slice(&20.0f64.to_le_bytes());
+        sis_metadata[meta + 44..meta + 46].copy_from_slice(&5i16.to_le_bytes());
+        let channel_bytes = channel_name.as_bytes();
+        let channel_start = meta + 46;
+        sis_metadata[channel_start..channel_start + channel_bytes.len()]
+            .copy_from_slice(channel_bytes);
+
+        let ifd_entry_count = 12u32;
+        let ifd_start = 8u32;
+        let payload_start = ifd_start + 2 + ifd_entry_count * 12 + 4;
+        let software_start = payload_start;
+        let sis_metadata_start = software_start + software.len() as u32;
+        let pixel_start = sis_metadata_start + sis_metadata.len() as u32;
+
+        let entries = [
+            tiff_entry(256, 4, 1, 1),
+            tiff_entry(257, 4, 1, 1),
+            tiff_entry(258, 3, 1, 8),
+            tiff_entry(259, 3, 1, 1),
+            tiff_entry(262, 3, 1, 1),
+            tiff_entry(273, 4, 1, pixel_start),
+            tiff_entry(277, 3, 1, 1),
+            tiff_entry(278, 4, 1, 1),
+            tiff_entry(279, 4, 1, 1),
+            tiff_entry(284, 3, 1, 1),
+            tiff_entry(SIS_TAG, 4, 1, sis_metadata_start),
+            tiff_entry(
+                crate::tiff::ifd::tag::SOFTWARE,
+                2,
+                software.len() as u32,
+                software_start,
+            ),
+        ];
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"II");
+        bytes.extend_from_slice(&42u16.to_le_bytes());
+        bytes.extend_from_slice(&ifd_start.to_le_bytes());
+        bytes.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        for entry in entries {
+            bytes.extend_from_slice(&entry);
+        }
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&software);
+        bytes.extend_from_slice(&sis_metadata);
+        bytes.push(9);
+
+        std::fs::write(path, bytes).unwrap();
+    }
+
     fn write_minimal_tiff_with_nikon_private_xml(
         path: &Path,
         primary_xml: Option<&str>,
@@ -9941,19 +10017,40 @@ mod nikon_elements_tiff_tests {
     }
 
     #[test]
-    fn java_tiff_wrapper_suffixes_accept_tif_and_tiff() {
-        assert!(NikonElementsTiffReader::new().is_this_type_by_name(Path::new("sample.tif")));
-        assert!(NikonElementsTiffReader::new().is_this_type_by_name(Path::new("sample.tiff")));
+    fn java_tiff_wrapper_suffix_sufficiency_matches() {
+        assert!(!NikonElementsTiffReader::new().is_this_type_by_name(Path::new("sample.tif")));
+        assert!(!NikonElementsTiffReader::new().is_this_type_by_name(Path::new("sample.tiff")));
         assert!(!FeiTiffReader::new().is_this_type_by_name(Path::new("sample.tif")));
         assert!(!FeiTiffReader::new().is_this_type_by_name(Path::new("sample.tiff")));
-        assert!(SisReader::new().is_this_type_by_name(Path::new("sample.tif")));
-        assert!(SisReader::new().is_this_type_by_name(Path::new("sample.tiff")));
-        assert!(ImprovisionTiffReader::new().is_this_type_by_name(Path::new("sample.tif")));
-        assert!(ImprovisionTiffReader::new().is_this_type_by_name(Path::new("sample.tiff")));
+        assert!(!SisReader::new().is_this_type_by_name(Path::new("sample.tif")));
+        assert!(!SisReader::new().is_this_type_by_name(Path::new("sample.tiff")));
+        assert!(!ImprovisionTiffReader::new().is_this_type_by_name(Path::new("sample.tif")));
+        assert!(!ImprovisionTiffReader::new().is_this_type_by_name(Path::new("sample.tiff")));
         assert!(ZeissApotomeTiffReader::new().is_this_type_by_name(Path::new("sample.tif")));
         assert!(ZeissApotomeTiffReader::new().is_this_type_by_name(Path::new("sample.tiff")));
         assert!(FluoviewReader::new().is_this_type_by_name(Path::new("sample.tif")));
         assert!(FluoviewReader::new().is_this_type_by_name(Path::new("sample.tiff")));
+    }
+
+    #[test]
+    fn nikon_elements_detection_requires_java_private_xml_tag() {
+        let tagged = temp_path("nikon-elements-tagged");
+        write_minimal_tiff_with_nikon_private_xml(
+            &tagged,
+            Some("<variant>Ti2</variant>"),
+            None,
+            "",
+        );
+        let tagged_bytes = std::fs::read(&tagged).unwrap();
+        assert!(NikonElementsTiffReader::new().is_this_type_by_bytes(&tagged_bytes));
+
+        let plain = temp_path("nikon-elements-plain");
+        write_minimal_tiff_with_description(&plain, "plain TIFF");
+        let plain_bytes = std::fs::read(&plain).unwrap();
+        assert!(!NikonElementsTiffReader::new().is_this_type_by_bytes(&plain_bytes));
+
+        let _ = std::fs::remove_file(tagged);
+        let _ = std::fs::remove_file(plain);
     }
 
     #[test]
@@ -9990,6 +10087,44 @@ mod nikon_elements_tiff_tests {
     }
 
     #[test]
+    fn sis_binary_metadata_preserves_java_empty_channel_for_overlong_name() {
+        let path = temp_path("sis_overlong_channel");
+        let long_channel = "A".repeat(129);
+        write_minimal_sis_tiff_with_binary_metadata(&path, &long_channel);
+
+        let mut reader = SisReader::new();
+        reader.set_id(&path).unwrap();
+
+        assert!(matches!(
+            reader.metadata().series_metadata.get("Channel name"),
+            Some(MetadataValue::String(value)) if value.is_empty()
+        ));
+        let ome = reader.ome_metadata().unwrap();
+        assert_eq!(ome.images[0].channels[0].name.as_deref(), Some(""));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sis_ome_enrichment_preserves_delegated_tiff_channel_scaffold() {
+        let path = temp_path("sis_ome_channels");
+        write_minimal_sis_tiff_with_binary_metadata(&path, "DAPI");
+
+        let mut reader = SisReader::new();
+        reader.set_id(&path).unwrap();
+        reader.inner.series_list_mut()[0].metadata.size_c = 3;
+        reader.inner.series_list_mut()[0].metadata.is_rgb = false;
+
+        let ome = reader.ome_metadata().unwrap();
+        assert_eq!(ome.images[0].channels.len(), 3);
+        assert_eq!(ome.images[0].channels[0].name.as_deref(), Some("DAPI"));
+        assert_eq!(ome.images[0].channels[1].name, None);
+        assert_eq!(ome.images[0].channels[2].name, None);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn fei_helios_private_tag_projects_java_metadata() {
         let path = temp_path("fei_helios_metadata");
         write_minimal_tiff_with_ascii_tags(
@@ -10016,9 +10151,13 @@ mod nikon_elements_tiff_tests {
         ));
 
         let ome = reader.ome_metadata().unwrap();
-        assert_eq!(ome.images[0].physical_size_x, Some(0.000001));
-        assert_eq!(ome.images[0].physical_size_y, Some(0.000002));
+        assert_eq!(ome.images[0].physical_size_x, Some(1.0));
+        assert_eq!(ome.images[0].physical_size_y, Some(2.0));
         assert_eq!(ome.images[0].time_increment, Some(0.25));
+        assert_eq!(
+            ome.images[0].acquisition_date.as_deref(),
+            Some("2020-01-02T15:04:05")
+        );
         assert_eq!(ome.images[0].planes[0].position_x, Some(1.5));
         assert_eq!(ome.images[0].planes[0].position_y, Some(2.5));
         assert_eq!(ome.images[0].planes[0].position_z, Some(3.5));
@@ -10027,6 +10166,44 @@ mod nikon_elements_tiff_tests {
             Some("Helios G4")
         );
         assert_eq!(ome.experimenters[0].last_name.as_deref(), Some("Operator"));
+    }
+
+    #[test]
+    fn fei_sfeg_ini_projects_java_physical_size_without_objective() {
+        let path = temp_path("fei_sfeg_metadata");
+        write_minimal_tiff_with_ascii_tags(
+            &path,
+            &[(
+                FEI_SFEG_TAG,
+                "[DatabarData]\nImageName=SEM image\nszUserText=notes\n\
+                 [Vector]\nMagnification=1000\n\
+                 [Vector.Sysscan]\nPositionX=4.5\nPositionY=5.5\n\
+                 [Vector.Video.Detectors]\nNrDetectorsConnected=1\nDetector_0_Name=ETD\n",
+            )],
+        );
+
+        let mut reader = FeiTiffReader::new();
+        reader.set_id(&path).unwrap();
+
+        let ome = reader.ome_metadata().unwrap();
+        assert_eq!(ome.images[0].name.as_deref(), Some("SEM image"));
+        assert_eq!(ome.images[0].description.as_deref(), Some("notes"));
+        assert_eq!(
+            ome.images[0].physical_size_x,
+            Some(1000.0 * FEI_MAG_MULTIPLIER)
+        );
+        assert_eq!(
+            ome.images[0].physical_size_y,
+            Some(1000.0 * FEI_MAG_MULTIPLIER)
+        );
+        assert_eq!(ome.images[0].planes[0].position_x, Some(4.5));
+        assert_eq!(ome.images[0].planes[0].position_y, Some(5.5));
+        assert_eq!(
+            ome.instruments[0].detectors[0].model.as_deref(),
+            Some("ETD")
+        );
+        assert!(ome.instruments[0].objectives.is_empty());
+        assert!(ome.images[0].objective_ref.is_none());
     }
 
     #[test]
@@ -11961,6 +12138,15 @@ mod improvision_tests {
         entry
     }
 
+    fn bigtiff_entry(tag: u16, typ: u16, count: u64, value: u64) -> [u8; 20] {
+        let mut entry = [0u8; 20];
+        entry[0..2].copy_from_slice(&tag.to_le_bytes());
+        entry[2..4].copy_from_slice(&typ.to_le_bytes());
+        entry[4..12].copy_from_slice(&count.to_le_bytes());
+        entry[12..20].copy_from_slice(&value.to_le_bytes());
+        entry
+    }
+
     // Comments shaped like Improvision/Volocity per-plane ImageDescription,
     // covering the keys Java's ImprovisionTiffReader parses into data fields.
     fn sample_comments() -> Vec<String> {
@@ -12078,6 +12264,39 @@ mod improvision_tests {
         plain[marker..marker + "Improvision".len()].copy_from_slice(b"plain-text!");
         assert!(!ImprovisionTiffReader::new().is_this_type_by_bytes(&plain));
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn byte_detection_uses_tiff_parser_for_bigtiff_comments() {
+        let mut desc = b"Improvision\nTotalChannels=1".to_vec();
+        desc.push(0);
+
+        let ifd_start = 16u64;
+        let desc_start = ifd_start + 8 + 20 + 8;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"II");
+        bytes.extend_from_slice(&43u16.to_le_bytes());
+        bytes.extend_from_slice(&8u16.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&ifd_start.to_le_bytes());
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        bytes.extend_from_slice(&bigtiff_entry(
+            crate::tiff::ifd::tag::IMAGE_DESCRIPTION,
+            2,
+            desc.len() as u64,
+            desc_start,
+        ));
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&desc);
+
+        assert!(ImprovisionTiffReader::new().is_this_type_by_bytes(&bytes));
+
+        let marker = bytes
+            .windows("Improvision".len())
+            .position(|window| window == b"Improvision")
+            .unwrap();
+        bytes[marker..marker + "Improvision".len()].copy_from_slice(b"plain-text!");
+        assert!(!ImprovisionTiffReader::new().is_this_type_by_bytes(&bytes));
     }
 
     fn write_one_pixel_improvision_tiff(path: &std::path::Path, desc: &str, pixel: u8) {
@@ -12486,6 +12705,11 @@ mod nikon_tiff_tests {
         "sensor\ts_params\tLambdaEm\t520\n",
     );
 
+    const EZC1_MINIMAL_DESCRIPTION: &str = concat!(
+        "document\tlabel\tx\ty\tz\n",
+        "document\tscale\t1.0\t1.0\t1.0\n",
+    );
+
     #[test]
     fn nikon_tiff_detects_ezc1_software_tag() {
         let path = temp_path("detect");
@@ -12494,6 +12718,8 @@ mod nikon_tiff_tests {
         // Whole-file header so the out-of-line SOFTWARE value is reachable.
         let header = std::fs::read(&path).unwrap();
         let reader = NikonTiffReader::new();
+        assert!(!reader.is_this_type_by_name(Path::new("sample.tif")));
+        assert!(!reader.is_this_type_by_name(Path::new("sample.tiff")));
         assert!(reader.is_this_type_by_bytes(&header));
 
         // A non-EZ-C1 SOFTWARE tag must be rejected.
@@ -12564,6 +12790,39 @@ mod nikon_tiff_tests {
 
         std::fs::remove_file(&path).ok();
     }
+
+    #[test]
+    fn nikon_tiff_reopen_resets_java_metadata_accumulators() {
+        let path1 = temp_path("metadata_first");
+        let path2 = temp_path("metadata_second");
+        write_minimal_tiff_with_software_and_description(&path1, "EZ-C1 3.90", EZC1_DESCRIPTION);
+        write_minimal_tiff_with_software_and_description(
+            &path2,
+            "EZ-C1 3.90",
+            EZC1_MINIMAL_DESCRIPTION,
+        );
+
+        let mut reader = NikonTiffReader::new();
+        reader.set_id(&path1).unwrap();
+        assert!(!reader.ome_metadata().unwrap().instruments[0]
+            .light_sources
+            .is_empty());
+
+        reader.set_id(&path2).unwrap();
+        let ome = reader.ome_metadata().unwrap();
+        let image = &ome.images[0];
+        let instrument = &ome.instruments[0];
+        assert_eq!(image.physical_size_x, Some(1.0));
+        assert_eq!(image.physical_size_y, Some(1.0));
+        assert_eq!(image.physical_size_z, Some(1.0));
+        assert!(instrument.light_sources.is_empty());
+        assert!(instrument.detectors.is_empty());
+        assert!(instrument.filters.is_empty());
+        assert!(instrument.dichroics.is_empty());
+
+        std::fs::remove_file(&path1).ok();
+        std::fs::remove_file(&path2).ok();
+    }
 }
 
 #[cfg(test)]
@@ -12633,6 +12892,71 @@ mod metamorph_tiff_tests {
         std::fs::write(path, bytes).unwrap();
     }
 
+    fn write_minimal_multi_ifd_tiff_with_descriptions(path: &Path, descriptions: &[&str]) {
+        let entry_count = 11u32;
+        let ifd_size = 2 + entry_count * 12 + 4;
+        let ifd_start = 8u32;
+
+        let mut descs: Vec<Vec<u8>> = descriptions
+            .iter()
+            .map(|description| {
+                let mut desc = description.as_bytes().to_vec();
+                desc.push(0);
+                desc
+            })
+            .collect();
+
+        let ifd_offsets: Vec<u32> = (0..descs.len())
+            .map(|i| ifd_start + i as u32 * ifd_size)
+            .collect();
+        let mut next_data_offset = ifd_start + descs.len() as u32 * ifd_size;
+        let mut desc_offsets = Vec::with_capacity(descs.len());
+        for desc in &descs {
+            desc_offsets.push(next_data_offset);
+            next_data_offset += desc.len() as u32;
+        }
+        let pixel_offsets: Vec<u32> = (0..descs.len())
+            .map(|i| next_data_offset + i as u32)
+            .collect();
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"II");
+        bytes.extend_from_slice(&42u16.to_le_bytes());
+        bytes.extend_from_slice(&ifd_start.to_le_bytes());
+
+        for i in 0..descs.len() {
+            let entries = [
+                tiff_entry(256, 4, 1, 1),                                   // ImageWidth
+                tiff_entry(257, 4, 1, 1),                                   // ImageLength
+                tiff_entry(258, 3, 1, 8),                                   // BitsPerSample
+                tiff_entry(259, 3, 1, 1),                                   // Compression
+                tiff_entry(262, 3, 1, 1),                                   // Photometric
+                tiff_entry(270, 2, descs[i].len() as u32, desc_offsets[i]), // ImageDescription
+                tiff_entry(273, 4, 1, pixel_offsets[i]),                    // StripOffsets
+                tiff_entry(277, 3, 1, 1),                                   // SamplesPerPixel
+                tiff_entry(278, 4, 1, 1),                                   // RowsPerStrip
+                tiff_entry(279, 4, 1, 1),                                   // StripByteCounts
+                tiff_entry(284, 3, 1, 1),                                   // PlanarConfiguration
+            ];
+
+            bytes.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+            for entry in entries {
+                bytes.extend_from_slice(&entry);
+            }
+            let next_ifd = ifd_offsets.get(i + 1).copied().unwrap_or(0);
+            bytes.extend_from_slice(&next_ifd.to_le_bytes());
+        }
+
+        for desc in descs.drain(..) {
+            bytes.extend_from_slice(&desc);
+        }
+        for i in 0..descriptions.len() {
+            bytes.push(i as u8);
+        }
+
+        std::fs::write(path, bytes).unwrap();
+    }
+
     /// A small Metamorph `<MetaData>` comment exercising the `<prop>` /
     /// `<custom-prop>` id/value parsing path (`MetamorphHandler.startElement`).
     const METADATA_COMMENT: &str = concat!(
@@ -12648,6 +12972,21 @@ mod metamorph_tiff_tests {
         "<custom-prop id=\"Exposure\" type=\"string\" value=\"50 ms\"/>",
         "<custom-prop id=\"wavelength\" type=\"int\" value=\"525\"/>",
         "<custom-prop id=\"_IllumSetting_\" type=\"string\" value=\"GFP\"/>",
+        "</MetaData>",
+    );
+
+    const METADATA_COMMENT_PLANE_2: &str = concat!(
+        "<MetaData>",
+        "<prop id=\"image-name\" type=\"string\" value=\"MyImage\"/>",
+        "<prop id=\"acquisition-time-local\" type=\"time\" value=\"20100101 12:30:46\"/>",
+        "<prop id=\"spatial-calibration-x\" type=\"float\" value=\"0.32\"/>",
+        "<prop id=\"spatial-calibration-y\" type=\"float\" value=\"0.32\"/>",
+        "<prop id=\"stage-position-x\" type=\"float\" value=\"100.5\"/>",
+        "<prop id=\"stage-position-y\" type=\"float\" value=\"200.25\"/>",
+        "<prop id=\"z-position\" type=\"float\" value=\"1.0\"/>",
+        "<custom-prop id=\"Exposure\" type=\"string\" value=\"100 ms\"/>",
+        "<custom-prop id=\"wavelength\" type=\"int\" value=\"610\"/>",
+        "<custom-prop id=\"_IllumSetting_\" type=\"string\" value=\"RFP\"/>",
         "</MetaData>",
     );
 
@@ -12707,6 +13046,40 @@ mod metamorph_tiff_tests {
         assert!(!image.channels.is_empty());
         assert_eq!(image.channels[0].name.as_deref(), Some("GFP"));
         assert_eq!(image.channels[0].emission_wavelength, Some(525.0));
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn metamorph_tiff_accumulates_metadata_from_each_ifd_comment() {
+        let path = temp_path("multi_ifd_metadata");
+        let first = METADATA_COMMENT.replace(
+            "<custom-prop id=\"wavelength\" type=\"int\" value=\"525\"/>",
+            "<prop id=\"z-position\" type=\"float\" value=\"0.0\"/><custom-prop id=\"wavelength\" type=\"int\" value=\"525\"/>",
+        );
+        write_minimal_multi_ifd_tiff_with_descriptions(
+            &path,
+            &[first.as_str(), METADATA_COMMENT_PLANE_2],
+        );
+
+        let mut reader = MetamorphTiffReader::new();
+        reader.set_id(&path).unwrap();
+
+        let metadata = reader.metadata();
+        assert_eq!(metadata.size_c, 2);
+        assert_eq!(metadata.image_count, 2);
+
+        let ome = reader.ome_metadata().expect("ome metadata");
+        let image = &ome.images[0];
+        assert_eq!(image.physical_size_z, Some(1.0));
+        assert_eq!(image.channels.len(), 2);
+        assert_eq!(image.channels[0].name.as_deref(), Some("GFP"));
+        assert_eq!(image.channels[0].emission_wavelength, Some(525.0));
+        assert_eq!(image.channels[1].name.as_deref(), Some("RFP"));
+        assert_eq!(image.channels[1].emission_wavelength, Some(610.0));
+        assert_eq!(image.planes.len(), 2);
+        assert_eq!(image.planes[0].exposure_time, Some(0.05));
+        assert_eq!(image.planes[1].exposure_time, Some(0.1));
 
         std::fs::remove_file(&path).ok();
     }

@@ -35,10 +35,12 @@ pub mod memoizer;
 pub mod metadata;
 pub mod pixel;
 pub mod reader;
+mod reader_order;
 pub mod registry;
 pub mod stitcher;
 pub mod tiff;
 pub mod wrappers;
+mod writer_order;
 pub mod writer_registry;
 
 pub use crate::cache::{CacheStrategy, CachedReader};

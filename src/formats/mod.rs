@@ -25,6 +25,7 @@ pub mod ics;
 pub mod imagic;
 pub mod imaris_hdf;
 pub mod incell;
+pub mod java_writer;
 pub mod jpeg;
 pub mod khoros;
 pub mod legacy;

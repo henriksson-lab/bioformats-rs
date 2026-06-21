@@ -1546,14 +1546,8 @@ impl Default for CanonRawReader {
 
 impl FormatReader for CanonRawReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_ascii_lowercase());
-        matches!(
-            ext.as_deref(),
-            Some("cr2") | Some("crw") | Some("jpg") | Some("thm") | Some("wav") | Some("cr3")
-        )
+        let _ = path;
+        false
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
@@ -1757,6 +1751,47 @@ fn imacon_add_xml_metadata(xml_text: &str, series_metadata: &mut HashMap<String,
     }
 }
 
+/// Port of Java `DateTools.formatDate(value, "yyyyMMdd HHmmSSZ")` as used by
+/// `ImaconReader`. The original pattern uses uppercase `S`, so the final two
+/// digits are milliseconds rather than seconds; Bio-Formats' default ISO output
+/// does not retain milliseconds.
+fn imacon_format_creation_date(value: &str) -> Option<String> {
+    let mut parts = value.split_whitespace();
+    let date = parts.next()?;
+    let time_zone = parts.next()?;
+    if parts.next().is_some() || date.len() != 8 || time_zone.len() < 6 {
+        return None;
+    }
+
+    let year: u32 = date[0..4].parse().ok()?;
+    let month: u32 = date[4..6].parse().ok()?;
+    let day: u32 = date[6..8].parse().ok()?;
+    let time = &time_zone[..6];
+    let zone = &time_zone[6..];
+    if time.len() != 6 || zone.len() != 5 {
+        return None;
+    }
+    let hour: u32 = time[0..2].parse().ok()?;
+    let minute: u32 = time[2..4].parse().ok()?;
+    let _millisecond: u32 = time[4..6].parse().ok()?;
+    let zone_sign = &zone[0..1];
+    let zone_hour: u32 = zone[1..3].parse().ok()?;
+    let zone_minute: u32 = zone[3..5].parse().ok()?;
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || (zone_sign != "+" && zone_sign != "-")
+        || zone_hour > 23
+        || zone_minute > 59
+    {
+        return None;
+    }
+    Some(format!(
+        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:00"
+    ))
+}
+
 impl Default for ImaconReader {
     fn default() -> Self {
         Self::new()
@@ -1868,10 +1903,10 @@ impl FormatReader for ImaconReader {
                         .insert("ImageName".into(), MetadataValue::String(name));
                 }
                 if let Some(date) = creation_date.as_deref() {
-                    meta.series_metadata.insert(
-                        "CreationDate".into(),
-                        MetadataValue::String(date.to_string()),
-                    );
+                    if let Some(formatted) = imacon_format_creation_date(date) {
+                        meta.series_metadata
+                            .insert("CreationDate".into(), MetadataValue::String(formatted));
+                    }
                 }
                 meta
             })
@@ -3588,6 +3623,16 @@ mod tests {
         l2d
     }
 
+    fn write_b16(path: &Path, width: u16, height: u16, pixels: &[u16]) {
+        let mut bytes = vec![0u8; 216];
+        bytes[4..6].copy_from_slice(&width.to_le_bytes());
+        bytes[6..8].copy_from_slice(&height.to_le_bytes());
+        for pixel in pixels {
+            bytes.extend_from_slice(&pixel.to_le_bytes());
+        }
+        fs::write(path, bytes).unwrap();
+    }
+
     #[test]
     fn l2d_delegates_planes_to_companion_tiffs() {
         let root = temp_dir("l2d_planes");
@@ -3701,11 +3746,71 @@ mod tests {
     }
 
     #[test]
+    fn pco_b16_reads_declared_dimensions_and_pixels() {
+        let root = temp_dir("pco_b16");
+        let path = root.join("frame.b16");
+        write_b16(
+            &path,
+            3,
+            2,
+            &[0x0102, 0x0304, 0x0506, 0x0708, 0x090a, 0x0b0c],
+        );
+
+        let mut reader = PcoB16Reader::new();
+        assert!(reader.is_this_type_by_name(&path));
+        reader.set_id(&path).unwrap();
+
+        let meta = reader.metadata();
+        assert_eq!((meta.size_x, meta.size_y, meta.image_count), (3, 2, 1));
+        assert_eq!(meta.pixel_type, PixelType::Uint16);
+        assert!(meta.is_little_endian);
+        assert_eq!(
+            reader.open_bytes(0).unwrap(),
+            vec![2, 1, 4, 3, 6, 5, 8, 7, 10, 9, 12, 11]
+        );
+        assert_eq!(
+            reader.open_bytes_region(0, 1, 0, 2, 2).unwrap(),
+            vec![4, 3, 6, 5, 10, 9, 12, 11]
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pco_b16_rejects_short_declared_payload() {
+        let root = temp_dir("pco_b16_short");
+        let path = root.join("short.b16");
+        write_b16(&path, 2, 2, &[1, 2, 3]);
+
+        let err = PcoB16Reader::new().set_id(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("too short"),
+            "unexpected error: {err}"
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn canon_byte_detection_matches_java_fixed_length_probe() {
         let reader = CanonRawReader::new();
         assert!(!reader.is_this_type_by_bytes(&vec![0; 1024]));
         let legacy = vec![0u8; CanonRawReader::FILE_LENGTH as usize];
         assert!(reader.is_this_type_by_bytes(&legacy));
+    }
+
+    #[test]
+    fn canon_suffixes_are_not_sufficient_like_java() {
+        let reader = CanonRawReader::new();
+        for name in [
+            "image.cr2",
+            "image.crw",
+            "image.jpg",
+            "image.thm",
+            "image.wav",
+        ] {
+            assert!(!reader.is_this_type_by_name(Path::new(name)));
+        }
     }
 
     fn push_tiff_entry(data: &mut Vec<u8>, tag: u16, typ: u16, count: u32, value: u32) {
@@ -3816,7 +3921,7 @@ mod tests {
             matches!(md0.get("ExperimenterLastName"), Some(MetadataValue::String(v)) if v == "Lovelace")
         );
         assert!(
-            matches!(md0.get("CreationDate"), Some(MetadataValue::String(v)) if v == "20240102 030405+0000")
+            matches!(md0.get("CreationDate"), Some(MetadataValue::String(v)) if v == "2024-01-02T03:04:00")
         );
         assert!(matches!(md0.get("Camera"), Some(MetadataValue::String(v)) if v == "Imacon 949"));
 

@@ -504,6 +504,38 @@ fn image_writer_ome_tiff_dispatch_matches_java_pyramid_first_order() {
 }
 
 #[test]
+fn image_writer_plain_ome_tiff_uses_ometiff_not_pyramid_writer_like_java() {
+    let mut meta = ImageMetadata::default();
+    meta.size_x = 2;
+    meta.size_y = 2;
+    meta.pixel_type = PixelType::Uint8;
+    meta.size_c = 1;
+    meta.image_count = 1;
+
+    for suffix in ["ome.tif", "ome.tiff", "ome.tf2", "ome.tf8", "ome.btf"] {
+        let path = temp_path(&format!("generic_dispatch.{suffix}"));
+        ImageWriter::save(&path, &meta, &[vec![1, 2, 3, 4]]).unwrap();
+
+        let file = std::fs::File::open(&path).unwrap();
+        let mut parser = bioformats::tiff::parser::TiffParser::new(file).unwrap();
+        let (ifd, _) = parser.read_ifd(parser.first_ifd_offset).unwrap();
+        assert!(
+            ifd.get(bioformats::tiff::ifd::tag::SUB_IFD).is_none(),
+            "{suffix} should use Java's ordinary OMETiffWriter path unless pyramid metadata is present"
+        );
+
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(
+            bytes.windows(b"<OME".len()).any(|window| window == b"<OME"),
+            "OME-XML missing from {suffix}"
+        );
+        let mut reader = ImageReader::open(&path).unwrap();
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 3, 4]);
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+#[test]
 fn tiff_writer_rejects_missing_planes_on_close() {
     use bioformats::TiffWriter;
 
@@ -769,6 +801,55 @@ fn generic_png_writer_uses_apng_stack_writer_like_java() {
     assert_eq!(reader.metadata().image_count, 2);
     assert_eq!(reader.open_bytes(0).unwrap(), vec![10, 20]);
     assert_eq!(reader.open_bytes(1).unwrap(), vec![30, 40]);
+}
+
+#[test]
+fn java_writer_dispatches_from_java_writers_txt() {
+    let path = temp_path("JavaWriterSmoke.java");
+    let meta = ImageMetadata {
+        size_x: 2,
+        size_y: 2,
+        pixel_type: PixelType::Uint8,
+        bits_per_pixel: 8,
+        image_count: 2,
+        size_z: 2,
+        size_c: 1,
+        size_t: 1,
+        ..Default::default()
+    };
+
+    ImageWriter::save(&path, &meta, &[vec![1, 2, 255, 128], vec![4, 5, 6, 7]])
+        .expect("JavaWriter save failed");
+
+    let text = std::fs::read_to_string(&path).expect("read JavaWriter output");
+    let class_name = path.file_stem().unwrap().to_string_lossy();
+    assert!(text.contains(&format!("public class {class_name} {{")));
+    assert!(text.contains("public byte[][] series0Plane0 = {"));
+    assert!(text.contains("    {1, 2},"));
+    assert!(text.contains("    {-1, -128}"));
+    assert!(text.contains("public byte[][] series0Plane1 = {"));
+    assert!(text.trim_end().ends_with('}'));
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn java_writer_rejects_int16_like_java_pixel_type_list() {
+    let path = temp_path("UnsupportedJavaWriter.java");
+    let meta = ImageMetadata {
+        size_x: 1,
+        size_y: 1,
+        pixel_type: PixelType::Int16,
+        bits_per_pixel: 16,
+        image_count: 1,
+        ..Default::default()
+    };
+
+    let err = ImageWriter::save(&path, &meta, &[vec![0, 0]]).unwrap_err();
+    assert!(
+        matches!(err, bioformats::BioFormatsError::UnsupportedFormat(_)),
+        "unexpected JavaWriter error: {err:?}"
+    );
+    let _ = std::fs::remove_file(path);
 }
 
 #[test]
@@ -1104,6 +1185,251 @@ fn ics_writer_rgb_header_matches_java_axis_layout() {
     assert!(header.contains("layout\tparameters\t6"));
     assert!(header.contains("layout\torder\tbits ch x y z t"));
     assert!(header.contains("layout\tsizes\t8 3 1 1 1 1"));
+}
+
+#[test]
+fn ics_writer_emits_java_parameter_scales_for_physical_sizes() {
+    let mut meta = ImageMetadata::default();
+    meta.size_x = 2;
+    meta.size_y = 1;
+    meta.size_z = 2;
+    meta.size_c = 1;
+    meta.pixel_type = PixelType::Uint8;
+    meta.bits_per_pixel = 8;
+    meta.image_count = 2;
+    meta.is_rgb = false;
+    meta.is_interleaved = false;
+    meta.series_metadata
+        .insert("PhysicalSizeX".into(), MetadataValue::Float(0.5));
+    meta.series_metadata
+        .insert("PhysicalSizeY".into(), MetadataValue::Float(0.25));
+    meta.series_metadata
+        .insert("PhysicalSizeZ".into(), MetadataValue::Float(2.0));
+    meta.series_metadata
+        .insert("TimeIncrement".into(), MetadataValue::Float(1.5));
+
+    let path = temp_path("ics_physical_scale.ics");
+    ImageWriter::save(&path, &meta, &[vec![1, 2], vec![3, 4]]).unwrap();
+
+    let header = std::fs::read_to_string(&path).unwrap();
+    assert!(header.contains("parameter\tscale\t1 0.5 0.25 2 1.5 1"));
+    assert!(header.contains("parameter\tunits\tbits micrometers micrometers micrometers seconds"));
+
+    let mut reader = bioformats::formats::ics::IcsReader::new();
+    reader.set_id(&path).unwrap();
+    let ome = reader.ome_metadata().unwrap();
+    let image = &ome.images[0];
+    assert_eq!(image.physical_size_x, Some(0.5));
+    assert_eq!(image.physical_size_y, Some(0.25));
+    assert_eq!(image.physical_size_z, Some(2.0));
+    assert_eq!(image.time_increment, Some(1.5));
+}
+
+#[test]
+fn ics_reader_maps_millisecond_time_scale_to_seconds() {
+    let path = temp_path("ics_ms_time_scale.ics");
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"ics_version\t2.0\r\n");
+    bytes.extend_from_slice(b"filename\tics_ms_time_scale.ics\r\n");
+    bytes.extend_from_slice(b"layout\tparameters\t6\r\n");
+    bytes.extend_from_slice(b"layout\torder\tbits x y z t ch\r\n");
+    bytes.extend_from_slice(b"layout\tsizes\t8 1 1 1 2 1\r\n");
+    bytes.extend_from_slice(b"representation\tformat\tinteger\r\n");
+    bytes.extend_from_slice(b"representation\tsign\tunsigned\r\n");
+    bytes.extend_from_slice(b"representation\tbyte_order\t1\r\n");
+    bytes.extend_from_slice(b"representation\tcompression\tuncompressed\r\n");
+    bytes.extend_from_slice(b"parameter\tscale\t1 1 1 1 250 1\r\n");
+    bytes.extend_from_slice(b"parameter\tunits\tbits micrometers micrometers micrometers ms\r\n");
+    bytes.extend_from_slice(b"end\n");
+    bytes.extend_from_slice(&[3, 4]);
+    std::fs::write(&path, bytes).unwrap();
+
+    let mut reader = bioformats::formats::ics::IcsReader::new();
+    reader.set_id(&path).unwrap();
+    let ome = reader.ome_metadata().unwrap();
+
+    assert_eq!(ome.images[0].time_increment, Some(0.25));
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![3]);
+    assert_eq!(reader.open_bytes(1).unwrap(), vec![4]);
+}
+
+#[test]
+fn ics_reader_accepts_missing_scale_units_like_java() {
+    let path = temp_path("ics_missing_scale_units.ics");
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"ics_version\t2.0\r\n");
+    bytes.extend_from_slice(b"filename\tics_missing_scale_units.ics\r\n");
+    bytes.extend_from_slice(b"layout\tparameters\t6\r\n");
+    bytes.extend_from_slice(b"layout\torder\tbits x y z t ch\r\n");
+    bytes.extend_from_slice(b"layout\tsizes\t8 1 1 1 2 1\r\n");
+    bytes.extend_from_slice(b"representation\tformat\tinteger\r\n");
+    bytes.extend_from_slice(b"representation\tsign\tunsigned\r\n");
+    bytes.extend_from_slice(b"representation\tbyte_order\t1\r\n");
+    bytes.extend_from_slice(b"representation\tcompression\tuncompressed\r\n");
+    bytes.extend_from_slice(b"parameter\tscale\t1 0.5 0.25 2 250 1\r\n");
+    bytes.extend_from_slice(b"end\n");
+    bytes.extend_from_slice(&[3, 4]);
+    std::fs::write(&path, bytes).unwrap();
+
+    let mut reader = bioformats::formats::ics::IcsReader::new();
+    reader.set_id(&path).unwrap();
+    let ome = reader.ome_metadata().unwrap();
+    let image = &ome.images[0];
+
+    assert_eq!(image.physical_size_x, Some(0.5));
+    assert_eq!(image.physical_size_y, Some(0.25));
+    assert_eq!(image.physical_size_z, Some(2.0));
+    assert_eq!(image.time_increment, Some(0.25));
+}
+
+#[test]
+fn ics_reader_falls_back_to_raw_when_gzip_flag_is_wrong_like_java() {
+    let path = temp_path("ics_wrong_gzip_flag.ics");
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"ics_version\t2.0\r\n");
+    bytes.extend_from_slice(b"filename\tics_wrong_gzip_flag.ics\r\n");
+    bytes.extend_from_slice(b"layout\tparameters\t3\r\n");
+    bytes.extend_from_slice(b"layout\torder\tbits x y\r\n");
+    bytes.extend_from_slice(b"layout\tsizes\t8 3 1\r\n");
+    bytes.extend_from_slice(b"representation\tformat\tinteger\r\n");
+    bytes.extend_from_slice(b"representation\tsign\tunsigned\r\n");
+    bytes.extend_from_slice(b"representation\tbyte_order\t1\r\n");
+    bytes.extend_from_slice(b"representation\tcompression\tgzip\r\n");
+    bytes.extend_from_slice(b"end\n");
+    bytes.extend_from_slice(&[9, 8, 7]);
+    std::fs::write(&path, bytes).unwrap();
+
+    let mut reader = bioformats::formats::ics::IcsReader::new();
+    reader.set_id(&path).unwrap();
+
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![9, 8, 7]);
+}
+
+#[test]
+fn ics_reader_tokenizes_ctrl_d_separator_like_java() {
+    let path = temp_path("ics_ctrl_d_separator.ics");
+    let sep = b'\x04';
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"ics_version\t2.0\r\n");
+    bytes.extend_from_slice(b"filename\tics_ctrl_d_separator.ics\r\n");
+    bytes.extend_from_slice(b"layout");
+    bytes.push(sep);
+    bytes.extend_from_slice(b"parameters");
+    bytes.push(sep);
+    bytes.extend_from_slice(b"6\r\n");
+    bytes.extend_from_slice(b"layout");
+    bytes.push(sep);
+    bytes.extend_from_slice(b"order");
+    bytes.push(sep);
+    bytes.extend_from_slice(b"bits");
+    bytes.push(sep);
+    bytes.extend_from_slice(b"x");
+    bytes.push(sep);
+    bytes.extend_from_slice(b"y");
+    bytes.push(sep);
+    bytes.extend_from_slice(b"z");
+    bytes.push(sep);
+    bytes.extend_from_slice(b"t");
+    bytes.push(sep);
+    bytes.extend_from_slice(b"ch\r\n");
+    bytes.extend_from_slice(b"layout");
+    bytes.push(sep);
+    bytes.extend_from_slice(b"sizes");
+    bytes.push(sep);
+    bytes.extend_from_slice(b"8");
+    bytes.push(sep);
+    bytes.extend_from_slice(b"2");
+    bytes.push(sep);
+    bytes.extend_from_slice(b"1");
+    bytes.push(sep);
+    bytes.extend_from_slice(b"1");
+    bytes.push(sep);
+    bytes.extend_from_slice(b"1");
+    bytes.push(sep);
+    bytes.extend_from_slice(b"1\r\n");
+    bytes.extend_from_slice(b"representation");
+    bytes.push(sep);
+    bytes.extend_from_slice(b"format");
+    bytes.push(sep);
+    bytes.extend_from_slice(b"integer\r\n");
+    bytes.extend_from_slice(b"representation");
+    bytes.push(sep);
+    bytes.extend_from_slice(b"sign");
+    bytes.push(sep);
+    bytes.extend_from_slice(b"unsigned\r\n");
+    bytes.extend_from_slice(b"representation");
+    bytes.push(sep);
+    bytes.extend_from_slice(b"byte_order");
+    bytes.push(sep);
+    bytes.extend_from_slice(b"1\r\n");
+    bytes.extend_from_slice(b"representation");
+    bytes.push(sep);
+    bytes.extend_from_slice(b"compression");
+    bytes.push(sep);
+    bytes.extend_from_slice(b"uncompressed\r\n");
+    bytes.extend_from_slice(b"parameter");
+    bytes.push(sep);
+    bytes.extend_from_slice(b"scale");
+    bytes.push(sep);
+    bytes.extend_from_slice(b"1");
+    bytes.push(sep);
+    bytes.extend_from_slice(b"0.5");
+    bytes.push(sep);
+    bytes.extend_from_slice(b"1");
+    bytes.push(sep);
+    bytes.extend_from_slice(b"1");
+    bytes.push(sep);
+    bytes.extend_from_slice(b"1");
+    bytes.push(sep);
+    bytes.extend_from_slice(b"1\r\n");
+    bytes.extend_from_slice(b"end\n");
+    bytes.extend_from_slice(&[11, 13]);
+    std::fs::write(&path, bytes).unwrap();
+
+    let mut reader = bioformats::formats::ics::IcsReader::new();
+    reader.set_id(&path).unwrap();
+
+    assert_eq!(reader.metadata().size_x, 2);
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![11, 13]);
+    assert_eq!(
+        reader.ome_metadata().unwrap().images[0].physical_size_x,
+        Some(0.5)
+    );
+}
+
+#[test]
+fn ics_reader_maps_parameter_t_to_plane_delta_t_like_java() {
+    let path = temp_path("ics_parameter_t_delta_t.ics");
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"ics_version\t2.0\r\n");
+    bytes.extend_from_slice(b"filename\tics_parameter_t_delta_t.ics\r\n");
+    bytes.extend_from_slice(b"layout\tparameters\t6\r\n");
+    bytes.extend_from_slice(b"layout\torder\tbits x y z t ch\r\n");
+    bytes.extend_from_slice(b"layout\tsizes\t8 1 1 2 2 2\r\n");
+    bytes.extend_from_slice(b"representation\tformat\tinteger\r\n");
+    bytes.extend_from_slice(b"representation\tsign\tunsigned\r\n");
+    bytes.extend_from_slice(b"representation\tbyte_order\t1\r\n");
+    bytes.extend_from_slice(b"representation\tcompression\tuncompressed\r\n");
+    bytes.extend_from_slice(b"parameter\tt\t0.25 bad 99\r\n");
+    bytes.extend_from_slice(b"end\n");
+    bytes.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+    std::fs::write(&path, bytes).unwrap();
+
+    let mut reader = bioformats::formats::ics::IcsReader::new();
+    reader.set_id(&path).unwrap();
+    let ome = reader.ome_metadata().unwrap();
+    let planes = &ome.images[0].planes;
+
+    assert_eq!(
+        planes
+            .iter()
+            .filter(|p| p.the_t == 0 && p.delta_t == Some(0.25))
+            .count(),
+        4
+    );
+    assert!(!planes.iter().any(|p| p.the_t == 1 && p.delta_t.is_some()));
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![1]);
+    assert_eq!(reader.open_bytes(7).unwrap(), vec![8]);
 }
 
 #[test]

@@ -15960,7 +15960,7 @@ fn spider_rejects_invalid_dimensions_short_payload_and_accepts_unknown_iform_lik
         &[0; 4],
     );
     let unknown_header = std::fs::read(&unknown_iform).unwrap();
-    assert!(reader.is_this_type_by_bytes(&unknown_header[..52]));
+    assert!(reader.is_this_type_by_bytes(&unknown_header));
     reader.set_id(&unknown_iform).unwrap();
     assert_eq!(reader.metadata().image_count, 1);
     assert_eq!(reader.open_bytes(0).unwrap(), vec![0; 4]);
@@ -15985,6 +15985,28 @@ fn spider_uses_labrec_header_size_like_java() {
     let mut reader = bioformats::formats::amira::SpiderReader::new();
     reader.set_id(&path).unwrap();
     assert_eq!(reader.open_bytes(0).unwrap(), 1.25f32.to_le_bytes());
+}
+
+#[test]
+fn spider_registry_uses_full_stream_detection_like_java() {
+    let path = tmp("spider_large_payload.fake");
+    let mut payload = vec![0u8; 768];
+    for i in 0..1024u32 {
+        payload.extend_from_slice(&(i as f32).to_le_bytes());
+    }
+    write_spider_header(
+        &path, 1.0, 1024.0, 1024.0, 1.0, 1.0, 256.0, 1024.0, 0.0, &payload,
+    );
+
+    let bytes = std::fs::read(&path).unwrap();
+    let probe = bioformats::formats::amira::SpiderReader::new();
+    assert!(!probe.is_this_type_by_bytes(&bytes[..2048]));
+    assert!(probe.is_this_type_by_bytes(&bytes));
+
+    let mut reader = ImageReader::open(&path).unwrap();
+    assert_eq!(reader.metadata().size_x, 1);
+    assert_eq!(reader.metadata().size_y, 1024);
+    assert_eq!(&reader.open_bytes(0).unwrap()[..4], &0.0f32.to_le_bytes());
 }
 
 #[test]

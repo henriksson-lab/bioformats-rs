@@ -28,35 +28,10 @@ fn writer_for(path: &Path) -> Option<Box<dyn FormatWriter>> {
             || n.ends_with(".ome.tf8")
             || n.ends_with(".ome.btf")
     ) {
-        return Some(Box::new(crate::tiff::PyramidOmeTiffWriter::new()));
+        return Some(Box::new(crate::tiff::TiffWriter::new().with_auto_ome_xml()));
     }
 
-    #[allow(unused_mut)]
-    let mut writers: Vec<Box<dyn FormatWriter>> = vec![
-        Box::new(crate::tiff::TiffWriter::new()),
-        // Java writers.txt registers APNGWriter for ".png"; it can write both
-        // single-frame PNG/APNG and multi-frame PNG stacks.
-        Box::new(crate::formats::extended::ApngWriter::new()),
-        Box::new(crate::formats::png::PngWriter::new()),
-        Box::new(crate::formats::jpeg::JpegWriter::new()),
-        Box::new(crate::formats::bmp::BmpWriter::new()),
-        Box::new(crate::formats::raster::TgaWriter::new()),
-        Box::new(crate::formats::raster::PnmWriter::new()),
-        Box::new(crate::formats::ics::IcsWriter::new()),
-        Box::new(crate::formats::mrc::MrcWriter::new()),
-        Box::new(crate::formats::fits::FitsWriter::new()),
-        Box::new(crate::formats::nrrd::NrrdWriter::new()),
-        Box::new(crate::formats::metaimage::MetaImageWriter::new()),
-        Box::new(crate::formats::ome_xml::OmeXmlWriter::new()),
-        Box::new(crate::formats::dicom::DicomWriter::new()),
-        Box::new(crate::formats::avi::AviWriter::new()),
-        Box::new(crate::formats::eps::EpsWriter::new()),
-        Box::new(crate::formats::v3draw::V3DrawWriter::new()),
-        Box::new(crate::formats::cellh5::CellH5Writer::new()),
-        Box::new(crate::formats::misc::QtWriter::new()),
-    ];
-    #[cfg(feature = "jpeg2000-write")]
-    writers.push(Box::new(crate::formats::misc::Jpeg2000Writer::new()));
+    let writers = crate::writer_order::all_writers();
     writers.into_iter().find(|w| w.is_this_type(path))
 }
 

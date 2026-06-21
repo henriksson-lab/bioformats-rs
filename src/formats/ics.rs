@@ -43,6 +43,8 @@ struct IcsHeader {
     scale_axes: Vec<String>,
     /// Per-axis units (from `parameter units`), aligned with `scales`.
     scale_units: Vec<String>,
+    /// Per-timepoint timestamps in seconds (from `parameter t`).
+    timestamps: Vec<Option<f64>>,
     /// Emission wavelengths (from `sensor s_params LambdaEm`).
     em_waves: Vec<f64>,
     /// Excitation wavelengths (from `sensor s_params LambdaEx`).
@@ -72,14 +74,14 @@ impl IcsHeader {
                 break;
             }
 
-            let tokens: Vec<&str> = line.split_ascii_whitespace().collect();
+            let tokens = tokenize_ics_line(line);
             if tokens.is_empty() {
                 continue;
             }
 
             match tokens[0].to_ascii_lowercase().as_str() {
                 "ics_version" if tokens.len() >= 2 => {
-                    hdr.version = parse_ics_scalar(tokens[1], "ics_version")?;
+                    hdr.version = parse_ics_scalar(&tokens[1], "ics_version")?;
                 }
                 "filename" if tokens.len() >= 2 => {
                     let joined = tokens[1..].join(" ");
@@ -107,10 +109,13 @@ impl IcsHeader {
                         hdr.scale_units =
                             tokens[2..].iter().map(|s| s.to_ascii_lowercase()).collect();
                     }
+                    "t" => {
+                        hdr.timestamps = parse_ics_optional_doubles(&tokens[2..]);
+                    }
                     _ => {}
                 },
                 "sensor" if tokens.len() >= 4 && tokens[1].eq_ignore_ascii_case("s_params") => {
-                    match tokens[2] {
+                    match tokens[2].as_str() {
                         "LambdaEm" => {
                             hdr.em_waves = tokens[3..]
                                 .iter()
@@ -140,7 +145,7 @@ impl IcsHeader {
                     }
                     "significant_bits" | "significant bits" if tokens.len() >= 3 => {
                         hdr.significant_bits =
-                            parse_ics_scalar(tokens[2], "layout significant_bits")?;
+                            parse_ics_scalar(&tokens[2], "layout significant_bits")?;
                     }
                     _ => {}
                 },
@@ -184,14 +189,45 @@ where
     })
 }
 
-fn parse_ics_list<T>(values: &[&str], field: &str) -> Result<Vec<T>>
+fn parse_ics_list<T>(values: &[String], field: &str) -> Result<Vec<T>>
 where
     T: std::str::FromStr,
 {
     values
         .iter()
-        .map(|value| parse_ics_scalar(value, field))
+        .map(|value| parse_ics_scalar(value.as_str(), field))
         .collect()
+}
+
+fn parse_ics_optional_doubles(values: &[String]) -> Vec<Option<f64>> {
+    values
+        .iter()
+        .map(|value| value.parse::<f64>().ok())
+        .collect()
+}
+
+fn tokenize_ics_line(line: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut token = String::new();
+    let mut within_quotes = false;
+
+    for c in line.chars() {
+        if (c.is_whitespace() || c == '\x04') && !within_quotes {
+            if !token.is_empty() {
+                tokens.push(std::mem::take(&mut token));
+            }
+        } else {
+            if c == '"' {
+                within_quotes = !within_quotes;
+            }
+            token.push(c);
+        }
+    }
+
+    if !token.is_empty() {
+        tokens.push(token);
+    }
+    tokens
 }
 
 /// Port of MetadataTools.makeSaneDimensionOrder: ensure all of X,Y,Z,C,T are
@@ -538,6 +574,30 @@ impl IcsReader {
         Ok(coords)
     }
 
+    fn plane_index_for_coords(meta: &ImageMetadata, z: u32, c: u32, t: u32) -> u32 {
+        let mut index = 0u32;
+        let mut stride = 1u32;
+        let c_count = if meta.is_rgb { 1 } else { meta.size_c.max(1) };
+        for axis in match meta.dimension_order {
+            DimensionOrder::XYCTZ => ['C', 'T', 'Z'],
+            DimensionOrder::XYCZT => ['C', 'Z', 'T'],
+            DimensionOrder::XYTCZ => ['T', 'C', 'Z'],
+            DimensionOrder::XYTZC => ['T', 'Z', 'C'],
+            DimensionOrder::XYZCT => ['Z', 'C', 'T'],
+            DimensionOrder::XYZTC => ['Z', 'T', 'C'],
+        } {
+            let (coord, count) = match axis {
+                'Z' => (z, meta.size_z.max(1)),
+                'C' => (c, c_count),
+                'T' => (t, meta.size_t.max(1)),
+                _ => (0, 1),
+            };
+            index += coord * stride;
+            stride *= count;
+        }
+        index
+    }
+
     fn data_payload(&self) -> Result<Vec<u8>> {
         let hdr = self
             .header
@@ -554,13 +614,24 @@ impl IcsReader {
         } else {
             hdr.data_offset
         };
-        f.seek(SeekFrom::Start(data_offset))
-            .map_err(BioFormatsError::Io)?;
         let mut data = Vec::new();
         if hdr.gzip_compressed {
+            f.seek(SeekFrom::Start(data_offset))
+                .map_err(BioFormatsError::Io)?;
             let mut dec = flate2::read::GzDecoder::new(f);
-            dec.read_to_end(&mut data).map_err(BioFormatsError::Io)?;
+            if dec.read_to_end(&mut data).is_ok() {
+                return Ok(data);
+            }
+
+            // Java ICSReader falls back to raw reads when a file declares gzip
+            // compression but the stream is not actually gzip-compressed.
+            let mut raw = File::open(&data_path).map_err(BioFormatsError::Io)?;
+            raw.seek(SeekFrom::Start(data_offset))
+                .map_err(BioFormatsError::Io)?;
+            raw.read_to_end(&mut data).map_err(BioFormatsError::Io)?;
         } else {
+            f.seek(SeekFrom::Start(data_offset))
+                .map_err(BioFormatsError::Io)?;
             f.read_to_end(&mut data).map_err(BioFormatsError::Io)?;
         }
         Ok(data)
@@ -772,28 +843,52 @@ impl FormatReader for IcsReader {
         // Physical sizes from `parameter scale`, gated on micrometre units, with
         // axis labels taken from `layout order` (Java ICSReader uses `axes`).
         let is_micron = |u: Option<&String>| {
-            u.map(|s| {
-                let s = s.as_str();
-                s == "um"
-                    || s == "microns"
-                    || s == "micron"
-                    || s == "micrometer"
-                    || s == "micrometers"
-                    || s == "micrometre"
-                    || s == "micrometres"
-            })
-            .unwrap_or(false)
+            matches!(
+                u.map_or("", String::as_str),
+                "" | "um"
+                    | "microns"
+                    | "micron"
+                    | "micrometer"
+                    | "micrometers"
+                    | "micrometre"
+                    | "micrometres"
+            )
         };
+        let time_scale_seconds = |scale: f64, u: Option<&String>| match u.map_or("", String::as_str)
+        {
+            "" | "ms" | "millisecond" | "milliseconds" => Some(scale / 1000.0),
+            "seconds" | "second" | "s" => Some(scale),
+            _ => None,
+        };
+        let scale_units = if hdr.scale_units.len() + 1 == hdr.scales.len() {
+            let mut units = Vec::with_capacity(hdr.scales.len());
+            let mut unit_index = 0usize;
+            for axis in &hdr.order {
+                if axis.eq_ignore_ascii_case("ch") || unit_index >= hdr.scale_units.len() {
+                    units.push("nm".to_string());
+                } else {
+                    units.push(hdr.scale_units[unit_index].clone());
+                    unit_index += 1;
+                }
+            }
+            units
+        } else {
+            hdr.scale_units.clone()
+        };
+
         for (i, &scale) in hdr.scales.iter().enumerate() {
             if scale.is_nan() {
                 continue;
             }
             let axis = hdr.order.get(i).map(String::as_str).unwrap_or("");
-            let unit = hdr.scale_units.get(i);
+            let unit = scale_units.get(i);
             match axis {
                 "x" if is_micron(unit) => img.physical_size_x = Some(scale),
                 "y" if is_micron(unit) => img.physical_size_y = Some(scale),
                 "z" | "depth" if is_micron(unit) => img.physical_size_z = Some(scale),
+                "t" | "time" => {
+                    img.time_increment = time_scale_seconds(scale, unit);
+                }
                 _ => {}
             }
         }
@@ -811,6 +906,43 @@ impl FormatReader for IcsReader {
                 }
             }
         }
+
+        for (t, timestamp) in hdr.timestamps.iter().enumerate() {
+            if t >= meta.size_t as usize {
+                break;
+            }
+            let Some(delta_t) = timestamp.filter(|v| v.is_finite()) else {
+                continue;
+            };
+            let effective_c = if meta.is_rgb { 1 } else { meta.size_c.max(1) };
+            for z in 0..meta.size_z.max(1) {
+                for c in 0..effective_c {
+                    let plane_index = Self::plane_index_for_coords(meta, z, c, t as u32);
+                    if let Some(plane) = img
+                        .planes
+                        .iter_mut()
+                        .find(|p| p.the_z == z && p.the_c == c && p.the_t == t as u32)
+                    {
+                        plane.delta_t = Some(delta_t);
+                    } else {
+                        img.planes.push(crate::common::ome_metadata::OmePlane {
+                            the_z: z,
+                            the_c: c,
+                            the_t: t as u32,
+                            delta_t: Some(delta_t),
+                            exposure_time: None,
+                            position_x: None,
+                            position_y: None,
+                            position_z: None,
+                        });
+                    }
+                    debug_assert!(plane_index < meta.image_count);
+                }
+            }
+        }
+        img.planes.sort_by_key(|plane| {
+            Self::plane_index_for_coords(meta, plane.the_z, plane.the_c, plane.the_t)
+        });
 
         Some(ome)
     }
@@ -906,6 +1038,46 @@ fn ics_writer_byte_order(meta: &ImageMetadata) -> String {
         (1..=bytes).rev().map(|v| v.to_string()).collect()
     };
     values.join(" ")
+}
+
+fn metadata_f64(meta: &ImageMetadata, key: &str) -> Option<f64> {
+    meta.series_metadata.get(key).and_then(|v| match v {
+        MetadataValue::Float(v) if v.is_finite() => Some(*v),
+        MetadataValue::Int(v) => Some(*v as f64),
+        MetadataValue::String(s) => s.parse::<f64>().ok().filter(|v| v.is_finite()),
+        _ => None,
+    })
+}
+
+fn ics_parameter_scale_and_units(meta: &ImageMetadata) -> (String, String) {
+    let physical_x = metadata_f64(meta, "PhysicalSizeX").unwrap_or(1.0);
+    let physical_y = metadata_f64(meta, "PhysicalSizeY").unwrap_or(1.0);
+    let physical_z = metadata_f64(meta, "PhysicalSizeZ").unwrap_or(1.0);
+    let time_increment = metadata_f64(meta, "TimeIncrement");
+
+    // Java ICSWriter emits one leading bits scale, then values in its fixed
+    // outputOrder ("XYZTC"), even when RGB layout has a leading "ch" axis.
+    let scales = [
+        "1".to_string(),
+        physical_x.to_string(),
+        physical_y.to_string(),
+        physical_z.to_string(),
+        time_increment.unwrap_or(1.0).to_string(),
+        "1".to_string(),
+    ];
+    let mut units = vec![
+        "bits".to_string(),
+        "micrometers".to_string(),
+        "micrometers".to_string(),
+        "micrometers".to_string(),
+    ];
+    if time_increment.is_some() {
+        units.push("seconds".to_string());
+    }
+    (
+        scales.into_iter().collect::<Vec<_>>().join(" "),
+        units.join(" "),
+    )
 }
 
 fn ics_metadata_path_for_ids(path: &Path) -> PathBuf {
@@ -1034,6 +1206,9 @@ impl FormatWriter for IcsWriter {
         )
         .map_err(BioFormatsError::Io)?;
         write!(f, "representation\tcompression\tuncompressed\r\n").map_err(BioFormatsError::Io)?;
+        let (scale, units) = ics_parameter_scale_and_units(&meta);
+        write!(f, "parameter\tscale\t{}\r\n", scale).map_err(BioFormatsError::Io)?;
+        write!(f, "parameter\tunits\t{}\r\n", units).map_err(BioFormatsError::Io)?;
         // The ICS2 terminator MUST end in a bare LF, not CRLF. Java's ICSReader locates
         // the pixel-data offset for ICS v2 with `in.readString(NL)` (NL = "\r\n"),
         // which stops at the FIRST terminator character and consumes only that one

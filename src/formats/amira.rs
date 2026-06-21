@@ -840,6 +840,70 @@ fn validate_spider_payload_len(
     Ok(())
 }
 
+fn spider_type_matches_stream_len(header: &[u8], stream_len: u64) -> bool {
+    if header.len() < 104 {
+        return false;
+    }
+    // Java SpiderReader.isThisType(stream) does not just check plausible
+    // float fields; it verifies the declared pixel and header byte counts
+    // against the stream length.
+    let mut little_endian = false;
+    let mut size = match (r_f32_w(header, 0, little_endian) as i64).checked_mul(4) {
+        Some(v) => v,
+        None => return false,
+    };
+    if size == 0 {
+        little_endian = true;
+        size = match (r_f32_w(header, 0, little_endian) as i64).checked_mul(4) {
+            Some(v) => v,
+            None => return false,
+        };
+    }
+    size = match size
+        .checked_mul(r_f32_w(header, 8, little_endian) as i64)
+        .and_then(|v| v.checked_mul(r_f32_w(header, 44, little_endian) as i64))
+    {
+        Some(v) => v,
+        None => return false,
+    };
+    let header_size = match (r_f32_w(header, 44, little_endian) as i64)
+        .checked_mul(r_f32_w(header, 48, little_endian) as i64)
+        .and_then(|v| v.checked_mul(4))
+    {
+        Some(v) => v,
+        None => return false,
+    };
+    let slices = r_f32_w(header, 100, little_endian) as i64;
+    if slices > 0 {
+        size = match size.checked_mul(slices) {
+            Some(v) => v,
+            None => return false,
+        };
+    }
+    size > 0
+        && (size
+            .checked_add(header_size)
+            .map(|v| v == stream_len as i64)
+            .unwrap_or(false)
+            || size == stream_len as i64)
+}
+
+pub(crate) fn is_spider_file(path: &Path) -> bool {
+    let stream_len = match std::fs::metadata(path) {
+        Ok(metadata) => metadata.len(),
+        Err(_) => return false,
+    };
+    let mut f = match File::open(path) {
+        Ok(file) => file,
+        Err(_) => return false,
+    };
+    let mut header = [0u8; 104];
+    if f.read_exact(&mut header).is_err() {
+        return false;
+    }
+    spider_type_matches_stream_len(&header, stream_len)
+}
+
 pub struct SpiderReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
@@ -873,15 +937,11 @@ impl FormatReader for SpiderReader {
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
-        if header.len() < 52 {
-            return false;
-        }
-        // Java records IFORM as metadata but byte detection only requires
-        // plausible positive dimensions.
-        let little_endian = (r_f32_le_w(header, 0) as i32) > 0;
-        let nsam = r_f32_w(header, 44, little_endian);
-        let nrow = r_f32_w(header, 4, little_endian);
-        nsam > 0.0 && nrow > 0.0
+        // The byte-only trait has no real stream length, so direct callers use
+        // the supplied buffer length as Java's RandomAccessInputStream length.
+        // The registry uses `is_spider_file` when it has a path and can check
+        // the full file length.
+        spider_type_matches_stream_len(header, header.len() as u64)
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
@@ -1126,7 +1186,8 @@ mod spider_tests {
         }
 
         let mut r = SpiderReader::new();
-        assert!(r.is_this_type_by_bytes(&hdr[..104]));
+        let file_bytes = std::fs::read(&path).unwrap();
+        assert!(r.is_this_type_by_bytes(&file_bytes));
         r.set_id(&path).unwrap();
         let meta = r.metadata();
         assert!(!meta.is_little_endian);

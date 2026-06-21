@@ -849,17 +849,6 @@ fn file_stitcher_maps_mixed_time_channel_filenames() {
 // ── Helper ───────────────────────────────────────────────────────────────────
 
 fn open_boxed_reader(path: &Path) -> Box<dyn FormatReader> {
-    let header = std::fs::read(path).unwrap_or_default();
-    let header = &header[..header.len().min(512)];
-    for r in bioformats::registry::all_readers_pub() {
-        if r.is_this_type_by_bytes(header) {
-            return r;
-        }
-    }
-    for r in bioformats::registry::all_readers_pub() {
-        if r.is_this_type_by_name(path) {
-            return r;
-        }
-    }
-    panic!("No reader found for {}", path.display());
+    bioformats::registry::open_reader_boxed(path)
+        .unwrap_or_else(|err| panic!("No reader found for {}: {err}", path.display()))
 }

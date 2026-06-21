@@ -375,6 +375,16 @@ mod tests {
         std::env::temp_dir().join(format!("bioformats_memoizer_{nanos}_{name}"))
     }
 
+    fn write_minimal_sbig(path: &Path) {
+        let mut bytes = vec![0u8; 2048];
+        bytes[..21].copy_from_slice(b"ST-7 Compressed Image");
+        let header = b"\nWidth = 1\nHeight = 1\nEnd\n";
+        bytes[21..21 + header.len()].copy_from_slice(header);
+        bytes.extend_from_slice(&2u16.to_le_bytes());
+        bytes.extend_from_slice(&23u16.to_le_bytes());
+        std::fs::write(path, bytes).unwrap();
+    }
+
     struct FailingSeriesReader {
         meta: ImageMetadata,
     }
@@ -555,6 +565,22 @@ mod tests {
 
         let _ = std::fs::remove_file(Memoizer::cache_path(&path));
         let _ = std::fs::remove_file(tiff_path);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn cache_hit_preserves_extensionless_sbig_detection() {
+        let path = temp_path("cached_sbig_no_suffix");
+        write_minimal_sbig(&path);
+
+        let first = Memoizer::open(&path).expect("initial SBIG open failed");
+        assert_eq!(first.metadata().size_x, 1);
+
+        let mut second = Memoizer::open(&path).expect("cached SBIG open failed");
+        assert_eq!(second.metadata().size_y, 1);
+        assert_eq!(second.open_bytes(0).unwrap(), vec![23, 0]);
+
+        let _ = std::fs::remove_file(Memoizer::cache_path(&path));
         let _ = std::fs::remove_file(path);
     }
 

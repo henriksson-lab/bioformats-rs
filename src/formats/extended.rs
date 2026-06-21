@@ -562,6 +562,12 @@ impl FormatReader for DngReader {
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.inner.set_id(path)?;
+        for series in self.inner.series_list_mut() {
+            series.metadata.series_metadata.insert(
+                "format".to_string(),
+                MetadataValue::String("DNG".to_string()),
+            );
+        }
 
         // Inspect the first IFD: a Bayer-CFA DNG has PhotometricInterpretation
         // == CFA_ARRAY (32803). Anything else is returned via the TIFF reader.
@@ -621,7 +627,10 @@ impl FormatReader for DngReader {
                     is_little_endian: base.is_little_endian,
                     resolution_count: 1,
                     thumbnail: false,
-                    series_metadata: HashMap::new(),
+                    series_metadata: HashMap::from([(
+                        "format".to_string(),
+                        MetadataValue::String("DNG".to_string()),
+                    )]),
                     lookup_table: None,
                     modulo_z: None,
                     modulo_c: None,

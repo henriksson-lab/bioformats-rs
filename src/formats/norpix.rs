@@ -1024,6 +1024,7 @@ const IMAGE_PRO_TAG_3: u16 = 40100;
 /// Image-Pro Sequence reader (`.seq`/`.ips`), TIFF-based.
 pub struct SeqReader {
     inner: crate::tiff::TiffReader,
+    ips_files: Option<Vec<PathBuf>>,
 }
 
 impl SeqReader {
@@ -1031,12 +1032,13 @@ impl SeqReader {
     pub fn new() -> Self {
         SeqReader {
             inner: crate::tiff::TiffReader::new(),
+            ips_files: None,
         }
     }
 
     /// Mirror Java `SEQReader.isThisType(RandomAccessInputStream)`: parse the
     /// first IFD and require IMAGE_PRO_TAG_1 (stored as a `short[]`) or
-    /// IMAGE_PRO_TAG_3 (stored as an `int[]`, i.e. TIFF SHORT). Operates on
+    /// IMAGE_PRO_TAG_3 (stored as an `int[]`, i.e. TIFF LONG). Operates on
     /// whatever header bytes are available; if the tags lie beyond the supplied
     /// window the parse fails gracefully and detection returns `false`. This
     /// keeps the TIFF-based Image-Pro reader from colliding with the raw
@@ -1056,10 +1058,10 @@ impl SeqReader {
             ifd.get(IMAGE_PRO_TAG_1),
             Some(crate::tiff::ifd::IfdValue::Short(_))
         );
-        // TIFF SHORT values surface as `int[]` in Java; `IfdValue::Short` here.
+        // Java checks for `int[]`, which corresponds to TIFF LONG values.
         let tag3_int = matches!(
             ifd.get(IMAGE_PRO_TAG_3),
-            Some(crate::tiff::ifd::IfdValue::Short(_))
+            Some(crate::tiff::ifd::IfdValue::Long(_))
         );
         tag1_short || tag3_int
     }
@@ -1232,6 +1234,134 @@ impl SeqReader {
         let effective_c = if is_rgb { 1 } else { size_c };
         m.image_count = size_z.saturating_mul(effective_c).saturating_mul(size_t);
     }
+
+    fn is_ips_path(path: &Path) -> bool {
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("ips"))
+            .unwrap_or(false)
+    }
+
+    fn read_ips_u32(file: &mut File, label: &str) -> Result<u32> {
+        let mut buf = [0u8; 4];
+        file.read_exact(&mut buf).map_err(|e| {
+            BioFormatsError::Io(std::io::Error::new(
+                e.kind(),
+                format!("Image-Pro IPS missing {label}: {e}"),
+            ))
+        })?;
+        Ok(u32::from_le_bytes(buf))
+    }
+
+    fn read_ips_len_string(file: &mut File, label: &str) -> Result<String> {
+        let mut len = [0u8; 1];
+        file.read_exact(&mut len).map_err(|e| {
+            BioFormatsError::Io(std::io::Error::new(
+                e.kind(),
+                format!("Image-Pro IPS missing {label} length: {e}"),
+            ))
+        })?;
+        let mut bytes = vec![0u8; len[0] as usize];
+        file.read_exact(&mut bytes).map_err(|e| {
+            BioFormatsError::Io(std::io::Error::new(
+                e.kind(),
+                format!("Image-Pro IPS missing {label} bytes: {e}"),
+            ))
+        })?;
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    fn effective_size_c(meta: &ImageMetadata) -> u32 {
+        if meta.is_rgb {
+            (meta.size_c / 3).max(1)
+        } else {
+            meta.size_c.max(1)
+        }
+    }
+
+    fn ips_plane_file_index(&self, plane_index: u32) -> Result<usize> {
+        let meta = self.metadata();
+        if plane_index >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        let size_z = meta.size_z.max(1);
+        let effective_c = Self::effective_size_c(meta);
+        let size_t = meta.size_t.max(1);
+        let series_count = self.series_count().max(1);
+        let z = plane_index % size_z;
+        let c = (plane_index / size_z) % effective_c;
+        let t = plane_index / size_z / effective_c;
+        let index = z as usize
+            + size_z as usize
+                * (c as usize + effective_c as usize * (self.series() + series_count * t as usize));
+        let max_index = size_z as usize * effective_c as usize * series_count * size_t as usize;
+        if index >= max_index {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        Ok(index)
+    }
+
+    fn init_ips_file(&mut self, path: &Path) -> Result<()> {
+        let mut file = File::open(path)?;
+        file.seek(SeekFrom::Start(27))?;
+
+        let channel_count = Self::read_ips_u32(&mut file, "channel count")?;
+        let mut channel_names = Vec::with_capacity(channel_count as usize);
+        for c in 0..channel_count {
+            channel_names.push(Self::read_ips_len_string(
+                &mut file,
+                &format!("channel name {c}"),
+            )?);
+        }
+
+        let file_count = Self::read_ips_u32(&mut file, "file count")?;
+        if file_count == 0 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "Image-Pro IPS file list is empty".into(),
+            ));
+        }
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let mut pixel_files = Vec::with_capacity(file_count as usize);
+        for f in 0..file_count {
+            let name = Self::read_ips_len_string(&mut file, &format!("pixel file {f}"))?;
+            pixel_files.push(parent.join(name));
+        }
+
+        let t_count = Self::read_ips_u32(&mut file, "T count")?.max(1);
+        let pos_count = Self::read_ips_u32(&mut file, "position count")?.max(1);
+        let _unknown_count = Self::read_ips_u32(&mut file, "unknown count")?;
+        let z_count = Self::read_ips_u32(&mut file, "Z count")?.max(1);
+
+        self.inner.set_id(&pixel_files[0])?;
+        self.init_standard_metadata();
+
+        let Some(base_series) = self.inner.series_list().first().cloned() else {
+            return Err(BioFormatsError::NotInitialized);
+        };
+        let mut series = Vec::with_capacity(pos_count as usize);
+        for _ in 0..pos_count {
+            let mut s = base_series.clone();
+            let m = &mut s.metadata;
+            m.size_t = t_count;
+            m.size_z = z_count;
+            m.size_c = m.size_c.saturating_mul(channel_count.max(1));
+            m.image_count = m
+                .image_count
+                .saturating_mul(z_count)
+                .saturating_mul(t_count)
+                .saturating_mul(channel_count.max(1));
+            for (c, name) in channel_names.iter().enumerate() {
+                m.series_metadata.insert(
+                    format!("Channel {} Name", c + 1),
+                    MetadataValue::String(name.clone()),
+                );
+            }
+            series.push(s);
+        }
+        self.inner.replace_series(series);
+        self.ips_files = Some(pixel_files);
+        Ok(())
+    }
 }
 
 impl Default for SeqReader {
@@ -1247,7 +1377,7 @@ impl FormatReader for SeqReader {
         // with Norpix). The byte check disambiguates ".seq".
         path.extension()
             .and_then(|e| e.to_str())
-            .map(|e| e.eq_ignore_ascii_case("ips") || e.eq_ignore_ascii_case("seq"))
+            .map(|e| e.eq_ignore_ascii_case("ips"))
             .unwrap_or(false)
     }
 
@@ -1257,12 +1387,18 @@ impl FormatReader for SeqReader {
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.inner.close()?;
-        self.inner.set_id(path)?;
-        self.init_standard_metadata();
+        self.ips_files = None;
+        if Self::is_ips_path(path) {
+            self.init_ips_file(path)?;
+        } else {
+            self.inner.set_id(path)?;
+            self.init_standard_metadata();
+        }
         Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
+        self.ips_files = None;
         self.inner.close()
     }
     fn series_count(&self) -> usize {
@@ -1278,6 +1414,13 @@ impl FormatReader for SeqReader {
         self.inner.metadata()
     }
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        if self.ips_files.is_some() {
+            let (w, h) = {
+                let m = self.metadata();
+                (m.size_x, m.size_y)
+            };
+            return self.open_bytes_region(plane_index, 0, 0, w, h);
+        }
         self.inner.open_bytes(plane_index)
     }
     fn open_bytes_region(
@@ -1288,9 +1431,33 @@ impl FormatReader for SeqReader {
         w: u32,
         h: u32,
     ) -> Result<Vec<u8>> {
+        if let Some(files) = self.ips_files.as_ref() {
+            let index = self.ips_plane_file_index(plane_index)?;
+            let path = files.get(index).ok_or_else(|| {
+                BioFormatsError::UnsupportedFormat(format!(
+                    "Image-Pro IPS references plane file {index}, but only {} files were listed",
+                    files.len()
+                ))
+            })?;
+            let mut reader = crate::tiff::TiffReader::new();
+            reader.set_id(path)?;
+            return reader.open_bytes_region(0, x, y, w, h);
+        }
         self.inner.open_bytes_region(plane_index, x, y, w, h)
     }
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
+        if let Some(files) = self.ips_files.as_ref() {
+            let index = self.ips_plane_file_index(plane_index)?;
+            let path = files.get(index).ok_or_else(|| {
+                BioFormatsError::UnsupportedFormat(format!(
+                    "Image-Pro IPS references plane file {index}, but only {} files were listed",
+                    files.len()
+                ))
+            })?;
+            let mut reader = crate::tiff::TiffReader::new();
+            reader.set_id(path)?;
+            return reader.open_thumb_bytes(0);
+        }
         self.inner.open_thumb_bytes(plane_index)
     }
     fn resolution_count(&self) -> usize {
@@ -1320,10 +1487,13 @@ mod seq_tests {
     ///   [8..)    IFD: entry count, entries (12 bytes each), next-IFD = 0
     ///   then     out-of-line payloads (strip pixels + tag arrays)
     fn build_tiff(extra: &[(u16, u16, u32, Vec<u8>)]) -> Vec<u8> {
+        build_tiff_with_pixels(extra, vec![0, 1, 2, 3])
+    }
+
+    fn build_tiff_with_pixels(extra: &[(u16, u16, u32, Vec<u8>)], pixels: Vec<u8>) -> Vec<u8> {
         // Minimal 2x2 8-bit grayscale, single strip.
         let width = 2u32;
         let height = 2u32;
-        let pixels: Vec<u8> = vec![0, 1, 2, 3];
 
         // Base structural tags (tag, type, count, inline-or-offset value).
         // type: 3 = SHORT, 4 = LONG.
@@ -1401,6 +1571,31 @@ mod seq_tests {
         tiff
     }
 
+    fn build_ips(
+        channel_names: &[&str],
+        pixel_files: &[&str],
+        t: u32,
+        pos: u32,
+        z: u32,
+    ) -> Vec<u8> {
+        let mut ips = vec![0u8; 27];
+        ips.extend_from_slice(&(channel_names.len() as u32).to_le_bytes());
+        for name in channel_names {
+            ips.push(name.len() as u8);
+            ips.extend_from_slice(name.as_bytes());
+        }
+        ips.extend_from_slice(&(pixel_files.len() as u32).to_le_bytes());
+        for file in pixel_files {
+            ips.push(file.len() as u8);
+            ips.extend_from_slice(file.as_bytes());
+        }
+        ips.extend_from_slice(&t.to_le_bytes());
+        ips.extend_from_slice(&pos.to_le_bytes());
+        ips.extend_from_slice(&0u32.to_le_bytes());
+        ips.extend_from_slice(&z.to_le_bytes());
+        ips
+    }
+
     fn image_pro_tags() -> Vec<(u16, u16, u32, Vec<u8>)> {
         // IMAGE_PRO_TAG_1 (50288): SHORT[12] identical values.
         let mut tag1 = Vec::new();
@@ -1408,11 +1603,11 @@ mod seq_tests {
             tag1.extend_from_slice(&7u16.to_le_bytes());
         }
         // IMAGE_PRO_TAG_2 (40105): SHORT frame rate = 30 (inline).
-        // IMAGE_PRO_TAG_3 (40100): SHORT (int[]) marker = 1 (inline).
+        // IMAGE_PRO_TAG_3 (40100): LONG (int[]) marker = 1 (inline).
         vec![
             (IMAGE_PRO_TAG_1, 3, 12, tag1),
             (IMAGE_PRO_TAG_2, 3, 1, 30u16.to_le_bytes().to_vec()),
-            (IMAGE_PRO_TAG_3, 3, 1, 1u16.to_le_bytes().to_vec()),
+            (IMAGE_PRO_TAG_3, 4, 1, 1u32.to_le_bytes().to_vec()),
         ]
     }
 
@@ -1422,6 +1617,24 @@ mod seq_tests {
         assert!(
             SeqReader::is_this_type_from_bytes(&tiff),
             "Image-Pro TIFF (tag1 short[] + tag3 int[]) should be detected"
+        );
+    }
+
+    #[test]
+    fn detects_image_pro_tiff_via_long_tag3_without_tag1() {
+        let tiff = build_tiff(&[(IMAGE_PRO_TAG_3, 4, 1, 1u32.to_le_bytes().to_vec())]);
+        assert!(
+            SeqReader::is_this_type_from_bytes(&tiff),
+            "Java SEQReader accepts IMAGE_PRO_TAG_3 only when it is an int[]/LONG"
+        );
+    }
+
+    #[test]
+    fn rejects_short_tag3_without_tag1_like_java() {
+        let tiff = build_tiff(&[(IMAGE_PRO_TAG_3, 3, 1, 1u16.to_le_bytes().to_vec())]);
+        assert!(
+            !SeqReader::is_this_type_from_bytes(&tiff),
+            "Java SEQReader requires IMAGE_PRO_TAG_3 to materialize as int[], not short[]"
         );
     }
 
@@ -1479,6 +1692,58 @@ mod seq_tests {
         assert_eq!(plane, vec![0, 1, 2, 3]);
 
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn ips_metadata_file_groups_seq_tiffs_like_java() {
+        let dir = std::env::temp_dir().join(format!("bioformats_seq_ips_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let names = [
+            "z0c0p0t0.seq",
+            "z1c0p0t0.seq",
+            "z0c0p1t0.seq",
+            "z1c0p1t0.seq",
+        ];
+        for (i, name) in names.iter().enumerate() {
+            let pixels = vec![i as u8, i as u8 + 10, i as u8 + 20, i as u8 + 30];
+            std::fs::write(
+                dir.join(name),
+                build_tiff_with_pixels(&image_pro_tags(), pixels),
+            )
+            .unwrap();
+        }
+        let ips_path = dir.join("group.ips");
+        std::fs::write(&ips_path, build_ips(&["DAPI"], &names, 1, 2, 2)).unwrap();
+
+        let mut reader = SeqReader::new();
+        assert!(reader.is_this_type_by_name(&ips_path));
+        reader.set_id(&ips_path).unwrap();
+        assert_eq!(reader.series_count(), 2);
+        let m = reader.metadata();
+        assert_eq!(m.size_z, 2);
+        assert_eq!(m.size_c, 1);
+        assert_eq!(m.size_t, 1);
+        assert_eq!(m.image_count, 2);
+        assert!(matches!(
+            m.series_metadata.get("Channel 1 Name"),
+            Some(MetadataValue::String(name)) if name == "DAPI"
+        ));
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![0, 10, 20, 30]);
+        assert_eq!(reader.open_bytes(1).unwrap(), vec![1, 11, 21, 31]);
+
+        reader.set_series(1).unwrap();
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![2, 12, 22, 32]);
+        assert_eq!(reader.open_bytes(1).unwrap(), vec![3, 13, 23, 33]);
+        assert_eq!(reader.open_thumb_bytes(1).unwrap(), vec![3, 13, 23, 33]);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn seq_name_alone_is_not_sufficient_but_ips_is() {
+        let reader = SeqReader::new();
+        assert!(!reader.is_this_type_by_name(Path::new("image.seq")));
+        assert!(reader.is_this_type_by_name(Path::new("image.ips")));
     }
 
     #[test]

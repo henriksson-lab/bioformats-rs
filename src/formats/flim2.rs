@@ -297,24 +297,35 @@ const FLOWSIGHT_METADATA_XML_TAG: u16 = 33027;
 const FLOWSIGHT_GREYSCALE_COMPRESSION: u16 = 30817;
 const FLOWSIGHT_BITMASK_COMPRESSION: u16 = 30818;
 
+fn flowsight_pre_xml_channel_count(ifd0: &Ifd) -> usize {
+    let mut channel_count = ifd0.get_u32(FLOWSIGHT_CHANNEL_COUNT_TAG).unwrap_or(1) as usize;
+    if let Some(names) = ifd0.get_str(FLOWSIGHT_CHANNEL_NAMES_TAG) {
+        channel_count = split_flowsight_pipe_list(names).len();
+    }
+    channel_count
+}
+
+fn validate_flowsight_channel_descriptions(ifd0: &Ifd, channel_count: usize) -> Result<()> {
+    if let Some(descs) = ifd0.get_str(FLOWSIGHT_CHANNEL_DESCS_TAG) {
+        let desc_count = split_flowsight_pipe_list(descs).len();
+        if desc_count != channel_count {
+            return Err(BioFormatsError::Format(format!(
+                "Channel count ({channel_count}) does not match number of channel descriptions ({desc_count}) in string \"{descs}\""
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn flowsight_channel_count(ifd0: &Ifd) -> usize {
     // Match Java FlowSightReader (lines 150-200): start with the CHANNEL_COUNT_TAG
     // default, override with the channel-names count if present, then override
     // AGAIN with the XML ChannelInUseIndicators count if the XML provides it.
     // The XML count is applied LAST so it wins when sources disagree.
-    let mut channel_count = ifd0
-        .get_u32(FLOWSIGHT_CHANNEL_COUNT_TAG)
-        .unwrap_or(1)
-        .max(1) as usize;
-    if let Some(names) = ifd0.get_str(FLOWSIGHT_CHANNEL_NAMES_TAG) {
-        let count = split_flowsight_pipe_list(names).len();
-        if count > 0 {
-            channel_count = count;
-        }
-    }
+    let mut channel_count = flowsight_pre_xml_channel_count(ifd0);
     if let Some(xml) = ifd0.get_str(FLOWSIGHT_METADATA_XML_TAG) {
         if let Some(count) = count_flowsight_channels_in_use(xml) {
-            channel_count = count.max(1);
+            channel_count = count;
         }
     }
     channel_count
@@ -323,8 +334,11 @@ fn flowsight_channel_count(ifd0: &Ifd) -> usize {
 fn split_flowsight_pipe_list(value: &str) -> Vec<String> {
     // Java FlowSightReader uses String.split("\\|"), which preserves empty
     // interior tokens but discards trailing empty tokens.
+    if value.is_empty() {
+        return vec![String::new()];
+    }
     let mut parts: Vec<String> = value.split('|').map(str::to_owned).collect();
-    while parts.len() > 1 && parts.last().is_some_and(|s| s.is_empty()) {
+    while parts.last().is_some_and(|s| s.is_empty()) {
         parts.pop();
     }
     parts
@@ -335,6 +349,7 @@ fn count_flowsight_channels_in_use(xml: &str) -> Option<usize> {
     let imaging_open_end = xml[imaging_start..].find('>')? + imaging_start + 1;
     let imaging_close = xml[imaging_open_end..].find("</Imaging>")? + imaging_open_end;
     let mut pos = imaging_open_end;
+    let mut found = None;
     while pos < imaging_close {
         let Some(rel_open) = xml[pos..imaging_close].find('<') else {
             break;
@@ -359,12 +374,14 @@ fn count_flowsight_channels_in_use(xml: &str) -> Option<usize> {
         if tag_name.starts_with("ChannelInUseIndicators") {
             let close_tag = format!("</{tag_name}>");
             let close = xml[open_end + 1..imaging_close].find(&close_tag)? + open_end + 1;
-            return Some(
+            found = Some(
                 xml[open_end + 1..close]
                     .split(' ')
                     .filter(|token| *token == "1")
                     .count(),
             );
+            pos = close + close_tag.len();
+            continue;
         }
         let close_tag = format!("</{tag_name}>");
         pos = xml[open_end + 1..imaging_close]
@@ -372,10 +389,15 @@ fn count_flowsight_channels_in_use(xml: &str) -> Option<usize> {
             .map(|rel| open_end + 1 + rel + close_tag.len())
             .unwrap_or(open_end + 1);
     }
-    None
+    found
 }
 
-fn build_flowsight_metadata(ifd: &Ifd, ifd0: &Ifd, channel_count: usize) -> Result<ImageMetadata> {
+fn build_flowsight_metadata(
+    ifd: &Ifd,
+    ifd0: &Ifd,
+    channel_count: usize,
+    little_endian: bool,
+) -> Result<ImageMetadata> {
     let total_width = ifd
         .image_width()
         .ok_or_else(|| BioFormatsError::Format("FlowSight image IFD missing ImageWidth".into()))?;
@@ -405,7 +427,7 @@ fn build_flowsight_metadata(ifd: &Ifd, ifd0: &Ifd, channel_count: usize) -> Resu
             PixelType::Uint16
         },
         bits_per_pixel: bits as u8,
-        is_little_endian: true,
+        is_little_endian: little_endian,
         ..ImageMetadata::default()
     };
     meta.series_metadata.insert(
@@ -425,18 +447,28 @@ fn build_flowsight_metadata(ifd: &Ifd, ifd0: &Ifd, channel_count: usize) -> Resu
         );
     }
     if let Some(descs) = ifd0.get_str(FLOWSIGHT_CHANNEL_DESCS_TAG) {
-        let desc_count = split_flowsight_pipe_list(descs).len();
-        if desc_count != channel_count {
-            return Err(BioFormatsError::Format(format!(
-                "Channel count ({channel_count}) does not match number of channel descriptions ({desc_count}) in string \"{descs}\""
-            )));
-        }
         meta.series_metadata.insert(
             "FlowSight.ChannelDescriptions".into(),
             crate::common::metadata::MetadataValue::String(descs.to_owned()),
         );
     }
     Ok(meta)
+}
+
+fn flowsight_has_metadata_tag(header: &[u8]) -> bool {
+    let cursor = std::io::Cursor::new(header);
+    let mut parser = match TiffParser::new(cursor) {
+        Ok(parser) => parser,
+        Err(_) => return false,
+    };
+    if !matches!(parser.variant, crate::tiff::parser::TiffVariant::Classic) {
+        return false;
+    }
+    let (ifd, _) = match parser.read_ifd(parser.first_ifd_offset) {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    ifd.get_str(FLOWSIGHT_METADATA_XML_TAG).is_some()
 }
 
 fn crop_flowsight_plane(
@@ -660,9 +692,7 @@ impl FormatReader for FlowSightReader {
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
-        header.len() >= 4
-            && ((header[0..2] == [0x49, 0x49] && header[2..4] == [42, 0])
-                || (header[0..2] == [0x4d, 0x4d] && header[2..4] == [0, 42]))
+        flowsight_has_metadata_tag(header)
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
@@ -688,10 +718,11 @@ impl FormatReader for FlowSightReader {
                 "FlowSight CIF metadata XML tag 33027 is missing".into(),
             ));
         }
+        validate_flowsight_channel_descriptions(ifd0, flowsight_pre_xml_channel_count(ifd0))?;
         let channel_count = flowsight_channel_count(ifd0);
         let metas = ifds[1..]
             .iter()
-            .map(|ifd| build_flowsight_metadata(ifd, ifd0, channel_count))
+            .map(|ifd| build_flowsight_metadata(ifd, ifd0, channel_count, little_endian))
             .collect::<Result<Vec<_>>>()?;
 
         self.path = Some(path.to_path_buf());
@@ -785,6 +816,48 @@ impl FormatReader for FlowSightReader {
         let tx = (meta.size_x - tw) / 2;
         let ty = (meta.size_y - th) / 2;
         self.open_bytes_region(_plane_index, tx, ty, tw, th)
+    }
+
+    fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
+        use crate::common::ome_metadata::OmeMetadata;
+
+        if self.metas.is_empty() {
+            return None;
+        }
+
+        let channel_names = self
+            .ifds
+            .first()
+            .and_then(|ifd| ifd.get_str(FLOWSIGHT_CHANNEL_NAMES_TAG))
+            .map(split_flowsight_pipe_list);
+        let channel_descs = self
+            .ifds
+            .first()
+            .and_then(|ifd| ifd.get_str(FLOWSIGHT_CHANNEL_DESCS_TAG))
+            .map(split_flowsight_pipe_list);
+
+        let mut ome = OmeMetadata::default();
+        for (series, meta) in self.metas.iter().enumerate() {
+            let _ = ome.populate_pixels(meta, series);
+            let Some(image) = ome.images.get_mut(series) else {
+                continue;
+            };
+            if let (Some(_names), Some(descs)) = (channel_names.as_ref(), channel_descs.as_ref()) {
+                let is_mask = meta.pixel_type == PixelType::Uint8;
+                for (channel, desc) in image.channels.iter_mut().zip(descs.iter()) {
+                    channel.name = Some(if is_mask {
+                        format!("{desc} Mask")
+                    } else {
+                        desc.clone()
+                    });
+                }
+            }
+            image.modulo_z = meta.modulo_z.clone();
+            image.modulo_c = meta.modulo_c.clone();
+            image.modulo_t = meta.modulo_t.clone();
+            let _ = ome.add_original_metadata_annotations(meta, series);
+        }
+        Some(ome)
     }
 }
 
@@ -6919,6 +6992,11 @@ impl AfiReader {
             }
         }
     }
+
+    fn is_extra_series(&self) -> bool {
+        let extra = 2usize.min(self.metas.len());
+        self.current_series + extra >= self.metas.len()
+    }
 }
 
 fn afi_widen_plane_bytes(
@@ -7033,11 +7111,18 @@ impl FormatReader for AfiReader {
         // the multi-channel pyramid resolutions.
         let total = metas.len();
         let extra = 2usize.min(total);
+        let pyramid_pixel_type = metas.first().map(|m| m.pixel_type);
         for (i, m) in metas.iter_mut().enumerate() {
             if i + extra < total {
                 m.size_c = nchannels;
                 m.is_rgb = false;
                 m.image_count = m.size_c * m.size_z.max(1) * m.size_t.max(1);
+                if i > 0 {
+                    if let Some(pixel_type) = pyramid_pixel_type {
+                        m.pixel_type = pixel_type;
+                        m.bits_per_pixel = (pixel_type.bytes_per_sample() * 8) as u8;
+                    }
+                }
             }
         }
 
@@ -7083,8 +7168,25 @@ impl FormatReader for AfiReader {
         self.open_assembled_plane(p, Some((x, y, w, h)))
     }
     fn open_thumb_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
-        self.readers[0].set_series(self.current_series)?;
-        self.readers[0].open_thumb_bytes(p)
+        if self.is_extra_series() {
+            self.readers[0].set_series(self.current_series)?;
+            return self.readers[0].open_thumb_bytes(p);
+        }
+
+        // Java switches to the last pyramid series and calls back through this
+        // reader, so the thumbnail is assembled through AFI channel logic rather
+        // than delegated to the first SVS file.
+        let saved = self.current_series;
+        let target = self.metas.len().saturating_sub(2).saturating_sub(1);
+        self.current_series = target;
+        let meta = self.metadata().clone();
+        let tw = meta.size_x.min(256);
+        let th = meta.size_y.min(256);
+        let tx = (meta.size_x - tw) / 2;
+        let ty = (meta.size_y - th) / 2;
+        let result = self.open_bytes_region(p, tx, ty, tw, th);
+        self.current_series = saved;
+        result
     }
     fn resolution_count(&self) -> usize {
         self.readers
@@ -7111,10 +7213,9 @@ impl FormatReader for AfiReader {
 /// comment with `Description`, `Name` (channel names), `LSMEmissionWavelength`,
 /// `LSMExcitationWavelength`, and `RecordingDate`.
 ///
-/// We port the comment parsing and dimension assignment (`sizeC` = number of
-/// IFDs). The per-IFD strip→Z-plane reshape that the Java reader performs is
-/// not yet replicated; pixel reads are delegated to `TiffReader` as-is, so
-/// per-channel planes are exposed at IFD granularity.
+/// We port the comment parsing, dimension assignment (`sizeC` = number of IFDs),
+/// and the per-IFD strip→Z-plane reshape that the Java reader performs before
+/// reading pixel planes.
 pub struct ImarisTiffReader {
     inner: crate::tiff::TiffReader,
     path: Option<PathBuf>,
@@ -17795,6 +17896,10 @@ EndClass: 0
             reader.open_bytes_region(1, 1, 0, 1, 1).unwrap(),
             vec![0x80, 0x80]
         );
+        assert_eq!(
+            reader.open_thumb_bytes(1).unwrap(),
+            vec![0x00, 0x00, 0x80, 0x80]
+        );
 
         let _ = std::fs::remove_file(first);
         let _ = std::fs::remove_file(second);
@@ -18102,6 +18207,39 @@ EndClass: 0
         out.extend_from_slice(&extra);
     }
 
+    fn write_test_ifd_be(
+        out: &mut Vec<u8>,
+        entries: &[TestEntry],
+        ifd_offset: usize,
+        next_ifd_offset: u32,
+    ) {
+        let mut entries = entries
+            .iter()
+            .map(|entry| (entry.tag, entry))
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|(tag, _)| *tag);
+        let mut extra = Vec::new();
+        let extra_base = ifd_offset + ifd_table_len(entries.len());
+
+        out.extend_from_slice(&(entries.len() as u16).to_be_bytes());
+        for (_, entry) in entries {
+            out.extend_from_slice(&entry.tag.to_be_bytes());
+            out.extend_from_slice(&entry.typ.to_be_bytes());
+            out.extend_from_slice(&entry.count.to_be_bytes());
+            if entry.value.len() <= 4 {
+                let mut inline = [0u8; 4];
+                inline[..entry.value.len()].copy_from_slice(&entry.value);
+                out.extend_from_slice(&inline);
+            } else {
+                let offset = (extra_base + extra.len()) as u32;
+                out.extend_from_slice(&offset.to_be_bytes());
+                extra.extend_from_slice(&entry.value);
+            }
+        }
+        out.extend_from_slice(&next_ifd_offset.to_be_bytes());
+        out.extend_from_slice(&extra);
+    }
+
     fn write_synthetic_flowsight_cif(
         path: &Path,
         bits_per_sample: u16,
@@ -18158,6 +18296,121 @@ EndClass: 0
         write_test_ifd(&mut data, &ifd0_entries, ifd0_offset, ifd1_offset as u32);
         write_test_ifd(&mut data, &ifd1_entries, ifd1_offset, 0);
         data.extend_from_slice(compressed);
+
+        let mut file = File::create(path).unwrap();
+        file.write_all(&data).unwrap();
+    }
+
+    fn write_big_endian_synthetic_flowsight_cif(path: &Path) {
+        let compressed = [0x00, 1, 0xff, 1];
+        let ifd0_entries = vec![
+            TestEntry {
+                tag: FLOWSIGHT_CHANNEL_COUNT_TAG,
+                typ: 3,
+                count: 1,
+                value: 2u16.to_be_bytes().to_vec(),
+            },
+            ascii_entry(FLOWSIGHT_CHANNEL_NAMES_TAG, "BF|SSC"),
+            ascii_entry(FLOWSIGHT_CHANNEL_DESCS_TAG, "Brightfield|Scatter"),
+            ascii_entry(
+                FLOWSIGHT_METADATA_XML_TAG,
+                "<Root><Imaging><ChannelInUseIndicators>1 1</ChannelInUseIndicators></Imaging></Root>",
+            ),
+        ];
+        let ifd0_offset = 8usize;
+        let ifd1_offset =
+            ifd0_offset + ifd_table_len(ifd0_entries.len()) + ifd_extra_len(&ifd0_entries);
+        let ifd1_entry_count = 7usize;
+        let ifd1_entries = vec![
+            TestEntry {
+                tag: tag::IMAGE_WIDTH,
+                typ: 4,
+                count: 1,
+                value: 4u32.to_be_bytes().to_vec(),
+            },
+            TestEntry {
+                tag: tag::IMAGE_LENGTH,
+                typ: 4,
+                count: 1,
+                value: 1u32.to_be_bytes().to_vec(),
+            },
+            TestEntry {
+                tag: tag::BITS_PER_SAMPLE,
+                typ: 3,
+                count: 1,
+                value: 8u16.to_be_bytes().to_vec(),
+            },
+            TestEntry {
+                tag: tag::COMPRESSION,
+                typ: 3,
+                count: 1,
+                value: FLOWSIGHT_BITMASK_COMPRESSION.to_be_bytes().to_vec(),
+            },
+            TestEntry {
+                tag: tag::ROWS_PER_STRIP,
+                typ: 4,
+                count: 1,
+                value: 1u32.to_be_bytes().to_vec(),
+            },
+            TestEntry {
+                tag: tag::STRIP_OFFSETS,
+                typ: 4,
+                count: 1,
+                value: ((ifd1_offset + ifd_table_len(ifd1_entry_count)) as u32)
+                    .to_be_bytes()
+                    .to_vec(),
+            },
+            TestEntry {
+                tag: tag::STRIP_BYTE_COUNTS,
+                typ: 4,
+                count: 1,
+                value: (compressed.len() as u32).to_be_bytes().to_vec(),
+            },
+        ];
+
+        let mut data = Vec::new();
+        data.extend_from_slice(b"MM");
+        data.extend_from_slice(&42u16.to_be_bytes());
+        data.extend_from_slice(&(ifd0_offset as u32).to_be_bytes());
+        write_test_ifd_be(&mut data, &ifd0_entries, ifd0_offset, ifd1_offset as u32);
+        write_test_ifd_be(&mut data, &ifd1_entries, ifd1_offset, 0);
+        data.extend_from_slice(&compressed);
+
+        let mut file = File::create(path).unwrap();
+        file.write_all(&data).unwrap();
+    }
+
+    fn write_synthetic_flowsight_cif_without_metadata_tag(path: &Path) {
+        let compressed = [0x00, 1, 0xff, 1];
+        let ifd0_entries = vec![
+            short_entry(FLOWSIGHT_CHANNEL_COUNT_TAG, 2),
+            ascii_entry(FLOWSIGHT_CHANNEL_NAMES_TAG, "BF|SSC"),
+            ascii_entry(FLOWSIGHT_CHANNEL_DESCS_TAG, "Brightfield|Scatter"),
+        ];
+        let ifd0_offset = 8usize;
+        let ifd1_offset =
+            ifd0_offset + ifd_table_len(ifd0_entries.len()) + ifd_extra_len(&ifd0_entries);
+        let ifd1_entry_count = 7usize;
+        let ifd1_entries = vec![
+            long_entry(tag::IMAGE_WIDTH, 4),
+            long_entry(tag::IMAGE_LENGTH, 1),
+            short_entry(tag::BITS_PER_SAMPLE, 8),
+            short_entry(tag::COMPRESSION, FLOWSIGHT_BITMASK_COMPRESSION),
+            long_entry(tag::ROWS_PER_STRIP, 1),
+            long_entry(
+                tag::STRIP_OFFSETS,
+                (ifd1_offset + ifd_table_len(ifd1_entry_count)) as u32,
+            ),
+            long_entry(tag::STRIP_BYTE_COUNTS, compressed.len() as u32),
+        ];
+
+        let mut data = Vec::new();
+        data.extend_from_slice(b"II");
+        data.extend_from_slice(&42u16.to_le_bytes());
+        data.extend_from_slice(&(ifd0_offset as u32).to_le_bytes());
+        write_test_ifd(&mut data, &ifd0_entries, ifd0_offset, ifd1_offset as u32);
+        write_test_ifd(&mut data, &ifd1_entries, ifd1_offset, 0);
+        data.extend_from_slice(&compressed);
 
         let mut file = File::create(path).unwrap();
         file.write_all(&data).unwrap();
@@ -18890,6 +19143,9 @@ EndClass: 0
             split_flowsight_pipe_list("BF|SSC|"),
             vec!["BF".to_string(), "SSC".to_string()]
         );
+        assert_eq!(split_flowsight_pipe_list("|"), Vec::<String>::new());
+        assert_eq!(split_flowsight_pipe_list("||"), Vec::<String>::new());
+        assert_eq!(split_flowsight_pipe_list(""), vec!["".to_string()]);
     }
 
     #[test]
@@ -18912,6 +19168,43 @@ EndClass: 0
             ),
             Some(1)
         );
+        assert_eq!(
+            count_flowsight_channels_in_use(
+                "<Root><Imaging><ChannelInUseIndicators>1 1 1</ChannelInUseIndicators><Other><ChannelInUseIndicators>1</ChannelInUseIndicators></Other><ChannelInUseIndicators_1>0 1</ChannelInUseIndicators_1></Imaging></Root>"
+            ),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn flowsight_byte_detection_requires_metadata_tag_like_java() {
+        let good = temp_cif_path("detect-good");
+        write_synthetic_flowsight_cif(&good, 8, FLOWSIGHT_BITMASK_COMPRESSION, &[0x00, 1, 0xff, 1]);
+        let good_bytes = std::fs::read(&good).unwrap();
+        assert!(FlowSightReader::new().is_this_type_by_bytes(&good_bytes));
+
+        let bad = temp_cif_path("detect-bad");
+        write_synthetic_flowsight_cif_without_metadata_tag(&bad);
+        let bad_bytes = std::fs::read(&bad).unwrap();
+        assert!(!FlowSightReader::new().is_this_type_by_bytes(&bad_bytes));
+
+        let _ = std::fs::remove_file(good);
+        let _ = std::fs::remove_file(bad);
+    }
+
+    #[test]
+    fn flowsight_metadata_endianness_matches_tiff_header_like_java() {
+        let path = temp_cif_path("big-endian");
+        write_big_endian_synthetic_flowsight_cif(&path);
+
+        let mut reader = FlowSightReader::new();
+        reader.set_id(&path).expect("big-endian FlowSight CIF");
+
+        assert!(!reader.metadata().is_little_endian);
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![0x00, 0x00]);
+        assert_eq!(reader.open_bytes(1).unwrap(), vec![0xff, 0xff]);
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -18934,6 +19227,64 @@ EndClass: 0
         );
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn flowsight_rejects_channel_description_mismatch_before_xml_override_like_java() {
+        let path = temp_cif_path("bad-channel-descs-before-xml");
+        write_synthetic_flowsight_cif_with_metadata(
+            &path,
+            8,
+            FLOWSIGHT_BITMASK_COMPRESSION,
+            &[0x00, 1, 0xff, 1],
+            "BF|SSC",
+            "Only one description",
+            "<Root><Imaging><ChannelInUseIndicators>1 0</ChannelInUseIndicators></Imaging></Root>",
+        );
+
+        let err = FlowSightReader::new().set_id(&path).unwrap_err();
+        assert!(
+            matches!(err, BioFormatsError::Format(ref message) if message.contains("does not match number of channel descriptions")),
+            "unexpected FlowSight error: {err:?}"
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn flowsight_ome_channel_names_use_descriptions_and_mask_suffix_like_java() {
+        let greyscale = temp_cif_path("ome-channel-greyscale");
+        write_synthetic_flowsight_cif(
+            &greyscale,
+            16,
+            FLOWSIGHT_GREYSCALE_COMPRESSION,
+            &[0x1a, 0x91, 0x11],
+        );
+        let mut reader = FlowSightReader::new();
+        reader.set_id(&greyscale).expect("greyscale FlowSight CIF");
+        let ome = reader.ome_metadata().expect("greyscale OME metadata");
+        assert_eq!(
+            ome.images[0].channels[0].name.as_deref(),
+            Some("Brightfield")
+        );
+        assert_eq!(ome.images[0].channels[1].name.as_deref(), Some("Scatter"));
+
+        let mask = temp_cif_path("ome-channel-mask");
+        write_synthetic_flowsight_cif(&mask, 8, FLOWSIGHT_BITMASK_COMPRESSION, &[0x00, 1, 0xff, 1]);
+        let mut reader = FlowSightReader::new();
+        reader.set_id(&mask).expect("mask FlowSight CIF");
+        let ome = reader.ome_metadata().expect("mask OME metadata");
+        assert_eq!(
+            ome.images[0].channels[0].name.as_deref(),
+            Some("Brightfield Mask")
+        );
+        assert_eq!(
+            ome.images[0].channels[1].name.as_deref(),
+            Some("Scatter Mask")
+        );
+
+        let _ = std::fs::remove_file(greyscale);
+        let _ = std::fs::remove_file(mask);
     }
 
     #[test]
