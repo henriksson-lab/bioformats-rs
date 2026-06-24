@@ -1268,7 +1268,12 @@ impl TiffReader {
 
     /// Resolve the IFD index for a given plane, taking current resolution into account.
     fn resolve_ifd_index(&self, plane_index: u32) -> Result<usize> {
-        let s = &self.series[self.current_series];
+        let s = self.series.get(self.current_series).ok_or_else(|| {
+            BioFormatsError::Format(format!(
+                "TIFF reader has no initialized series for current series {}",
+                self.current_series
+            ))
+        })?;
         if self.current_resolution == 0 {
             // Main resolution
             if !s.plane_ifd_indices.is_empty() {
@@ -4267,10 +4272,20 @@ impl crate::common::reader::FormatReader for TiffReader {
         } else {
             tf.parser.read_ifds()?
         };
+        if tf.ifds.is_empty() {
+            return Err(BioFormatsError::Format(
+                "TIFF file contains no readable IFDs".into(),
+            ));
+        }
         for ifd in &tf.ifds {
             Self::ifd_info(ifd, little_endian)?;
         }
         self.series = Self::build_series(&tf.ifds, little_endian);
+        if self.series.is_empty() {
+            return Err(BioFormatsError::Format(
+                "TIFF file contains no readable image series".into(),
+            ));
+        }
         // Detect OME-TIFF: OME-XML is stored in the first IFD's ImageDescription.
         self.ome_xml = self
             .series

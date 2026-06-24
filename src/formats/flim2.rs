@@ -5620,6 +5620,18 @@ impl NdpisReader {
         let band = if band < rgb_channels { band } else { 0 };
         let bytes_per_sample = meta.pixel_type.bytes_per_sample();
         let plane_len = width as usize * height as usize * bytes_per_sample;
+        let pixel_count = width as usize * height as usize;
+        let expected_interleaved_len = pixel_count
+            .saturating_mul(rgb_channels)
+            .saturating_mul(bytes_per_sample);
+        if expected_interleaved_len <= data.len() {
+            let mut out = Vec::with_capacity(plane_len);
+            for pixel in 0..pixel_count {
+                let start = (pixel * rgb_channels + band) * bytes_per_sample;
+                out.extend_from_slice(&data[start..start + bytes_per_sample]);
+            }
+            return out;
+        }
         let start = band.saturating_mul(plane_len);
         let end = start.saturating_add(plane_len);
         if end <= data.len() {
@@ -5652,9 +5664,11 @@ impl FormatReader for NdpisReader {
         matches!(ext.as_deref(), Some("ndpis"))
     }
     fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
-        true
+        false
     }
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.close()?;
+
         let text = std::fs::read_to_string(path).map_err(BioFormatsError::Io)?;
         let parent = path.parent().map(Path::to_path_buf).unwrap_or_default();
 
@@ -5765,6 +5779,9 @@ impl FormatReader for NdpisReader {
             .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
     fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
+        if self.readers.is_empty() {
+            return Err(BioFormatsError::NotInitialized);
+        }
         if !self.is_pyramid_series() {
             self.readers[0].set_series(self.current_series)?;
             return self.readers[0].open_bytes(p);
@@ -5779,6 +5796,9 @@ impl FormatReader for NdpisReader {
         Ok(self.select_ndpi_band(&self.readers[channel], channel, data, width, height))
     }
     fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+        if self.readers.is_empty() {
+            return Err(BioFormatsError::NotInitialized);
+        }
         if !self.is_pyramid_series() {
             self.readers[0].set_series(self.current_series)?;
             return self.readers[0].open_bytes_region(p, x, y, w, h);
@@ -5789,6 +5809,9 @@ impl FormatReader for NdpisReader {
         Ok(self.select_ndpi_band(&self.readers[channel], channel, data, w, h))
     }
     fn open_thumb_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
+        if self.readers.is_empty() {
+            return Err(BioFormatsError::NotInitialized);
+        }
         if !self.is_pyramid_series() {
             self.readers[0].set_series(self.current_series)?;
             return self.readers[0].open_thumb_bytes(p);
@@ -19136,8 +19159,8 @@ EndClass: 0
         let blue = dir.join("blue.ndpi");
         let green = dir.join("green.ndpi");
 
-        write_rgb_ndpi_for_ndpis(&blue, "blue channel", 450.0, &[10, 20, 30, 40, 50, 60]);
-        write_rgb_ndpi_for_ndpis(&green, "green channel", 520.0, &[11, 21, 31, 41, 51, 61]);
+        write_rgb_ndpi_for_ndpis(&blue, "blue channel", 450.0, &[10, 11, 20, 40, 50, 60]);
+        write_rgb_ndpi_for_ndpis(&green, "green channel", 520.0, &[11, 41, 21, 51, 31, 61]);
         std::fs::write(
             &index,
             "NoImages=2\r\nImage0=blue.ndpi\r\nImage1=green.ndpi\r\n",
@@ -19152,6 +19175,36 @@ EndClass: 0
         assert_eq!(reader.open_bytes(0).unwrap(), vec![20, 60]);
         assert_eq!(reader.open_bytes(1).unwrap(), vec![41, 31]);
         assert_eq!(reader.open_bytes_region(0, 1, 0, 1, 1).unwrap(), vec![60]);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn ndpis_failed_second_set_id_clears_previous_state() {
+        let dir = temp_flim2_path("ndpis-failed-second");
+        std::fs::create_dir_all(&dir).unwrap();
+        let good_index = dir.join("good.ndpis");
+        let bad_index = dir.join("bad.ndpis");
+        let ndpi = dir.join("channel.ndpi");
+
+        write_rgb_ndpi_for_ndpis(&ndpi, "blue channel", 450.0, &[10, 11, 20, 40, 50, 60]);
+        std::fs::write(&good_index, "NoImages=1\r\nImage0=channel.ndpi\r\n").unwrap();
+        std::fs::write(&bad_index, "NoImages=1\r\nImage0=missing.ndpi\r\n").unwrap();
+
+        let mut reader = NdpisReader::new();
+        reader.set_id(&good_index).expect("valid NDPIS fixture");
+        assert_eq!(reader.metadata().image_count, 1);
+
+        assert!(reader.set_id(&bad_index).is_err());
+        assert_eq!(reader.series_count(), 0);
+        assert!(matches!(
+            reader.open_bytes(0),
+            Err(BioFormatsError::NotInitialized)
+        ));
+        assert!(matches!(
+            reader.open_bytes_region(0, 0, 0, 1, 1),
+            Err(BioFormatsError::NotInitialized)
+        ));
 
         let _ = std::fs::remove_dir_all(dir);
     }

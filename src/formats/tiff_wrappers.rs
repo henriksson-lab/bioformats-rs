@@ -484,33 +484,42 @@ impl NdpiReader {
         }
     }
 
-    /// De-interleave a chunky RGB plane into channel-separated layout when the
-    /// current series is RGB and flagged non-interleaved (mirrors the SVS path).
-    fn separate_channels(&self, buf: Vec<u8>, w: u32, h: u32) -> Vec<u8> {
-        let m = self.inner.metadata();
-        if !m.is_rgb || m.is_interleaved {
+    fn ndpi_pixel_bytes_for_metadata(m: &ImageMetadata, buf: Vec<u8>) -> Vec<u8> {
+        if !m.is_rgb || m.size_c <= 1 {
             return buf;
         }
         let channels = m.size_c as usize;
-        if channels < 2 {
-            return buf;
-        }
         let bps = ((m.bits_per_pixel as usize + 7) / 8).max(1);
-        let pixels = w as usize * h as usize;
-        let expected = pixels * channels * bps;
-        if pixels == 0 || buf.len() != expected {
+        let plane = buf.len() / channels;
+        if plane == 0 || plane % bps != 0 || plane * channels != buf.len() {
             return buf;
         }
-        let mut out = vec![0u8; expected];
-        let plane = pixels * bps;
+        let pixels = plane / bps;
+        let mut out = vec![0u8; buf.len()];
         for i in 0..pixels {
             for c in 0..channels {
-                let src = (i * channels + c) * bps;
-                let dst = c * plane + i * bps;
+                let src = c * plane + i * bps;
+                let dst = (i * channels + c) * bps;
                 out[dst..dst + bps].copy_from_slice(&buf[src..src + bps]);
             }
         }
         out
+    }
+
+    fn ndpi_pixel_bytes(&self, buf: Vec<u8>, _w: u32, _h: u32) -> Vec<u8> {
+        let m = self.inner.metadata();
+        let marked_ndpi_ifd = self
+            .inner
+            .series_list()
+            .get(self.inner.series())
+            .and_then(|s| s.ifd_indices.first())
+            .and_then(|&idx| self.inner.ifd(idx))
+            .map(|ifd| ifd.get(NDPI_MARKER_TAG).is_some())
+            .unwrap_or(false);
+        if !marked_ndpi_ifd {
+            return buf;
+        }
+        Self::ndpi_pixel_bytes_for_metadata(m, buf)
     }
 
     /// Build OME image metadata for each flattened series: name "Series N" and
@@ -518,21 +527,21 @@ impl NdpiReader {
     /// (`10000 / XResolution` for ResolutionUnit == cm), mirroring the
     /// FormatTools.getPhysicalSize path Java uses for NDPI.
     fn build_ndpi_ome(&mut self) {
-        use crate::common::ome_metadata::{OmeChannel, OmeImage};
+        use crate::common::ome_metadata::{OmeChannel, OmeImage, OmePlane};
         use crate::tiff::ifd::tag;
         let mut images: Vec<OmeImage> = Vec::new();
-        let series: Vec<(usize, u32)> = self
+        let series: Vec<(usize, ImageMetadata)> = self
             .inner
             .series_list()
             .iter()
             .map(|s| {
                 (
                     s.ifd_indices.first().copied().unwrap_or(0),
-                    s.metadata.size_c.max(1),
+                    s.metadata.clone(),
                 )
             })
             .collect();
-        for (i, (ifd_idx, channels)) in series.into_iter().enumerate() {
+        for (i, (ifd_idx, metadata)) in series.into_iter().enumerate() {
             let (px, py) = self
                 .inner
                 .ifd(ifd_idx)
@@ -552,14 +561,43 @@ impl NdpiReader {
                     (conv(tag::X_RESOLUTION), conv(tag::Y_RESOLUTION))
                 })
                 .unwrap_or((None, None));
+            let mut planes = self
+                .inner
+                .ifd(ifd_idx)
+                .and_then(|ifd| {
+                    let position_x = ifd
+                        .get(NDPI_X_POSITION)
+                        .and_then(|v| v.as_vec_f32().and_then(|s| s.first().copied()))
+                        .map(|v| v as f64);
+                    let position_y = ifd
+                        .get(NDPI_Y_POSITION)
+                        .and_then(|v| v.as_vec_f32().and_then(|s| s.first().copied()))
+                        .map(|v| v as f64);
+                    let position_z = ifd.get(NDPI_Z_POSITION).and_then(|v| v.as_f64());
+                    if position_x.is_some() || position_y.is_some() || position_z.is_some() {
+                        Some(vec![OmePlane {
+                            position_x,
+                            position_y,
+                            position_z,
+                            ..Default::default()
+                        }])
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_default();
+            if planes.is_empty() && i == 0 && metadata.image_count > 0 {
+                planes.push(OmePlane::default());
+            }
             images.push(OmeImage {
                 name: Some(format!("Series {}", i + 1)),
                 physical_size_x: px,
                 physical_size_y: py,
                 channels: vec![OmeChannel {
-                    samples_per_pixel: channels,
+                    samples_per_pixel: metadata.size_c.max(1),
                     ..Default::default()
                 }],
+                planes,
                 ..Default::default()
             });
         }
@@ -897,6 +935,11 @@ impl FormatReader for NdpiReader {
         // Regroup the flat NDPI IFD chain into a pyramid series (+ macro/map
         // series) and detect sizeZ, mirroring NDPIReader.initStandardMetadata.
         self.build_ndpi_series();
+        if self.inner.series_count() == 0 {
+            return Err(BioFormatsError::Format(
+                "NDPI TIFF contains no readable image series".into(),
+            ));
+        }
         // Java's default ImageReader flattens the pyramid: each resolution is its
         // own top-level series. Mirror that so seriesCount matches the reference.
         let _ = self.inner.flatten_resolutions_into_series();
@@ -916,6 +959,7 @@ impl FormatReader for NdpiReader {
         self.size_z = 1;
         self.pyramid_height = 1;
         self.use_64bit = false;
+        self.ome_images.clear();
         self.inner.close()
     }
     fn series_count(&self) -> usize {
@@ -936,11 +980,11 @@ impl FormatReader for NdpiReader {
             (m.size_x, m.size_y)
         };
         let buf = self.inner.open_bytes(p)?;
-        Ok(self.separate_channels(buf, w, h))
+        Ok(self.ndpi_pixel_bytes(buf, w, h))
     }
     fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
         let buf = self.inner.open_bytes_region(p, x, y, w, h)?;
-        Ok(self.separate_channels(buf, w, h))
+        Ok(self.ndpi_pixel_bytes(buf, w, h))
     }
     fn open_thumb_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
         self.inner.open_thumb_bytes(p)
@@ -961,6 +1005,10 @@ impl FormatReader for NdpiReader {
         }
         Some(crate::common::ome_metadata::OmeMetadata {
             images: self.ome_images.clone(),
+            instruments: vec![crate::common::ome_metadata::OmeInstrument {
+                objectives: vec![crate::common::ome_metadata::OmeObjective::default()],
+                ..Default::default()
+            }],
             ..Default::default()
         })
     }
@@ -1392,14 +1440,24 @@ impl LeicaScnReader {
                 } else {
                     None
                 };
+                let objective_ref = images
+                    .iter()
+                    .position(|candidate| candidate.name == img.name)
+                    .unwrap_or(0)
+                    .min(1);
                 ome_images.push(OmeImage {
                     name: Some(format!("{} (R{})", img.name, r)),
                     physical_size_x: px,
                     physical_size_y: py,
+                    physical_size_z: (img.v_spacing_z > 0)
+                        .then_some(img.v_spacing_z as f64 / 1000.0),
                     channels: vec![OmeChannel {
                         samples_per_pixel: channels,
                         ..Default::default()
                     }],
+                    planes: vec![crate::common::ome_metadata::OmePlane::default()],
+                    instrument_ref: Some(0),
+                    objective_ref: Some(objective_ref),
                     ..Default::default()
                 });
             }
@@ -1426,33 +1484,9 @@ impl LeicaScnReader {
         }
     }
 
-    /// De-interleave a chunky RGB plane into channel-separated layout when the
-    /// current series is RGB and flagged non-interleaved (mirrors the SVS path).
-    fn separate_channels(&self, buf: Vec<u8>, w: u32, h: u32) -> Vec<u8> {
-        let m = self.inner.metadata();
-        if !m.is_rgb || m.is_interleaved {
-            return buf;
-        }
-        let channels = m.size_c as usize;
-        if channels < 2 {
-            return buf;
-        }
-        let bps = ((m.bits_per_pixel as usize + 7) / 8).max(1);
-        let pixels = w as usize * h as usize;
-        let expected = pixels * channels * bps;
-        if pixels == 0 || buf.len() != expected {
-            return buf;
-        }
-        let mut out = vec![0u8; expected];
-        let plane = pixels * bps;
-        for i in 0..pixels {
-            for c in 0..channels {
-                let src = (i * channels + c) * bps;
-                let dst = c * plane + i * bps;
-                out[dst..dst + bps].copy_from_slice(&buf[src..src + bps]);
-            }
-        }
-        out
+    fn interleave_channels(&self, buf: Vec<u8>, w: u32, h: u32) -> Vec<u8> {
+        let _ = (w, h);
+        buf
     }
 }
 
@@ -1476,12 +1510,15 @@ impl FormatReader for LeicaScnReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.ome_images.clear();
+        self.inner.close()?;
         self.inner.set_id(path)?;
         self.enrich_metadata();
         Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
+        self.ome_images.clear();
         self.inner.close()
     }
     fn series_count(&self) -> usize {
@@ -1502,11 +1539,11 @@ impl FormatReader for LeicaScnReader {
             (m.size_x, m.size_y)
         };
         let buf = self.inner.open_bytes(p)?;
-        Ok(self.separate_channels(buf, w, h))
+        Ok(self.interleave_channels(buf, w, h))
     }
     fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
         let buf = self.inner.open_bytes_region(p, x, y, w, h)?;
-        Ok(self.separate_channels(buf, w, h))
+        Ok(self.interleave_channels(buf, w, h))
     }
     fn open_thumb_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
         self.inner.open_thumb_bytes(p)
@@ -1527,6 +1564,13 @@ impl FormatReader for LeicaScnReader {
         }
         Some(crate::common::ome_metadata::OmeMetadata {
             images: self.ome_images.clone(),
+            instruments: vec![crate::common::ome_metadata::OmeInstrument {
+                objectives: vec![
+                    crate::common::ome_metadata::OmeObjective::default(),
+                    crate::common::ome_metadata::OmeObjective::default(),
+                ],
+                ..Default::default()
+            }],
             ..Default::default()
         })
     }
@@ -1562,6 +1606,8 @@ pub struct VentanaReader {
     /// derives subresolution metadata directly from raw IFD sizes.
     stitched_resolution_sizes: Vec<(u32, u32)>,
     metadata_override: Option<ImageMetadata>,
+    ome_images: Vec<crate::common::ome_metadata::OmeImage>,
+    pyramid_start_ifd: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1611,21 +1657,63 @@ impl VentanaReader {
             reassemble: false,
             stitched_resolution_sizes: Vec::new(),
             metadata_override: None,
+            ome_images: Vec::new(),
+            pyramid_start_ifd: 0,
         }
     }
 
     fn first_description(&self) -> Option<String> {
-        let series = self.inner.series_list();
-        let v = series
-            .first()?
-            .metadata
-            .series_metadata
-            .get("ImageDescription")?;
-        if let crate::common::metadata::MetadataValue::String(s) = v {
-            Some(s.clone())
-        } else {
-            None
+        let mut fallback = None;
+        let mut iscan_fallback = None;
+        for idx in 0..self.inner.ifd_count() {
+            let Some(ifd) = self.inner.ifd(idx) else {
+                continue;
+            };
+            let text = Self::ifd_text(ifd, 700).or_else(|| {
+                ifd.get_str(crate::tiff::ifd::tag::IMAGE_DESCRIPTION)
+                    .map(str::to_string)
+            });
+            let Some(text) = text else {
+                continue;
+            };
+            if text.contains("SlideStitchInfo") {
+                return Some(text);
+            }
+            if text.contains("<iScan") {
+                iscan_fallback.get_or_insert(text);
+                continue;
+            }
+            fallback.get_or_insert(text);
         }
+        iscan_fallback.or(fallback)
+    }
+
+    fn ifd_text(ifd: &crate::tiff::ifd::Ifd, tag: u16) -> Option<String> {
+        match ifd.get(tag)? {
+            crate::tiff::ifd::IfdValue::Ascii(s) => Some(s.trim_end_matches('\0').to_string()),
+            crate::tiff::ifd::IfdValue::Byte(v) | crate::tiff::ifd::IfdValue::Undefined(v) => {
+                let nul = v.iter().position(|&b| b == 0).unwrap_or(v.len());
+                String::from_utf8(v[..nul].to_vec()).ok()
+            }
+            _ => None,
+        }
+    }
+
+    fn detect_pyramid_start_ifd(&self) -> usize {
+        for idx in 0..self.inner.ifd_count() {
+            let Some(ifd) = self.inner.ifd(idx) else {
+                continue;
+            };
+            if !ifd
+                .get_vec_u64(crate::tiff::ifd::tag::TILE_OFFSETS)
+                .is_empty()
+                && ifd.image_width().unwrap_or(0) > 0
+                && ifd.image_length().unwrap_or(0) > 0
+            {
+                return idx;
+            }
+        }
+        0
     }
 
     /// Parse the iScan XMP. Mirrors `VentanaReader.parseXML`.
@@ -1737,19 +1825,32 @@ impl VentanaReader {
         let Some(series) = self.inner.series_list().first() else {
             return Vec::new();
         };
-        let original_full_x = series.metadata.size_x;
+        let original_full_x = self
+            .inner
+            .ifd(self.pyramid_start_ifd)
+            .and_then(|ifd| ifd.image_width())
+            .unwrap_or(series.metadata.size_x);
         let mut sizes = vec![(self.full_x, self.full_y)];
-        for level in &series.sub_resolutions {
-            let Some((sub_x, _sub_y)) = level.first().and_then(|&idx| {
-                self.inner.ifd(idx).map(|ifd| {
-                    (
-                        ifd.image_width().unwrap_or(0),
-                        ifd.image_length().unwrap_or(0),
-                    )
-                })
+        for idx in (self.pyramid_start_ifd + 1)..self.inner.ifd_count() {
+            let Some((sub_x, _sub_y)) = self.inner.ifd(idx).map(|ifd| {
+                (
+                    ifd.image_width().unwrap_or(0),
+                    ifd.image_length().unwrap_or(0),
+                )
             }) else {
                 continue;
             };
+            if self
+                .inner
+                .ifd(idx)
+                .map(|ifd| {
+                    ifd.get_vec_u64(crate::tiff::ifd::tag::TILE_OFFSETS)
+                        .is_empty()
+                })
+                .unwrap_or(true)
+            {
+                break;
+            }
             sizes.push(Self::stitched_size_for_resolution(
                 original_full_x,
                 self.full_x,
@@ -1777,11 +1878,10 @@ impl VentanaReader {
 
     fn refresh_metadata_override(&mut self) {
         self.metadata_override = None;
-        if !self.reassemble || self.inner.series() != 0 {
+        if !self.reassemble {
             return;
         }
-        let level = self.inner.resolution();
-        if let Some(&(sx, sy)) = self.stitched_resolution_sizes.get(level) {
+        if let Some(&(sx, sy)) = self.stitched_resolution_sizes.get(self.inner.series()) {
             let mut meta = self.inner.metadata().clone();
             meta.size_x = sx;
             meta.size_y = sy;
@@ -1806,13 +1906,14 @@ impl VentanaReader {
     /// overlaps. Mirrors the body of `initStandardMetadata` after the IFD scan.
     fn build_tiles(&mut self) {
         let series = self.inner.series_list();
-        let Some(s0) = series.first() else { return };
-        let full_w = s0.metadata.size_x;
+        let full_w = self
+            .inner
+            .ifd(self.pyramid_start_ifd)
+            .and_then(|ifd| ifd.image_width())
+            .or_else(|| series.first().map(|s| s.metadata.size_x))
+            .unwrap_or(0);
         // Tile geometry from the full-resolution IFD.
-        let main_ifd_idx = match s0.ifd_indices.first() {
-            Some(&i) => i,
-            None => return,
-        };
+        let main_ifd_idx = self.pyramid_start_ifd;
         let (tw, th, offset_count) = match self.inner.ifd(main_ifd_idx) {
             Some(ifd) => (
                 ifd.tile_width().unwrap_or(0),
@@ -2020,20 +2121,19 @@ impl VentanaReader {
             return;
         }
         self.parse_xml(&desc);
+        self.pyramid_start_ifd = self.detect_pyramid_start_ifd();
         self.build_tiles();
 
         // Update full-resolution series dimensions and vendor metadata.
         if self.reassemble {
-            let (fx, fy) = (self.full_x, self.full_y);
             self.stitched_resolution_sizes = self.compute_stitched_resolution_sizes();
-            if let Some(s) = self.inner.series_list_mut().first_mut() {
-                s.metadata.size_x = fx;
-                s.metadata.size_y = fy;
-            }
         }
         let mag = self.magnification;
         let pps = self.physical_pixel_size;
-        if let Some(s) = self.inner.series_list_mut().first_mut() {
+        if self.reassemble {
+            self.reorder_bif_series();
+        }
+        for s in self.inner.series_list_mut() {
             if let Some(m) = mag {
                 s.metadata.series_metadata.insert(
                     "ventana.magnification".into(),
@@ -2047,15 +2147,74 @@ impl VentanaReader {
                 );
             }
         }
+        self.build_ome_images();
         self.refresh_metadata_override();
+    }
+
+    fn reorder_bif_series(&mut self) {
+        let series = self.inner.series_list().to_vec();
+        if series.len() < 3 {
+            return;
+        }
+
+        let mut by_ifd = std::collections::HashMap::new();
+        for s in series {
+            if let Some(&ifd) = s.ifd_indices.first() {
+                by_ifd.insert(ifd, s);
+            }
+        }
+
+        let mut reordered = Vec::new();
+        let ifd_count = self.inner.ifd_count();
+        for ifd in self.pyramid_start_ifd..ifd_count {
+            let Some(mut s) = by_ifd.remove(&ifd) else {
+                continue;
+            };
+            let level = ifd - self.pyramid_start_ifd;
+            if let Some(&(sx, sy)) = self.stitched_resolution_sizes.get(level) {
+                s.metadata.size_x = sx;
+                s.metadata.size_y = sy;
+            }
+            s.metadata.is_interleaved = false;
+            reordered.push(s);
+        }
+        for ifd in 0..self.pyramid_start_ifd {
+            if let Some(mut s) = by_ifd.remove(&ifd) {
+                s.metadata.is_interleaved = false;
+                reordered.push(s);
+            }
+        }
+
+        if !reordered.is_empty() {
+            self.inner.replace_series(reordered);
+        }
+    }
+
+    fn build_ome_images(&mut self) {
+        use crate::common::ome_metadata::{OmeChannel, OmeImage};
+        self.ome_images.clear();
+        let physical = self.physical_pixel_size;
+        for (i, s) in self.inner.series_list().iter().enumerate() {
+            let channels = s.metadata.size_c.max(1);
+            self.ome_images.push(OmeImage {
+                name: Some(format!("Ventana-1.bif #{}", i + 1)),
+                physical_size_x: physical,
+                physical_size_y: physical,
+                channels: vec![OmeChannel {
+                    samples_per_pixel: channels,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            });
+        }
     }
 
     /// Scale factor between the full-resolution image and the resolution that is
     /// currently selected on the inner reader. Mirrors Java `getScale`
     /// (`VentanaReader.java:740-743`): `round(fullX / resX)`.
     fn get_scale(&self) -> i64 {
-        if self.reassemble && self.inner.series() == 0 {
-            let level = self.inner.resolution();
+        if self.reassemble {
+            let level = self.inner.series();
             if let (Some(&(full_x, _)), Some(&(res_x, _))) = (
                 self.stitched_resolution_sizes.first(),
                 self.stitched_resolution_sizes.get(level),
@@ -2090,11 +2249,11 @@ impl VentanaReader {
     /// intersected with the requested region (Java `VentanaReader.java:314-340`).
     /// Bytes-per-pixel layout follows the inner TiffReader.
     fn assemble_region(&mut self, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
-        let bpp_pixel = {
+        let (bytes_per_sample, samples_per_pixel, planar_rgb) = {
             let m = self.inner.metadata();
             let bytes = (m.bits_per_pixel as usize + 7) / 8;
             let spp = if m.is_rgb { m.size_c as usize } else { 1 };
-            bytes * spp
+            (bytes, spp, m.is_rgb && !m.is_interleaved && spp > 1)
         };
         // Full-resolution tile geometry (Java tileWidth/tileHeight).
         let tw = self.tile_width as i64;
@@ -2105,8 +2264,9 @@ impl VentanaReader {
         let this_tw = self.scale_coordinate(tw, scale);
         let this_th = self.scale_coordinate(th, scale);
 
-        let out_row = w as usize * bpp_pixel;
-        let mut out = vec![0u8; out_row * h as usize];
+        let out_row = w as usize * bytes_per_sample;
+        let out_plane = out_row * h as usize;
+        let mut out = vec![0u8; out_plane * samples_per_pixel];
         let req_x0 = x as i64;
         let req_y0 = y as i64;
         let req_x1 = req_x0 + w as i64;
@@ -2171,18 +2331,37 @@ impl VentanaReader {
                 this_tw as u32,
                 this_th as u32,
             )?;
-            let src_row = this_tw as usize * bpp_pixel;
             for row in iy0..iy1 {
                 // Source coordinates within the scaled tile (Java realRow / x-x).
                 let sy = (row - box_y) as usize;
                 let sx = (ix0 - box_x) as usize;
-                let copy_len = (ix1 - ix0) as usize * bpp_pixel;
-                let s_off = sy * src_row + sx * bpp_pixel;
+                let copy_pixels = (ix1 - ix0) as usize;
+                let copy_len = copy_pixels * bytes_per_sample;
                 let dst_y = (row - req_y0) as usize;
                 let dst_x = (ix0 - req_x0) as usize;
-                let d_off = dst_y * out_row + dst_x * bpp_pixel;
-                if s_off + copy_len <= src.len() && d_off + copy_len <= out.len() {
-                    out[d_off..d_off + copy_len].copy_from_slice(&src[s_off..s_off + copy_len]);
+                if planar_rgb {
+                    let src_plane = this_tw as usize * this_th as usize * bytes_per_sample;
+                    for c in 0..samples_per_pixel {
+                        let s_off = c * src_plane
+                            + sy * this_tw as usize * bytes_per_sample
+                            + sx * bytes_per_sample;
+                        let d_off = c * out_plane + dst_y * out_row + dst_x * bytes_per_sample;
+                        if s_off + copy_len <= src.len() && d_off + copy_len <= out.len() {
+                            out[d_off..d_off + copy_len]
+                                .copy_from_slice(&src[s_off..s_off + copy_len]);
+                        }
+                    }
+                } else {
+                    let chunky_src_row = this_tw as usize * samples_per_pixel * bytes_per_sample;
+                    let chunky_out_row = w as usize * samples_per_pixel * bytes_per_sample;
+                    let s_off = sy * chunky_src_row + sx * samples_per_pixel * bytes_per_sample;
+                    let d_off =
+                        dst_y * chunky_out_row + dst_x * samples_per_pixel * bytes_per_sample;
+                    let chunky_len = copy_pixels * samples_per_pixel * bytes_per_sample;
+                    if s_off + chunky_len <= src.len() && d_off + chunky_len <= out.len() {
+                        out[d_off..d_off + chunky_len]
+                            .copy_from_slice(&src[s_off..s_off + chunky_len]);
+                    }
                 }
             }
         }
@@ -2221,6 +2400,7 @@ impl FormatReader for VentanaReader {
         self.reassemble = false;
         self.stitched_resolution_sizes.clear();
         self.metadata_override = None;
+        self.ome_images.clear();
         self.inner.close()
     }
     fn series_count(&self) -> usize {
@@ -2243,7 +2423,7 @@ impl FormatReader for VentanaReader {
     fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
         // Reassemble the stitched image at the current resolution (Java stitches
         // every resolution by scaling AOI/tile coords; VentanaReader.java:240-312).
-        if self.reassemble && self.inner.series() == 0 {
+        if self.reassemble && self.inner.series() < self.stitched_resolution_sizes.len() {
             if p != 0 {
                 return Err(BioFormatsError::PlaneOutOfRange(p));
             }
@@ -2256,7 +2436,7 @@ impl FormatReader for VentanaReader {
         self.inner.open_bytes(p)
     }
     fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
-        if self.reassemble && self.inner.series() == 0 {
+        if self.reassemble && self.inner.series() < self.stitched_resolution_sizes.len() {
             if p != 0 {
                 return Err(BioFormatsError::PlaneOutOfRange(p));
             }
@@ -2282,6 +2462,20 @@ impl FormatReader for VentanaReader {
     }
     fn resolution(&self) -> usize {
         self.inner.resolution()
+    }
+
+    fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
+        if self.ome_images.is_empty() {
+            return None;
+        }
+        Some(crate::common::ome_metadata::OmeMetadata {
+            images: self.ome_images.clone(),
+            instruments: vec![crate::common::ome_metadata::OmeInstrument {
+                objectives: vec![crate::common::ome_metadata::OmeObjective::default()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        })
     }
 }
 
@@ -2372,6 +2566,32 @@ mod leica_scn_ventana_tests {
         assert_eq!(reader.open_bytes(0).unwrap(), vec![13]);
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn leica_scn_failed_reopen_clears_cached_ome_metadata() {
+        let good = temp_path("good_reopen", "scn");
+        let bad = temp_path("bad_reopen", "scn");
+        write_minimal_scn_tiff(
+            &good,
+            concat!(
+                r#"<scn><collection name="c"><image name="main"><pixels>"#,
+                r#"<dimension z="0" c="0" r="0" sizeX="1" sizeY="1" ifd="0"/>"#,
+                r#"</pixels></image></collection></scn>"#,
+            ),
+            1,
+        );
+        std::fs::write(&bad, b"not a tiff").unwrap();
+
+        let mut reader = LeicaScnReader::new();
+        reader.set_id(&good).unwrap();
+        assert!(reader.ome_metadata().is_some());
+
+        assert!(reader.set_id(&bad).is_err());
+        assert!(reader.ome_metadata().is_none());
+
+        let _ = std::fs::remove_file(good);
+        let _ = std::fs::remove_file(bad);
     }
 
     #[test]
@@ -11885,6 +12105,13 @@ mod ndpi_offset64_tests {
         push_u32_le(data, offset);
     }
 
+    fn push_ifd_float(data: &mut Vec<u8>, tag: u16, value: f32) {
+        push_u16_le(data, tag);
+        push_u16_le(data, 11);
+        push_u32_le(data, 1);
+        push_u32_le(data, value.to_bits());
+    }
+
     fn temp_ndpi_path(name: &str) -> PathBuf {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -11936,7 +12163,7 @@ mod ndpi_offset64_tests {
             } else {
                 None
             };
-            let entry_count = 10u16 + u16::from(spec.first) * 3;
+            let entry_count = 10u16 + u16::from(spec.first) * 5;
             let ifd_start = data.len() as u32;
             let after_ifd = ifd_start + 2 + u32::from(entry_count) * 12 + 4;
             let metadata_len = metadata.map(|s| s.len() as u32 + 1).unwrap_or(0);
@@ -11961,6 +12188,8 @@ mod ndpi_offset64_tests {
             push_ifd_short(&mut data, tag::PLANAR_CONFIGURATION, 1);
             if let Some(metadata) = metadata {
                 push_ifd_long(&mut data, NDPI_MARKER_TAG, 1);
+                push_ifd_float(&mut data, NDPI_X_POSITION, 12.5);
+                push_ifd_float(&mut data, NDPI_Y_POSITION, 25.0);
                 push_ifd_short(&mut data, NDPI_CAPTURE_MODE, capture_mode);
                 push_ifd_ascii(
                     &mut data,
@@ -12022,7 +12251,48 @@ mod ndpi_offset64_tests {
         assert!(macro_image.is_rgb);
         assert_eq!(macro_image.bits_per_pixel, 8);
 
+        let ome = reader.ome_metadata().unwrap();
+        assert_eq!(
+            ome.images
+                .iter()
+                .map(|image| image.planes.len())
+                .sum::<usize>(),
+            1
+        );
+        assert_eq!(ome.images[0].planes[0].position_x, Some(12.5));
+        assert_eq!(ome.images[0].planes[0].position_y, Some(25.0));
+
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn ndpi_pixel_layout_interleaves_rgb_delegate_bytes_for_band_selection() {
+        let meta = ImageMetadata {
+            is_rgb: true,
+            is_interleaved: false,
+            size_c: 3,
+            bits_per_pixel: 8,
+            ..Default::default()
+        };
+        let planar = vec![1, 2, 10, 20, 100, 110];
+        assert_eq!(
+            NdpiReader::ndpi_pixel_bytes_for_metadata(&meta, planar),
+            vec![1, 10, 100, 2, 20, 110],
+            "NDPI RGB delegate bytes are interleaved for Java-style band selection"
+        );
+    }
+
+    #[test]
+    fn ndpi_close_clears_cached_ome_metadata() {
+        let mut reader = NdpiReader::new();
+        reader
+            .ome_images
+            .push(crate::common::ome_metadata::OmeImage::default());
+        assert!(reader.ome_metadata().is_some());
+
+        reader.close().unwrap();
+
+        assert!(reader.ome_metadata().is_none());
     }
 
     #[test]
@@ -12122,6 +12392,19 @@ mod leica_scn_tests {
             images[1].dims.iter().map(|d| d.ifd).collect::<Vec<_>>(),
             vec![2]
         );
+    }
+
+    #[test]
+    fn scn_close_clears_cached_ome_metadata() {
+        let mut reader = LeicaScnReader::new();
+        reader
+            .ome_images
+            .push(crate::common::ome_metadata::OmeImage::default());
+        assert!(reader.ome_metadata().is_some());
+
+        reader.close().unwrap();
+
+        assert!(reader.ome_metadata().is_none());
     }
 }
 

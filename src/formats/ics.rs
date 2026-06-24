@@ -10,7 +10,6 @@ use std::path::{Path, PathBuf};
 
 use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
-use crate::common::path::confined_join;
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
 use crate::common::region::crop_full_plane;
@@ -115,6 +114,10 @@ impl IcsHeader {
                     _ => {}
                 },
                 "sensor" if tokens.len() >= 4 && tokens[1].eq_ignore_ascii_case("s_params") => {
+                    hdr.extra.insert(
+                        format!("sensor\ts_params\t{}", tokens[2]),
+                        tokens[3..].join(" "),
+                    );
                     match tokens[2].as_str() {
                         "LambdaEm" => {
                             hdr.em_waves = tokens[3..]
@@ -463,31 +466,14 @@ impl IcsReader {
         if hdr.version < 2.0 {
             // ICS1: the companion .ids lives next to the .ics on disk with the
             // same stem (Bio-Formats derives it from the actual file path, not
-            // from the `filename` recorded inside the header — that internal
-            // name may differ from the on-disk name). Match the .ics extension
-            // case so .ICS -> .IDS, .ics -> .ids.
-            let derived = match ics_path.extension().and_then(|e| e.to_str()) {
+            // from the `filename` recorded inside the header). Match the .ics
+            // extension case so .ICS -> .IDS, .ics -> .ids.
+            Ok(match ics_path.extension().and_then(|e| e.to_str()) {
                 Some(ext) if ext.chars().next().is_some_and(|c| c.is_ascii_uppercase()) => {
                     ics_path.with_extension("IDS")
                 }
                 _ => ics_path.with_extension("ids"),
-            };
-            if derived.exists() {
-                return Ok(derived);
-            }
-            // The sibling .ids is not present on disk; fall back to the
-            // header-recorded companion name when available (it may differ from
-            // the on-disk stem). Reject names that escape the image directory.
-            if let Some(filename) = &hdr.filename {
-                let name = filename.to_string_lossy();
-                return confined_join(ics_path.parent().unwrap_or_else(|| Path::new("")), &name)
-                    .ok_or_else(|| {
-                        BioFormatsError::Format(format!(
-                            "ICS companion filename escapes image directory: {name}"
-                        ))
-                    });
-            }
-            Ok(derived)
+            })
         } else {
             Ok(ics_path.to_path_buf())
         }
@@ -625,6 +611,7 @@ impl IcsReader {
 
             // Java ICSReader falls back to raw reads when a file declares gzip
             // compression but the stream is not actually gzip-compressed.
+            data.clear();
             let mut raw = File::open(&data_path).map_err(BioFormatsError::Io)?;
             raw.seek(SeekFrom::Start(data_offset))
                 .map_err(BioFormatsError::Io)?;
@@ -767,9 +754,19 @@ impl FormatReader for IcsReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.path = None;
+        self.header = None;
+        self.meta = None;
+
         let ics_path = Self::header_path(path);
         let hdr = IcsHeader::parse(&ics_path)?;
         let meta = build_metadata(&hdr)?;
+        if hdr.version < 2.0 {
+            let ids_path = Self::data_path(&ics_path, &hdr)?;
+            if !ids_path.exists() {
+                return Err(BioFormatsError::Format("IDS file not found.".into()));
+            }
+        }
         self.path = Some(ics_path);
         self.header = Some(hdr);
         self.meta = Some(meta);
@@ -836,9 +833,96 @@ impl FormatReader for IcsReader {
         let meta = self.meta.as_ref()?;
         let hdr = self.header.as_ref()?;
         let mut ome = crate::common::ome_metadata::OmeMetadata::from_image_metadata(meta);
+        if ome.instruments.is_empty() {
+            ome.instruments
+                .push(crate::common::ome_metadata::OmeInstrument {
+                    id: Some(crate::common::ome_metadata::create_lsid("Instrument", &[0])),
+                    objectives: vec![crate::common::ome_metadata::OmeObjective::default()],
+                    detectors: vec![crate::common::ome_metadata::OmeDetector::default()],
+                    ..Default::default()
+                });
+        }
+        let sensor_value = |name: &str| {
+            hdr.extra
+                .get(&format!("sensor\ts_params\t{name}"))
+                .map(String::as_str)
+        };
+        let sensor_f64 =
+            |name: &str| sensor_value(name).and_then(|value| value.parse::<f64>().ok());
+        if let Some(instrument) = ome.instruments.get_mut(0) {
+            if instrument.microscope_model.is_none() {
+                instrument.microscope_model = hdr.extra.get("sensor\ttype").cloned();
+            }
+            if instrument.objectives.is_empty() {
+                instrument
+                    .objectives
+                    .push(crate::common::ome_metadata::OmeObjective::default());
+            }
+            if let Some(objective) = instrument.objectives.get_mut(0) {
+                if objective.id.is_none() {
+                    objective.id = Some(crate::common::ome_metadata::create_lsid(
+                        "Objective",
+                        &[0, 0],
+                    ));
+                }
+                if objective.lens_na.is_none() {
+                    objective.lens_na = sensor_f64("NumAperture").filter(|v| *v > 0.0);
+                }
+                if objective.immersion.is_none() {
+                    objective.immersion = sensor_f64("RefrInxMedium")
+                        .map(|ri| if ri > 1.1 { "Oil" } else { "Air" }.to_string());
+                }
+            }
+            if instrument.detectors.is_empty() {
+                instrument
+                    .detectors
+                    .push(crate::common::ome_metadata::OmeDetector::default());
+            }
+            if let Some(detector) = instrument.detectors.get_mut(0) {
+                if detector.id.is_none() {
+                    detector.id = Some(crate::common::ome_metadata::create_lsid(
+                        "Detector",
+                        &[0, 0],
+                    ));
+                }
+                if detector.offset.is_none() {
+                    detector.offset = sensor_f64("DetectorBaseline").filter(|v| v.is_finite());
+                }
+                if detector.gain.is_none() {
+                    detector.gain = sensor_f64("DetectorSensitivity[0]").filter(|v| *v > 0.0);
+                }
+            }
+        }
         let img = ome.images.get_mut(0)?;
 
         img.name = hdr.image_name.clone();
+        img.instrument_ref = Some(0);
+        img.objective_ref = Some(0);
+        if img.planes.is_empty() {
+            let effective_c = if meta.is_rgb { 1 } else { meta.size_c.max(1) };
+            for t in 0..meta.size_t.max(1) {
+                for c in 0..effective_c {
+                    for z in 0..meta.size_z.max(1) {
+                        img.planes.push(crate::common::ome_metadata::OmePlane {
+                            the_z: z,
+                            the_c: c,
+                            the_t: t,
+                            delta_t: None,
+                            exposure_time: None,
+                            position_x: None,
+                            position_y: None,
+                            position_z: None,
+                        });
+                    }
+                }
+            }
+        }
+        for ch in &mut img.channels {
+            ch.detector_ref = Some("Detector:0".into());
+            if ch.pinhole_size.is_none() {
+                ch.pinhole_size = sensor_f64("PinholeRadius").filter(|v| *v > 0.0);
+            }
+        }
 
         // Physical sizes from `parameter scale`, gated on micrometre units, with
         // axis labels taken from `layout order` (Java ICSReader uses `axes`).
@@ -945,6 +1029,215 @@ impl FormatReader for IcsReader {
         });
 
         Some(ome)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp_dir(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("bioformats_ics_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn failed_reopen_clears_previous_reader_state() {
+        let dir = tmp_dir("failed_reopen");
+        let valid_ics = dir.join("valid_then_bad.ics");
+        let valid_companion = dir.join("valid_then_bad.ids");
+        let bad_ics = dir.join("bad_after_valid.ics");
+
+        std::fs::write(
+            &valid_ics,
+            "ics_version\t1.0\nlayout\torder\tbits x y\nlayout\tsizes\t8 2 1\nlayout\tsignificant_bits\t8\nrepresentation\tformat\tinteger\nrepresentation\tsign\tunsigned\nrepresentation\tbyte_order\t1 2 3 4\nrepresentation\tcompression\tuncompressed\n",
+        )
+        .unwrap();
+        std::fs::write(&valid_companion, [3, 4]).unwrap();
+        std::fs::write(
+            &bad_ics,
+            "ics_version\t1.0\nlayout\torder\tbits x y\nlayout\tsizes\t8 1 1\nlayout\tsignificant_bits\t8\nrepresentation\tformat\tinteger\nrepresentation\tsign\tunsigned\nrepresentation\tbyte_order\t1 2 3 4\nrepresentation\tcompression\tuncompressed\n",
+        )
+        .unwrap();
+
+        let mut reader = IcsReader::new();
+        reader.set_id(&valid_ics).unwrap();
+        assert_eq!(reader.metadata().size_x, 2);
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![3, 4]);
+
+        let err = reader.set_id(&bad_ics).unwrap_err();
+        assert!(
+            err.to_string().contains("IDS file not found"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(reader.metadata().size_x, 0);
+        assert!(reader.ome_metadata().is_none());
+        assert!(reader.open_bytes(0).is_err());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn ics1_requires_same_stem_ids_and_keeps_header_filename_as_image_name() {
+        let dir = tmp_dir("same_stem");
+        let ics = dir.join("same_stem_required.ics");
+        let matching_companion = dir.join("same_stem_required.ids");
+        let mismatched_companion = dir.join("same_stem_required_pixels.ids");
+
+        let header = format!(
+            "ics_version\t1.0\nfilename\tfolder/{}\nlayout\torder\tbits x y\nlayout\tsizes\t8 2 2\nlayout\tsignificant_bits\t8\nrepresentation\tformat\tinteger\nrepresentation\tsign\tunsigned\nrepresentation\tbyte_order\t1 2 3 4\nrepresentation\tcompression\tuncompressed\n",
+            mismatched_companion.file_name().unwrap().to_string_lossy()
+        );
+        std::fs::write(&ics, header).unwrap();
+        std::fs::write(&mismatched_companion, [9, 9, 9, 9]).unwrap();
+
+        let mut reader = IcsReader::new();
+        let err = reader.set_id(&ics).unwrap_err();
+        assert!(
+            err.to_string().contains("IDS file not found"),
+            "unexpected error: {err}"
+        );
+
+        std::fs::write(&matching_companion, [1, 2, 3, 4]).unwrap();
+        reader.set_id(&ics).unwrap();
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 3, 4]);
+        assert_eq!(reader.open_bytes_region(0, 1, 1, 1, 1).unwrap(), vec![4]);
+
+        let ome = reader.ome_metadata().unwrap();
+        assert_eq!(
+            ome.images.first().unwrap().name.as_deref(),
+            mismatched_companion
+                .file_name()
+                .and_then(|name| name.to_str())
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn ics2_embedded_pixels_ignore_header_filename_and_need_no_companion() {
+        let dir = tmp_dir("ics2_embedded");
+        let ics = dir.join("embedded.ics");
+        let misleading_companion = dir.join("embedded.ids");
+
+        let header = format!(
+            "ics_version\t2.0\nfilename\t{}\nlayout\torder\tbits x y\nlayout\tsizes\t8 3 2\nlayout\tsignificant_bits\t8\nrepresentation\tformat\tinteger\nrepresentation\tsign\tunsigned\nrepresentation\tbyte_order\t1 2 3 4\nrepresentation\tcompression\tuncompressed\nend\n",
+            misleading_companion.file_name().unwrap().to_string_lossy()
+        );
+        let mut contents = header.into_bytes();
+        contents.extend_from_slice(&[1, 2, 3, 4, 5, 6]);
+        std::fs::write(&ics, contents).unwrap();
+
+        let mut reader = IcsReader::new();
+        reader.set_id(&ics).unwrap();
+        assert_eq!(reader.metadata().image_count, 1);
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(reader.open_bytes_region(0, 1, 1, 2, 1).unwrap(), vec![5, 6]);
+
+        let ome = reader.ome_metadata().unwrap();
+        assert_eq!(
+            ome.images.first().unwrap().name.as_deref(),
+            misleading_companion
+                .file_name()
+                .and_then(|name| name.to_str())
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rgb_ome_planes_match_logical_image_count_and_nonzero_region() {
+        let dir = tmp_dir("rgb_ome");
+        let ics = dir.join("rgb_ome_planes.ics");
+        let companion = dir.join("rgb_ome_planes.ids");
+
+        let header = format!(
+            "ics_version\t1.0\nfilename\t{}\nlayout\torder\tbits ch x y\nlayout\tsizes\t8 3 2 1\nlayout\tsignificant_bits\t8\nrepresentation\tformat\tinteger\nrepresentation\tsign\tunsigned\nrepresentation\tbyte_order\t1 2 3 4\nrepresentation\tcompression\tuncompressed\n",
+            companion.file_name().unwrap().to_string_lossy()
+        );
+        std::fs::write(&ics, header).unwrap();
+        std::fs::write(&companion, [1, 2, 3, 4, 5, 6]).unwrap();
+
+        let mut reader = IcsReader::new();
+        reader.set_id(&ics).unwrap();
+        assert!(reader.metadata().is_rgb);
+        assert!(reader.metadata().is_interleaved);
+        assert_eq!(reader.metadata().size_c, 3);
+        assert_eq!(reader.metadata().image_count, 1);
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(
+            reader.open_bytes_region(0, 1, 0, 1, 1).unwrap(),
+            vec![4, 5, 6]
+        );
+
+        let ome = reader.ome_metadata().unwrap();
+        let image = ome.images.first().unwrap();
+        assert_eq!(image.channels.len(), 1);
+        assert_eq!(image.channels[0].samples_per_pixel, 3);
+        assert_eq!(image.planes.len(), 1);
+        assert_eq!(
+            (
+                image.planes[0].the_z,
+                image.planes[0].the_c,
+                image.planes[0].the_t
+            ),
+            (0, 0, 0)
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn stored_rgb_with_emission_waves_becomes_separate_channel_planes() {
+        let dir = tmp_dir("stored_rgb_waves");
+        let ics = dir.join("stored_rgb_with_waves.ics");
+        let companion = dir.join("stored_rgb_with_waves.ids");
+
+        let header = format!(
+            "ics_version\t1.0\nfilename\t{}\nlayout\torder\tbits ch x y\nlayout\tsizes\t8 2 2 1\nlayout\tsignificant_bits\t8\nrepresentation\tformat\tinteger\nrepresentation\tsign\tunsigned\nrepresentation\tbyte_order\t1 2 3 4\nrepresentation\tcompression\tuncompressed\nsensor\ts_params\tLambdaEm\t510 620\n",
+            companion.file_name().unwrap().to_string_lossy()
+        );
+        std::fs::write(&ics, header).unwrap();
+        std::fs::write(&companion, [1, 11, 2, 12]).unwrap();
+
+        let mut reader = IcsReader::new();
+        reader.set_id(&ics).unwrap();
+        assert!(!reader.metadata().is_rgb);
+        assert_eq!(reader.metadata().size_c, 2);
+        assert_eq!(reader.metadata().image_count, 2);
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2]);
+        assert_eq!(reader.open_bytes(1).unwrap(), vec![11, 12]);
+        assert_eq!(reader.open_bytes_region(1, 1, 0, 1, 1).unwrap(), vec![12]);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn declared_gzip_fallback_replaces_partial_decoder_output() {
+        let dir = tmp_dir("gzip_fallback");
+        let ics = dir.join("fallback.ics");
+
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut encoder, &[9, 8, 7, 6]).unwrap();
+        let mut invalid_gzip = encoder.finish().unwrap();
+        invalid_gzip.truncate(invalid_gzip.len() - 4);
+
+        let header = format!(
+            "ics_version\t2.0\nlayout\torder\tbits x y\nlayout\tsizes\t8 {} 1\nlayout\tsignificant_bits\t8\nrepresentation\tformat\tinteger\nrepresentation\tsign\tunsigned\nrepresentation\tbyte_order\t1 2 3 4\nrepresentation\tcompression\tgzip\nend\n",
+            invalid_gzip.len()
+        );
+        let mut contents = header.into_bytes();
+        contents.extend_from_slice(&invalid_gzip);
+        std::fs::write(&ics, contents).unwrap();
+
+        let mut reader = IcsReader::new();
+        reader.set_id(&ics).unwrap();
+        assert_eq!(reader.open_bytes(0).unwrap(), invalid_gzip);
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
 

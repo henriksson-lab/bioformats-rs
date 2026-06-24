@@ -13795,6 +13795,7 @@ impl FormatReader for PovrayReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.close()?;
         let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
         if data.len() < 6 {
             return Err(BioFormatsError::Format(
@@ -13883,14 +13884,14 @@ impl FormatReader for PovrayReader {
     }
 
     fn series_count(&self) -> usize {
-        1
+        usize::from(self.meta.is_some())
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 {
-            Err(BioFormatsError::SeriesOutOfRange(s))
-        } else {
+        if self.meta.is_some() && s == 0 {
             Ok(())
+        } else {
+            Err(BioFormatsError::SeriesOutOfRange(s))
         }
     }
 
@@ -13992,6 +13993,43 @@ impl FormatReader for PovrayReader {
         } else {
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod povray_tests {
+    use super::*;
+
+    #[test]
+    fn failed_second_set_id_clears_previous_grid() {
+        let good =
+            std::env::temp_dir().join(format!("bioformats_df3_good_{}.df3", std::process::id()));
+        let bad =
+            std::env::temp_dir().join(format!("bioformats_df3_bad_{}.df3", std::process::id()));
+
+        let mut df3 = Vec::new();
+        df3.extend_from_slice(&1u16.to_be_bytes());
+        df3.extend_from_slice(&1u16.to_be_bytes());
+        df3.extend_from_slice(&1u16.to_be_bytes());
+        df3.push(9);
+        std::fs::write(&good, df3).unwrap();
+        std::fs::write(&bad, [0u8; 3]).unwrap();
+
+        let mut reader = PovrayReader::new();
+        reader.set_id(&good).unwrap();
+        assert_eq!(reader.series_count(), 1);
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![9]);
+
+        assert!(reader.set_id(&bad).is_err());
+        assert_eq!(reader.series_count(), 0);
+        assert!(reader.set_series(0).is_err());
+        assert!(matches!(
+            reader.open_bytes(0),
+            Err(BioFormatsError::NotInitialized)
+        ));
+
+        std::fs::remove_file(good).ok();
+        std::fs::remove_file(bad).ok();
     }
 }
 

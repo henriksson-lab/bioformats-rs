@@ -8985,7 +8985,7 @@ fn ndpis_merges_pyramid_channels_but_keeps_extras_from_first_ndpi() {
 
     let mut reader = bioformats::formats::flim2::NdpisReader::new();
     assert!(reader.is_this_type_by_name(&ndpis));
-    assert!(reader.is_this_type_by_bytes(b"not checked by Java"));
+    assert!(!reader.is_this_type_by_bytes(b"not checked by Rust routing"));
     reader.set_id(&ndpis).unwrap();
 
     assert_eq!(reader.series_count(), 3);
@@ -9144,19 +9144,26 @@ fn ics_round_trip_gray16() {
 }
 
 #[test]
-fn ics1_uses_explicit_companion_filename() {
-    let ics = tmp("explicit_companion.ics");
-    let companion = tmp("explicit_companion_pixels.ids");
-    let derived = tmp("explicit_companion.ids");
-    let _ = std::fs::remove_file(&derived);
+fn ics1_requires_same_stem_ids_companion_like_java() {
+    let ics = tmp("same_stem_required.ics");
+    let matching_companion = tmp("same_stem_required.ids");
+    let mismatched_companion = tmp("same_stem_required_pixels.ids");
+    let _ = std::fs::remove_file(&matching_companion);
 
     let header = format!(
         "ics_version\t1.0\nfilename\t{}\nlayout\torder\tbits x y\nlayout\tsizes\t8 2 2\nlayout\tsignificant_bits\t8\nrepresentation\tformat\tinteger\nrepresentation\tsign\tunsigned\nrepresentation\tbyte_order\t1 2 3 4\nrepresentation\tcompression\tuncompressed\n",
-        companion.file_name().unwrap().to_string_lossy()
+        mismatched_companion.file_name().unwrap().to_string_lossy()
     );
     std::fs::write(&ics, header).unwrap();
-    std::fs::write(&companion, [1, 2, 3, 4]).unwrap();
+    std::fs::write(&mismatched_companion, [9, 9, 9, 9]).unwrap();
 
+    let err = ImageReader::open(&ics).unwrap_err();
+    assert!(
+        err.to_string().contains("IDS file not found"),
+        "unexpected error: {err}"
+    );
+
+    std::fs::write(&matching_companion, [1, 2, 3, 4]).unwrap();
     let mut reader = ImageReader::open(&ics).unwrap();
     assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 3, 4]);
 }
@@ -9181,20 +9188,52 @@ fn ics1_can_be_opened_from_ids_companion() {
 }
 
 #[test]
-fn ics1_rejects_companion_filename_that_escapes_directory() {
-    let ics = tmp("escaped_companion.ics");
-    std::fs::write(
-        &ics,
-        "ics_version\t1.0\nfilename\t../escaped.ids\nlayout\torder\tbits x y\nlayout\tsizes\t8 1 1\nlayout\tsignificant_bits\t8\nrepresentation\tformat\tinteger\nrepresentation\tsign\tunsigned\nrepresentation\tbyte_order\t1 2 3 4\nrepresentation\tcompression\tuncompressed\n",
-    )
-    .unwrap();
+fn ics2_embedded_pixels_ignore_header_filename_and_need_no_companion() {
+    let ics = tmp("ics2_embedded_pixels.ics");
+    let misleading_companion = tmp("ics2_embedded_pixels.ids");
+    let _ = std::fs::remove_file(&misleading_companion);
+
+    let header = format!(
+        "ics_version\t2.0\nfilename\t{}\nlayout\torder\tbits x y\nlayout\tsizes\t8 3 2\nlayout\tsignificant_bits\t8\nrepresentation\tformat\tinteger\nrepresentation\tsign\tunsigned\nrepresentation\tbyte_order\t1 2 3 4\nrepresentation\tcompression\tuncompressed\nend\n",
+        misleading_companion.file_name().unwrap().to_string_lossy()
+    );
+    let mut contents = header.into_bytes();
+    contents.extend_from_slice(&[1, 2, 3, 4, 5, 6]);
+    std::fs::write(&ics, contents).unwrap();
 
     let mut reader = ImageReader::open(&ics).unwrap();
-    let err = reader.open_bytes(0).unwrap_err();
-    assert!(
-        err.to_string().contains("escapes image directory"),
-        "unexpected error: {err}"
+    assert_eq!(reader.metadata().image_count, 1);
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 3, 4, 5, 6]);
+    assert_eq!(reader.open_bytes_region(0, 1, 1, 2, 1).unwrap(), vec![5, 6]);
+
+    let ome = reader.ome_metadata().unwrap();
+    assert_eq!(
+        ome.images.first().unwrap().name.as_deref(),
+        misleading_companion
+            .file_name()
+            .and_then(|name| name.to_str())
     );
+}
+
+#[test]
+fn ics_declared_gzip_fallback_replaces_partial_decoder_output() {
+    let ics = tmp("gzip_fallback_partial.ics");
+
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    std::io::Write::write_all(&mut encoder, &[9, 8, 7, 6]).unwrap();
+    let mut invalid_gzip = encoder.finish().unwrap();
+    invalid_gzip.truncate(invalid_gzip.len() - 4);
+
+    let header = format!(
+        "ics_version\t2.0\nlayout\torder\tbits x y\nlayout\tsizes\t8 {} 1\nlayout\tsignificant_bits\t8\nrepresentation\tformat\tinteger\nrepresentation\tsign\tunsigned\nrepresentation\tbyte_order\t1 2 3 4\nrepresentation\tcompression\tgzip\nend\n",
+        invalid_gzip.len()
+    );
+    let mut contents = header.into_bytes();
+    contents.extend_from_slice(&invalid_gzip);
+    std::fs::write(&ics, contents).unwrap();
+
+    let mut reader = ImageReader::open(&ics).unwrap();
+    assert_eq!(reader.open_bytes(0).unwrap(), invalid_gzip);
 }
 
 #[test]
@@ -9284,6 +9323,98 @@ fn ics_stored_rgb_with_emission_waves_becomes_separate_channels_like_java() {
     assert_eq!(reader.metadata().image_count, 2);
     assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2]);
     assert_eq!(reader.open_bytes(1).unwrap(), vec![11, 12]);
+}
+
+#[test]
+fn ics_rgb_ome_planes_match_logical_image_count() {
+    let ics = tmp("rgb_ome_planes.ics");
+    let companion = tmp("rgb_ome_planes.ids");
+
+    let header = format!(
+        "ics_version\t1.0\nfilename\t{}\nlayout\torder\tbits ch x y\nlayout\tsizes\t8 3 2 1\nlayout\tsignificant_bits\t8\nrepresentation\tformat\tinteger\nrepresentation\tsign\tunsigned\nrepresentation\tbyte_order\t1 2 3 4\nrepresentation\tcompression\tuncompressed\n",
+        companion.file_name().unwrap().to_string_lossy()
+    );
+    std::fs::write(&ics, header).unwrap();
+    std::fs::write(&companion, [1, 2, 3, 4, 5, 6]).unwrap();
+
+    let mut reader = ImageReader::open(&ics).unwrap();
+    assert!(reader.metadata().is_rgb);
+    assert!(reader.metadata().is_interleaved);
+    assert_eq!(reader.metadata().size_c, 3);
+    assert_eq!(reader.metadata().image_count, 1);
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 3, 4, 5, 6]);
+
+    let ome = reader.ome_metadata().unwrap();
+    let image = ome.images.first().unwrap();
+    assert_eq!(image.channels.len(), 1);
+    assert_eq!(image.channels[0].samples_per_pixel, 3);
+    assert_eq!(image.planes.len(), 1);
+    assert_eq!(
+        (
+            image.planes[0].the_z,
+            image.planes[0].the_c,
+            image.planes[0].the_t
+        ),
+        (0, 0, 0)
+    );
+}
+
+#[test]
+fn ics_header_filename_sets_image_name_without_controlling_companion() {
+    let ics = tmp("header_name_only.ics");
+    let companion = tmp("header_name_only.ids");
+    let wrong_companion = tmp("header_name_only_pixels.ids");
+
+    let header = format!(
+        "ics_version\t1.0\nfilename\tfolder/{}\nlayout\torder\tbits x y\nlayout\tsizes\t8 1 1\nlayout\tsignificant_bits\t8\nrepresentation\tformat\tinteger\nrepresentation\tsign\tunsigned\nrepresentation\tbyte_order\t1 2 3 4\nrepresentation\tcompression\tuncompressed\n",
+        wrong_companion.file_name().unwrap().to_string_lossy()
+    );
+    std::fs::write(&ics, header).unwrap();
+    std::fs::write(&companion, [42]).unwrap();
+    std::fs::write(&wrong_companion, [7]).unwrap();
+
+    let mut reader = ImageReader::open(&ics).unwrap();
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![42]);
+    let ome = reader.ome_metadata().unwrap();
+    assert_eq!(
+        ome.images.first().unwrap().name.as_deref(),
+        wrong_companion.file_name().and_then(|name| name.to_str())
+    );
+}
+
+#[test]
+fn ics_failed_reopen_clears_previous_reader_state() {
+    let valid_ics = tmp("valid_then_bad.ics");
+    let valid_companion = tmp("valid_then_bad.ids");
+    let bad_ics = tmp("bad_after_valid.ics");
+    let missing_bad_companion = tmp("bad_after_valid.ids");
+    let _ = std::fs::remove_file(&missing_bad_companion);
+
+    std::fs::write(
+        &valid_ics,
+        "ics_version\t1.0\nlayout\torder\tbits x y\nlayout\tsizes\t8 2 1\nlayout\tsignificant_bits\t8\nrepresentation\tformat\tinteger\nrepresentation\tsign\tunsigned\nrepresentation\tbyte_order\t1 2 3 4\nrepresentation\tcompression\tuncompressed\n",
+    )
+    .unwrap();
+    std::fs::write(&valid_companion, [3, 4]).unwrap();
+    std::fs::write(
+        &bad_ics,
+        "ics_version\t1.0\nlayout\torder\tbits x y\nlayout\tsizes\t8 1 1\nlayout\tsignificant_bits\t8\nrepresentation\tformat\tinteger\nrepresentation\tsign\tunsigned\nrepresentation\tbyte_order\t1 2 3 4\nrepresentation\tcompression\tuncompressed\n",
+    )
+    .unwrap();
+
+    let mut reader = bioformats::formats::ics::IcsReader::new();
+    reader.set_id(&valid_ics).unwrap();
+    assert_eq!(reader.metadata().size_x, 2);
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![3, 4]);
+
+    let err = reader.set_id(&bad_ics).unwrap_err();
+    assert!(
+        err.to_string().contains("IDS file not found"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(reader.metadata().size_x, 0);
+    assert!(reader.ome_metadata().is_none());
+    assert!(reader.open_bytes(0).is_err());
 }
 
 #[test]

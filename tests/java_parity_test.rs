@@ -100,6 +100,17 @@ fn testdata(rel: &str) -> PathBuf {
         .join(rel)
 }
 
+fn parity_input_path(input: &str) -> PathBuf {
+    let path = Path::new(input);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else if path.exists() {
+        path.to_path_buf()
+    } else {
+        testdata(input)
+    }
+}
+
 fn jar_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("bioformats_package.jar")
 }
@@ -391,6 +402,7 @@ fn java_parity() {
         return;
     }
     let strict = env::var("BIOFORMATS_RS_JAVA_PARITY_STRICT").as_deref() == Ok("1");
+    let no_pixels = env::var("BIOFORMATS_RS_JAVA_PARITY_NO_PIXELS").as_deref() == Ok("1");
     // Optional comma-separated substring filter, so a worker can verify just its
     // own files quickly: BIOFORMATS_RS_JAVA_PARITY_FILES="lsm/,nd2/"
     let filter = env::var("BIOFORMATS_RS_JAVA_PARITY_FILES").unwrap_or_default();
@@ -411,11 +423,21 @@ fn java_parity() {
     let mut new_findings: Vec<String> = Vec::new();
     let mut checked = 0u32;
 
-    for rel in FILES {
+    let extra = env::var("BIOFORMATS_RS_JAVA_PARITY_EXTRA_FILES").unwrap_or_default();
+    let mut inputs: Vec<String> = FILES.iter().map(|s| (*s).to_string()).collect();
+    inputs.extend(
+        extra
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+    );
+
+    for rel in &inputs {
         if !filters.is_empty() && !filters.iter().any(|f| rel.contains(f)) {
             continue;
         }
-        let path = testdata(rel);
+        let path = parity_input_path(rel);
         if !path.exists() {
             eprintln!("skip (absent): {rel}");
             continue;
@@ -586,6 +608,11 @@ fn java_parity() {
                 println!("  s{si} core ✗  {}", core_diffs.join("; "));
                 score.core_bad += 1;
                 core_failures.push(format!("{rel} s{si}: {}", core_diffs.join("; ")));
+            }
+
+            if no_pixels {
+                println!("  s{si} pixels — skipped by BIOFORMATS_RS_JAVA_PARITY_NO_PIXELS=1");
+                continue;
             }
 
             // ---- pixels: multi-region compare per plane ----

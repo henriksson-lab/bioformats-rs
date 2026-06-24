@@ -351,6 +351,7 @@ impl FormatReader for QtReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.close()?;
         let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
         let parsed = parse_quicktime(&data)?;
         self.path = Some(path.to_path_buf());
@@ -6620,6 +6621,7 @@ impl FormatReader for Jpeg2000Reader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.close()?;
         let file_data = std::fs::read(path).map_err(BioFormatsError::Io)?;
         let image = jpeg2k::Image::from_bytes(&file_data)
             .map_err(|e| BioFormatsError::Codec(format!("JPEG 2000: {e}")))?;
@@ -6814,6 +6816,39 @@ mod jpeg2000_tests {
         append_jpeg2000_sample(&mut out, -2, 2, true);
         append_jpeg2000_sample(&mut out, 0x01020304, 4, false);
         assert_eq!(out, vec![0x12, 0x34, 0xff, 0xfe, 0x01, 0x02, 0x03, 0x04]);
+    }
+
+    #[test]
+    fn failed_second_set_id_clears_previous_state() {
+        let bad = std::env::temp_dir().join(format!(
+            "bioformats_jpeg2000_bad_{}.jp2",
+            std::process::id()
+        ));
+        std::fs::write(&bad, b"not a jp2").unwrap();
+
+        let mut reader = Jpeg2000Reader::new();
+        reader.path = Some(PathBuf::from("previous.jp2"));
+        reader.meta = Some(ImageMetadata {
+            size_x: 1,
+            size_y: 1,
+            size_z: 1,
+            size_c: 1,
+            size_t: 1,
+            pixel_type: PixelType::Uint8,
+            bits_per_pixel: 8,
+            image_count: 1,
+            dimension_order: DimensionOrder::XYCZT,
+            ..ImageMetadata::default()
+        });
+        reader.pixel_data = Some(vec![9]);
+
+        assert!(reader.set_id(&bad).is_err());
+        assert!(matches!(
+            reader.open_bytes(0),
+            Err(BioFormatsError::NotInitialized)
+        ));
+
+        std::fs::remove_file(bad).ok();
     }
 }
 
@@ -7852,6 +7887,40 @@ mod qt_writer_tests {
         let mut header = [0u8; 64];
         header[12..16].copy_from_slice(b"imag");
         assert!(!reader.is_this_type_by_bytes(&header));
+    }
+
+    #[test]
+    fn reader_failed_second_set_id_clears_previous_movie() {
+        let meta = rgb_meta(1, 1, 1);
+        let good = std::env::temp_dir().join(format!(
+            "bioformats_qtreader_good_{}.mov",
+            std::process::id()
+        ));
+        let bad = std::env::temp_dir().join(format!(
+            "bioformats_qtreader_bad_{}.mov",
+            std::process::id()
+        ));
+
+        let mut writer = QtWriter::new();
+        writer.set_metadata(&meta).unwrap();
+        writer.set_id(&good).unwrap();
+        writer.save_bytes(0, &[1, 2, 3]).unwrap();
+        writer.close().unwrap();
+        std::fs::write(&bad, b"not a movie").unwrap();
+
+        let mut reader = QtReader::new();
+        reader.set_id(&good).unwrap();
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 3]);
+
+        assert!(reader.set_id(&bad).is_err());
+        assert_eq!(reader.series_count(), 0);
+        assert!(matches!(
+            reader.open_bytes(0),
+            Err(BioFormatsError::NotInitialized)
+        ));
+
+        let _ = std::fs::remove_file(good);
+        let _ = std::fs::remove_file(bad);
     }
 
     /// The lossy/encoded codecs are encoder-blocked; non-UINT8 input is rejected

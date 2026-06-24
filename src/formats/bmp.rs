@@ -19,6 +19,7 @@ const BMP_RAW: u32 = 0;
 const BMP_RLE_8: u32 = 1;
 const BMP_RLE_4: u32 = 2;
 const BMP_BITFIELDS: u32 = 3;
+const MAX_COMPRESSED_BMP_DECODE_BYTES: usize = 512 * 1024 * 1024;
 
 impl BmpReader {
     pub fn new() -> Self {
@@ -41,6 +42,22 @@ fn rd_i32(b: &[u8], off: usize) -> i32 {
 }
 fn rd_i16(b: &[u8], off: usize) -> i16 {
     i16::from_le_bytes([b[off], b[off + 1]])
+}
+
+fn bmp_abs_dimension(value: i32, axis: &str) -> Result<(u32, bool)> {
+    if value == i32::MIN {
+        return Err(BioFormatsError::InvalidData(format!(
+            "BMP: {axis} dimension is out of range"
+        )));
+    }
+    let invert = value < 0;
+    let abs = value.abs();
+    if abs < 1 {
+        return Err(BioFormatsError::InvalidData(format!(
+            "BMP: {axis} dimension must be non-zero"
+        )));
+    }
+    Ok((abs as u32, invert))
 }
 
 struct MsbBitReader<'a> {
@@ -98,21 +115,16 @@ fn load_bmp(path: &Path) -> Result<(ImageMetadata, Vec<u8>)> {
     }
 
     // Second header (40-byte BITMAPINFOHEADER): headerSize(4) then dims.
-    let mut size_x = rd_i32(&data, 18);
-    let mut size_y = rd_i32(&data, 22);
-    let mut invert_y = false;
-    if size_x < 1 {
-        size_x = size_x.abs();
-    }
-    if size_y < 1 {
-        size_y = size_y.abs();
-        invert_y = true;
-    }
-    let size_x = size_x as u32;
-    let size_y = size_y as u32;
+    let (size_x, _) = bmp_abs_dimension(rd_i32(&data, 18), "width")?;
+    let (size_y, invert_y) = bmp_abs_dimension(rd_i32(&data, 22), "height")?;
 
     let _color_planes = rd_i16(&data, 26);
     let bpp_total = rd_i16(&data, 28) as i32; // bits per pixel (all channels)
+    if !matches!(bpp_total, 1 | 4 | 8 | 16 | 24 | 32) {
+        return Err(BioFormatsError::InvalidData(format!(
+            "BMP: unsupported bits per pixel {bpp_total}"
+        )));
+    }
     let mut bpp = bpp_total;
     let compression = rd_i32(&data, 30) as u32;
     let pixel_size_x = rd_i32(&data, 38);
@@ -121,6 +133,11 @@ fn load_bmp(path: &Path) -> Result<(ImageMetadata, Vec<u8>)> {
 
     if n_colors == 0 && bpp != 32 && bpp != 24 {
         n_colors = if bpp < 8 { 1 << bpp } else { 256 };
+    }
+    if !(0..=256).contains(&n_colors) {
+        return Err(BioFormatsError::InvalidData(format!(
+            "BMP: invalid palette color count {n_colors}"
+        )));
     }
 
     // Palette begins after the 14+40 = 54-byte header.
@@ -173,15 +190,49 @@ fn load_bmp(path: &Path) -> Result<(ImageMetadata, Vec<u8>)> {
     let h = size_y as usize;
 
     // Output: interleaved, effective_c samples per pixel, row-major top-to-bottom.
-    let out_len = w * h * effective_c * bytes_per_sample;
+    let out_len = w
+        .checked_mul(h)
+        .and_then(|v| v.checked_mul(effective_c))
+        .and_then(|v| v.checked_mul(bytes_per_sample))
+        .ok_or_else(|| BioFormatsError::InvalidData("BMP: image buffer size overflows".into()))?;
+    if compression != BMP_RAW && out_len > MAX_COMPRESSED_BMP_DECODE_BYTES {
+        return Err(BioFormatsError::InvalidData(
+            "BMP: decoded image is too large".into(),
+        ));
+    }
+
+    let raw_layout = if compression == BMP_RAW {
+        // Row length in bytes for the source data (per Java: sizeX * (indexed?1:sizeC) * bpp / 8).
+        let row_bits = w
+            .checked_mul(effective_c)
+            .and_then(|v| v.checked_mul(bpp_u))
+            .ok_or_else(|| BioFormatsError::InvalidData("BMP: row size overflows".into()))?;
+        let row_bytes = row_bits.div_ceil(8);
+        // Rows are padded to a 4-byte boundary.
+        let padded_row = row_bytes
+            .checked_add(3)
+            .map(|v| v & !3)
+            .ok_or_else(|| BioFormatsError::InvalidData("BMP: padded row size overflows".into()))?;
+        let expected_payload = padded_row
+            .checked_mul(h)
+            .ok_or_else(|| BioFormatsError::InvalidData("BMP: pixel data size overflows".into()))?;
+        let expected_end = global.checked_add(expected_payload).ok_or_else(|| {
+            BioFormatsError::InvalidData("BMP: pixel data end offset overflows".into())
+        })?;
+        if expected_end > data.len() {
+            return Err(BioFormatsError::InvalidData(
+                "BMP: pixel data is shorter than expected".into(),
+            ));
+        }
+        Some((row_bytes, padded_row))
+    } else {
+        None
+    };
+
     let mut buf = vec![0u8; out_len];
 
     if compression == BMP_RAW {
-        // Row length in bytes for the source data (per Java: sizeX * (indexed?1:sizeC) * bpp / 8).
-        let row_bits = w * effective_c * bpp_u;
-        let row_bytes = row_bits.div_ceil(8);
-        // Rows are padded to a 4-byte boundary.
-        let padded_row = (row_bytes + 3) & !3;
+        let (row_bytes, padded_row) = raw_layout.expect("raw BMP layout was computed");
         let mut pos = global;
         // BMP stores rows bottom-up unless invert_y.
         for src_row in 0..h {
@@ -219,7 +270,9 @@ fn load_bmp(path: &Path) -> Result<(ImageMetadata, Vec<u8>)> {
                     }
                 }
             }
-            pos += padded_row;
+            pos = pos.checked_add(padded_row).ok_or_else(|| {
+                BioFormatsError::InvalidData("BMP: pixel row offset overflow".into())
+            })?;
             if pos > data.len() {
                 pos = data.len();
             }
@@ -417,6 +470,7 @@ impl FormatReader for BmpReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.close()?;
         let (meta, pixels) = load_bmp(path)?;
         self.path = Some(path.to_path_buf());
         self.meta = Some(meta);
@@ -432,10 +486,10 @@ impl FormatReader for BmpReader {
     }
 
     fn series_count(&self) -> usize {
-        1
+        usize::from(self.meta.is_some())
     }
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 {
+        if self.meta.is_none() || s != 0 {
             Err(BioFormatsError::SeriesOutOfRange(s))
         } else {
             Ok(())
@@ -775,6 +829,61 @@ mod tests {
     }
 
     #[test]
+    fn malformed_header_fields_return_errors_without_panics() {
+        let zero_width = tmp_path("zero_width");
+        write_raw_bmp(&zero_width, 0, 1, 24, &[]);
+        let err = load_bmp(&zero_width).expect_err("zero width must be rejected");
+        std::fs::remove_file(&zero_width).ok();
+        assert!(matches!(err, BioFormatsError::InvalidData(_)));
+
+        let zero_height = tmp_path("zero_height");
+        write_raw_bmp(&zero_height, 1, 0, 24, &[]);
+        let err = load_bmp(&zero_height).expect_err("zero height must be rejected");
+        std::fs::remove_file(&zero_height).ok();
+        assert!(matches!(err, BioFormatsError::InvalidData(_)));
+
+        let min_width = tmp_path("min_width");
+        write_raw_bmp(&min_width, i32::MIN, 1, 24, &[]);
+        let err = load_bmp(&min_width).expect_err("i32::MIN width must be rejected");
+        std::fs::remove_file(&min_width).ok();
+        assert!(matches!(err, BioFormatsError::InvalidData(_)));
+
+        let bad_bpp = tmp_path("bad_bpp");
+        write_raw_bmp(&bad_bpp, 1, 1, 0, &[]);
+        let err = load_bmp(&bad_bpp).expect_err("zero bits per pixel must be rejected");
+        std::fs::remove_file(&bad_bpp).ok();
+        assert!(matches!(err, BioFormatsError::InvalidData(_)));
+
+        let bad_colors = tmp_path("bad_colors");
+        write_compressed_bmp(&bad_colors, 1, 1, 8, BMP_RLE_8, 257, &[0, 1]);
+        let err = load_bmp(&bad_colors).expect_err("oversized palette must be rejected");
+        std::fs::remove_file(&bad_colors).ok();
+        assert!(matches!(err, BioFormatsError::InvalidData(_)));
+    }
+
+    #[test]
+    fn huge_raw_declaration_rejects_before_plane_allocation() {
+        let path = tmp_path("huge_raw_short");
+        write_raw_bmp(&path, 50_000, 50_000, 24, &[]);
+        let err = load_bmp(&path).expect_err("short huge BMP must not allocate declared plane");
+        std::fs::remove_file(&path).ok();
+        assert!(
+            matches!(err, BioFormatsError::InvalidData(message) if message.contains("shorter"))
+        );
+    }
+
+    #[test]
+    fn huge_compressed_declaration_rejects_before_plane_allocation() {
+        let path = tmp_path("huge_rle_short");
+        write_compressed_bmp(&path, 50_000, 50_000, 8, BMP_RLE_8, 4, &[0, 1]);
+        let err = load_bmp(&path).expect_err("huge compressed BMP must not allocate plane");
+        std::fs::remove_file(&path).ok();
+        assert!(
+            matches!(err, BioFormatsError::InvalidData(message) if message.contains("too large"))
+        );
+    }
+
+    #[test]
     fn rle8_matches_java_plane_without_vertical_flip() {
         let path = tmp_path("rle8_no_flip");
         // Absolute-mode four pixels, then EOF. Java decodes into a temporary
@@ -807,5 +916,120 @@ mod tests {
         std::fs::remove_file(&path).ok();
         assert_eq!(meta.size_x, 2);
         assert_eq!(buf, [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn rgb_metadata_region_and_ome_basics_match_java_layout() {
+        let path = tmp_path("rgb_region_ome");
+        write_raw_bmp(
+            &path,
+            2,
+            2,
+            24,
+            &[
+                10, 20, 30, 40, 50, 60, 0, 0, // bottom row in BGR + padding
+                70, 80, 90, 100, 110, 120, 0, 0, // top row in BGR + padding
+            ],
+        );
+
+        let mut reader = BmpReader::new();
+        reader.set_id(&path).unwrap();
+        let meta = reader.metadata().clone();
+        assert_eq!(meta.size_x, 2);
+        assert_eq!(meta.size_y, 2);
+        assert_eq!(meta.size_c, 3);
+        assert_eq!(meta.image_count, 1);
+        assert_eq!(meta.dimension_order, DimensionOrder::XYCTZ);
+        assert!(meta.is_rgb);
+        assert!(meta.is_interleaved);
+        assert!(!meta.is_indexed);
+
+        assert_eq!(
+            reader.open_bytes(0).unwrap(),
+            vec![90, 80, 70, 120, 110, 100, 30, 20, 10, 60, 50, 40]
+        );
+        assert_eq!(
+            reader.open_bytes_region(0, 1, 0, 1, 2).unwrap(),
+            vec![120, 110, 100, 60, 50, 40]
+        );
+
+        let ome = reader.ome_metadata().unwrap();
+        assert_eq!(ome.images.len(), 1);
+        assert_eq!(
+            ome.images[0].name.as_deref(),
+            path.file_name().and_then(|n| n.to_str())
+        );
+        assert_eq!(ome.images[0].channels.len(), 1);
+        assert_eq!(ome.images[0].channels[0].samples_per_pixel, 3);
+        assert_eq!(ome.images[0].planes.len(), 0);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn failed_second_set_id_clears_previous_pixels() {
+        let good = tmp_path("good");
+        let bad = tmp_path("bad");
+        write_raw_bmp(&good, 1, 1, 24, &[30, 20, 10, 0]);
+        std::fs::write(&bad, b"not a bmp").unwrap();
+
+        let mut reader = BmpReader::new();
+        reader.set_id(&good).unwrap();
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![10, 20, 30]);
+
+        assert!(reader.set_id(&bad).is_err());
+        assert_eq!(reader.series_count(), 0);
+        assert!(matches!(
+            reader.set_series(0),
+            Err(BioFormatsError::SeriesOutOfRange(0))
+        ));
+        assert!(matches!(
+            reader.open_bytes(0),
+            Err(BioFormatsError::NotInitialized)
+        ));
+
+        std::fs::remove_file(good).ok();
+        std::fs::remove_file(bad).ok();
+    }
+
+    #[test]
+    fn close_clears_series_state() {
+        let path = tmp_path("close_state");
+        write_raw_bmp(&path, 1, 1, 24, &[30, 20, 10, 0]);
+
+        let mut reader = BmpReader::new();
+        assert_eq!(reader.series_count(), 0);
+        assert!(matches!(
+            reader.set_series(0),
+            Err(BioFormatsError::SeriesOutOfRange(0))
+        ));
+
+        reader.set_id(&path).unwrap();
+        assert_eq!(reader.series_count(), 1);
+        reader.set_series(0).unwrap();
+
+        reader.close().unwrap();
+        assert_eq!(reader.series_count(), 0);
+        assert!(matches!(
+            reader.set_series(0),
+            Err(BioFormatsError::SeriesOutOfRange(0))
+        ));
+
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn detection_and_uninitialized_region_fail_cleanly() {
+        let reader = BmpReader::new();
+        assert!(reader.is_this_type_by_name(Path::new("sample.BMP")));
+        assert!(!reader.is_this_type_by_name(Path::new("sample.bmp.txt")));
+        assert!(reader.is_this_type_by_bytes(b"BMshort"));
+        assert!(!reader.is_this_type_by_bytes(b"B"));
+        assert!(!reader.is_this_type_by_bytes(b"not a bmp"));
+
+        let mut reader = BmpReader::new();
+        assert!(matches!(
+            reader.open_bytes_region(0, 0, 0, 1, 1),
+            Err(BioFormatsError::NotInitialized)
+        ));
     }
 }

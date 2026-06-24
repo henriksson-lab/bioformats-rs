@@ -1371,7 +1371,7 @@ impl SdtReader {
             image_count: adc_re.saturating_mul(channels),
             dimension_order: DimensionOrder::XYZTC,
             is_rgb: false,
-            is_interleaved: false,
+            is_interleaved: true,
             is_indexed: false,
             is_little_endian: true,
             resolution_count: 1,
@@ -1402,7 +1402,10 @@ impl FormatReader for SdtReader {
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
-        if header.len() >= 4 && &header[..4] == b"SPC-" {
+        if header.len() >= 18
+            && &header[..4] == b"SPC-"
+            && header.get(7..18) == Some(b" Data File ")
+        {
             return true;
         }
         if header.len() < 42 {
@@ -1420,6 +1423,8 @@ impl FormatReader for SdtReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.close()?;
+
         let mut f = File::open(path).map_err(BioFormatsError::Io)?;
         let file_len = f.metadata().map_err(BioFormatsError::Io)?.len();
 
@@ -1459,6 +1464,7 @@ impl FormatReader for SdtReader {
                 data_offset,
                 next_block_offset: 0,
             };
+            let block_length = file_len.saturating_sub(data_offset);
             self.blocks = vec![block.clone()];
             self.series = vec![SdtSeries {
                 block,
@@ -1467,7 +1473,7 @@ impl FormatReader for SdtReader {
                 unsupported_layout_reason: None,
                 raw_curve_payload_len: None,
                 compressed_curve_payload_len: None,
-                block_length: 0,
+                block_length,
                 incr: 1,
             }];
             self.current_series = 0;
@@ -1569,7 +1575,15 @@ impl FormatReader for SdtReader {
             let mut series_size_c = info.channels;
             let mut series_pixel_type = PixelType::Uint16;
             let mut series_bits_per_pixel = 16;
-            let expected = disk_plane_bytes.saturating_mul(base_image_count as u64);
+            let mode13_single_channel_block =
+                matches!(meas_info, Some(meas) if meas.meas_mode == 13);
+            let expected_channels_in_block = if mode13_single_channel_block {
+                1
+            } else {
+                info.channels
+            };
+            let expected = disk_plane_bytes
+                .saturating_mul(size_t.saturating_mul(expected_channels_in_block).max(1) as u64);
             let next_block_offset = info
                 .block_offsets
                 .get(i + 1)
@@ -1815,7 +1829,7 @@ impl FormatReader for SdtReader {
                 image_count,
                 dimension_order: DimensionOrder::XYZTC,
                 is_rgb: false,
-                is_interleaved: false,
+                is_interleaved: true,
                 is_indexed: false,
                 is_little_endian: true,
                 resolution_count: 1,
@@ -2113,6 +2127,13 @@ mod sdt_tests {
         .into_bytes()
     }
 
+    fn synthetic_mode13_setup(width: u16, height: u16, times: u16) -> Vec<u8> {
+        format!(
+            "#SP [SP_SCAN_X,I,0]\n#SP [SP_SCAN_Y,I,0]\n#SP [SP_IMG_X,I,{width}]\n#SP [SP_IMG_Y,I,{height}]\n#SP [SP_ADC_RE,I,{times}]\n#SP [SP_SCAN_RX,I,1]\n"
+        )
+        .into_bytes()
+    }
+
     fn decay_payload(width: u16, height: u16, times: u16, base_value: u16) -> Vec<u8> {
         let mut payload = Vec::new();
         for _y in 0..height {
@@ -2269,6 +2290,132 @@ mod sdt_tests {
         fs::write(path, file).unwrap();
     }
 
+    fn write_single_block_sdt_with_measure_infos(
+        path: &Path,
+        setup: &[u8],
+        measure_infos: &[Vec<u8>],
+        payload: &[u8],
+    ) {
+        let setup_offs = 42u32;
+        let meas_desc_offs = setup_offs as usize + setup.len();
+        let meas_desc_len = measure_infos.first().map(|m| m.len()).unwrap_or(0);
+        let data_block_offs = meas_desc_offs + measure_infos.len() * meas_desc_len;
+
+        let mut file = vec![0; 42];
+        put_i16(&mut file, 0, 1);
+        put_i32(&mut file, 8, setup_offs as i32);
+        put_u16(&mut file, 12, setup.len() as u16);
+        put_i32(&mut file, 14, data_block_offs as i32);
+        put_i16(&mut file, 18, 1);
+        put_i32(&mut file, 20, 0);
+        put_i32(&mut file, 24, meas_desc_offs as i32);
+        put_i16(&mut file, 28, measure_infos.len() as i16);
+        put_i16(&mut file, 30, meas_desc_len as i16);
+        put_u16(&mut file, 32, 0x5555);
+        file.extend_from_slice(setup);
+        for measure_info in measure_infos {
+            assert_eq!(measure_info.len(), meas_desc_len);
+            file.extend_from_slice(measure_info);
+        }
+
+        file.resize(data_block_offs + 22, 0);
+        put_i32(
+            &mut file,
+            data_block_offs + 2,
+            (data_block_offs + 22) as i32,
+        );
+        put_i32(&mut file, data_block_offs + 6, 0);
+        put_i16(&mut file, data_block_offs + 12, 0);
+        put_u32(&mut file, data_block_offs + 18, payload.len() as u32);
+        file.extend_from_slice(payload);
+        fs::write(path, file).unwrap();
+    }
+
+    #[test]
+    fn sdt_byte_detection_requires_specific_legacy_or_modern_header() {
+        let reader = SdtReader::new();
+        let mut legacy = vec![0u8; 42];
+        legacy[..18].copy_from_slice(b"SPC-130 Data File ");
+        assert!(reader.is_this_type_by_bytes(&legacy));
+        assert!(!reader.is_this_type_by_bytes(b"SPC-not an SDT stream"));
+
+        let mut modern = vec![0u8; 42];
+        put_u32(&mut modern, 2, 42);
+        put_u32(&mut modern, 8, 50);
+        put_u32(&mut modern, 14, 60);
+        put_u16(&mut modern, 32, 0x5555);
+        assert!(reader.is_this_type_by_bytes(&modern));
+
+        modern[32..34].copy_from_slice(&0x2222u16.to_le_bytes());
+        assert!(!reader.is_this_type_by_bytes(&modern));
+    }
+
+    #[test]
+    fn sdt_spc_header_path_reports_interleaved_lifetime_metadata() {
+        let path = temp_sdt_path("spc_header_interleaved.sdt");
+        let setup = synthetic_setup(4, 1, 3);
+        let setup_offs = 42usize;
+        let data_offs = setup_offs + setup.len();
+        let mut file = vec![0u8; setup_offs];
+        file[..18].copy_from_slice(b"SPC-130 Data File ");
+        put_i16(&mut file, 22, setup_offs as i16);
+        put_i32(&mut file, 24, setup.len() as i32);
+        put_i16(&mut file, 28, data_offs as i16);
+        file.extend_from_slice(&setup);
+        file.extend_from_slice(&decay_payload(4, 1, 3, 10));
+        fs::write(&path, file).unwrap();
+
+        let mut reader = SdtReader::new();
+        reader.set_id(&path).unwrap();
+        assert_eq!(reader.metadata().size_x, 4);
+        assert_eq!(reader.metadata().size_t, 3);
+        assert!(reader.metadata().is_interleaved);
+        let plane = reader.open_bytes(2).unwrap();
+        let values: Vec<u16> = plane
+            .chunks_exact(2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            .collect();
+        assert_eq!(values, vec![12, 22, 32, 42]);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn sdt_legacy_spc_padded_rows_support_nonzero_region_reads() {
+        let path = temp_sdt_path("legacy_spc_padded_rows.sdt");
+        let setup = synthetic_setup(3, 2, 2);
+        let setup_offs = 42usize;
+        let data_offs = setup_offs + setup.len();
+        let mut file = vec![0u8; setup_offs];
+        file[..18].copy_from_slice(b"SPC-130 Data File ");
+        put_i16(&mut file, 22, setup_offs as i16);
+        put_i32(&mut file, 24, setup.len() as i32);
+        put_i16(&mut file, 28, data_offs as i16);
+        file.extend_from_slice(&setup);
+        file.extend_from_slice(&padded_decay_payload(3, 2, 2, 10));
+        fs::write(&path, file).unwrap();
+
+        let mut reader = SdtReader::new();
+        reader.set_id(&path).unwrap();
+        assert!(reader.metadata().is_interleaved);
+
+        let plane = reader.open_bytes(1).unwrap();
+        let values: Vec<u16> = plane
+            .chunks_exact(2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            .collect();
+        assert_eq!(values, vec![11, 21, 31, 111, 121, 131]);
+
+        let region = reader.open_bytes_region(1, 1, 1, 2, 1).unwrap();
+        let region_values: Vec<u16> = region
+            .chunks_exact(2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            .collect();
+        assert_eq!(region_values, vec![121, 131]);
+
+        let _ = fs::remove_file(path);
+    }
+
     #[test]
     fn sdt_raw_odd_width_uses_padded_rows_but_returns_cropped_plane() {
         let path = temp_sdt_path("padded_rows.sdt");
@@ -2281,6 +2428,7 @@ mod sdt_tests {
         assert_eq!(reader.metadata().size_x, 3);
         assert_eq!(reader.metadata().size_y, 2);
         assert_eq!(reader.metadata().size_t, 2);
+        assert!(reader.metadata().is_interleaved);
         match reader
             .metadata()
             .series_metadata
@@ -2296,6 +2444,13 @@ mod sdt_tests {
             .map(|b| u16::from_le_bytes([b[0], b[1]]))
             .collect();
         assert_eq!(values, vec![11, 21, 31, 111, 121, 131]);
+
+        let region = reader.open_bytes_region(1, 1, 1, 2, 1).unwrap();
+        let region_values: Vec<u16> = region
+            .chunks_exact(2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            .collect();
+        assert_eq!(region_values, vec![121, 131]);
 
         let _ = fs::remove_file(path);
     }
@@ -2316,6 +2471,29 @@ mod sdt_tests {
         );
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn sdt_failed_second_set_id_clears_previous_state() {
+        let good = temp_sdt_path("good_then_bad.sdt");
+        let bad = temp_sdt_path("bad_after_good.sdt");
+        let setup = synthetic_setup(3, 2, 2);
+        let payload = padded_decay_payload(3, 2, 2, 10);
+        write_single_block_sdt(&good, &setup, &payload);
+        fs::write(&bad, b"not an sdt").unwrap();
+
+        let mut reader = SdtReader::new();
+        reader.set_id(&good).unwrap();
+        assert_eq!(reader.metadata().size_x, 3);
+
+        assert!(reader.set_id(&bad).is_err());
+        assert!(matches!(
+            reader.open_bytes(0),
+            Err(BioFormatsError::NotInitialized) | Err(BioFormatsError::PlaneOutOfRange(_))
+        ));
+
+        let _ = fs::remove_file(good);
+        let _ = fs::remove_file(bad);
     }
 
     #[test]
@@ -2760,6 +2938,50 @@ mod sdt_tests {
                 other => panic!("unexpected {key} metadata: {other:?}"),
             }
         }
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn sdt_mode13_single_channel_block_reads_first_plane_with_descriptor_channels() {
+        let path = temp_sdt_path("mode13_single_channel_block.sdt");
+        let setup = synthetic_mode13_setup(3, 2, 5);
+        let measure_infos = vec![
+            synthetic_measure_info(13, 0, 0, 5, 1),
+            synthetic_measure_info(13, 0, 0, 5, 1),
+        ];
+        let payload = padded_decay_payload(3, 2, 5, 20);
+        write_single_block_sdt_with_measure_infos(&path, &setup, &measure_infos, &payload);
+
+        let mut reader = SdtReader::new();
+        reader.set_id(&path).unwrap();
+        assert_eq!(reader.metadata().size_x, 3);
+        assert_eq!(reader.metadata().size_y, 2);
+        assert_eq!(reader.metadata().size_c, 2);
+        assert_eq!(reader.metadata().size_t, 5);
+        assert_eq!(reader.metadata().image_count, 10);
+        match reader
+            .metadata()
+            .series_metadata
+            .get("sdt_data_block_layout")
+        {
+            Some(MetadataValue::String(v)) => assert_eq!(v, "image"),
+            other => panic!("unexpected SDT layout metadata: {other:?}"),
+        }
+
+        let plane = reader.open_bytes(4).unwrap();
+        let values: Vec<u16> = plane
+            .chunks_exact(2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            .collect();
+        assert_eq!(values, vec![24, 34, 44, 124, 134, 144]);
+
+        let region = reader.open_bytes_region(4, 1, 1, 2, 1).unwrap();
+        let region_values: Vec<u16> = region
+            .chunks_exact(2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            .collect();
+        assert_eq!(region_values, vec![134, 144]);
 
         let _ = fs::remove_file(path);
     }

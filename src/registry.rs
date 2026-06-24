@@ -111,6 +111,10 @@ pub(crate) fn open_reader(path: &Path) -> Result<Box<dyn FormatReader>> {
     let header = peek_header(path, DETECTION_HEADER_BYTES)?;
     let mut best_error = None;
 
+    if let Some(err) = terminal_text_companion_error(path, &header) {
+        return Err(err);
+    }
+
     // `.ims` is shared by two unrelated formats: the HDF5-based Imaris
     // (`imaris::ImarisHdfReader`) and the older Bitplane Imaris 3 TIFF variant
     // (`flim2::ImarisTiffReader`). The TIFF wrapper accepts `.ims` purely by
@@ -168,11 +172,24 @@ pub(crate) fn open_reader(path: &Path) -> Result<Box<dyn FormatReader>> {
     // Give non-generic TIFF extensions a chance before the broad TiffReader
     // byte signature accepts the file.
     if is_tiff_header(&header) {
+        let had_tiff_wrappers = !tiff_wrapper_readers_for_extension(path, &header).is_empty();
         for mut r in tiff_wrapper_readers_for_extension(path, &header) {
             match r.set_id(path) {
                 Ok(()) => return Ok(r),
                 Err(err) => remember_set_id_error(&mut best_error, err),
             }
+        }
+        if had_tiff_wrappers && has_ndpi_extension(path) {
+            return Err(best_error.unwrap_or_else(|| {
+                BioFormatsError::UnsupportedFormat("NDPI TIFF could not be initialized".into())
+            }));
+        }
+        if has_ndpi_extension(path) {
+            let mut r = boxed_reader(crate::tiff::TiffReader::new());
+            return match r.set_id(path) {
+                Ok(()) => Ok(r),
+                Err(err) => Err(err),
+            };
         }
         if has_tiff_extension(path) {
             let mut r = boxed_reader(crate::tiff::TiffReader::new());
@@ -264,6 +281,54 @@ fn terminal_magic_allows_fake_fallback(err: &BioFormatsError) -> bool {
         BioFormatsError::UnsupportedFormat(message)
             if message.contains("Bruker OPUS native spectral image decoding")
     )
+}
+
+fn terminal_text_companion_error(path: &Path, header: &[u8]) -> Option<BioFormatsError> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+    let text = std::str::from_utf8(header).ok()?;
+    let trimmed = text.trim_start_matches('\u{feff}').trim_start();
+    match ext.as_deref() {
+        Some("mlf")
+            if trimmed.contains("<bts:MeasurementData")
+                || trimmed.contains("<MeasurementData") =>
+        {
+            Some(BioFormatsError::UnsupportedFormat(
+                "Yokogawa CV7000 MeasurementData.mlf is an XML index; open the .wpi/complete acquisition with its referenced TIFF planes".into(),
+            ))
+        }
+        Some("mrf")
+            if trimmed.contains("<bts:MeasurementDetail")
+                || trimmed.contains("<MeasurementDetail") =>
+        {
+            Some(BioFormatsError::UnsupportedFormat(
+                "Yokogawa CV7000 MeasurementDetail.mrf is channel metadata, not a standalone image; open the .wpi/complete acquisition with MeasurementData.mlf and TIFF planes".into(),
+            ))
+        }
+        Some("pict") | Some("pct")
+            if trimmed.starts_with("<!DOCTYPE html")
+                || trimmed.starts_with("<html")
+                || trimmed.starts_with("<?xml") =>
+        {
+            Some(BioFormatsError::UnsupportedFormat(
+                "PICT reader received a text/HTML document, not an Apple PICT image".into(),
+            ))
+        }
+        Some("pov")
+            if trimmed.starts_with("//")
+                || trimmed.starts_with("#")
+                || trimmed.contains("camera")
+                || trimmed.contains("light_source")
+                || trimmed.contains("object") =>
+        {
+            Some(BioFormatsError::UnsupportedFormat(
+                "POV-Ray .pov scene source is not a DF3 density grid image; only .df3-style voxel grids are readable".into(),
+            ))
+        }
+        _ => None,
+    }
 }
 
 /// Select a likely reader without calling `set_id`.
@@ -360,6 +425,13 @@ fn has_tiff_extension(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .map(|e| e.eq_ignore_ascii_case("tif") || e.eq_ignore_ascii_case("tiff"))
+        .unwrap_or(false)
+}
+
+fn has_ndpi_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("ndpi"))
         .unwrap_or(false)
 }
 

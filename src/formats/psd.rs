@@ -189,6 +189,12 @@ fn psd_color_mode_name(mode: u16) -> &'static str {
     }
 }
 
+fn psd_layer_mask_section_len(r: &mut Cur<'_>, _psb: bool) -> usize {
+    // Java PSDReader reads the layer/mask section length as a 32-bit value even
+    // for PSB. Preserve that observed offset behavior for pixel parity.
+    r.read_u32() as usize
+}
+
 fn psd_resource_name(id: u16) -> &'static str {
     match id {
         1005 => "ResolutionInfo",
@@ -947,8 +953,6 @@ fn load_psd(path: &Path) -> Result<(ImageMetadata, Vec<u8>)> {
     }
     let pixel_type = pixel_type_from_depth(depth)?;
 
-    let _ = psb; // Java's PSDReader uses 4-byte lengths regardless of version.
-
     // Color Mode Data section. For palette images (mode 2) this holds a
     // 768-byte (3 x 256) RGB lookup table, stored plane-by-plane.
     let mode_data_len = r.read_i32() as i64;
@@ -1058,12 +1062,15 @@ fn load_psd(path: &Path) -> Result<(ImageMetadata, Vec<u8>)> {
     // Layer and Mask Info section. Java derives the image-data offset through a
     // sequence of heuristics; we mirror them byte-for-byte so the resulting
     // (sometimes slightly misaligned) offset matches the Java reference output.
-    let block_len = r.read_i32();
+    let block_len = psd_layer_mask_section_len(&mut r, psb);
     // Start of the layer+mask block (just past the 4-byte length). The simple
     // fallback offset for the image-data section is `block_start + block_len`.
     let block_start = r.fp();
     let offset;
     if block_len == 0 {
+        offset = r.fp();
+    } else if psb {
+        r.seek(block_start.saturating_add(block_len));
         offset = r.fp();
     } else {
         let layer_len = r.read_i32();
@@ -1260,9 +1267,18 @@ fn finish_psd(
         }
         data[offset..end].to_vec()
     } else {
-        return Err(BioFormatsError::UnsupportedFormat(format!(
-            "PSD unsupported compression {compression}"
-        )));
+        // Java's PSDReader does not reject the observed PSB layer/mask offset
+        // case: after reading an unknown compression word it continues to expose
+        // the following bytes as the composite plane. Keep that pixel behavior
+        // rather than failing the reader.
+        let end = offset.checked_add(total_bytes).unwrap_or(usize::MAX);
+        if end > data.len() {
+            return Err(BioFormatsError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "failed to fill whole buffer",
+            )));
+        }
+        data[offset..end].to_vec()
     };
 
     // Color-mode semantics per the Java PSDReader:
@@ -1706,7 +1722,6 @@ impl FormatReader for PsdReader {
                 image.name = Some(name.to_string());
             }
         }
-        let _ = ome.add_original_metadata_annotations(meta, 0);
         Some(ome)
     }
 }

@@ -66,6 +66,10 @@ tissuefaxs = ["dep:rusqlite"]
 name = "bioformats-convert"
 path = "src/bin/bioformats_convert.rs"
 
+[[test]]
+name = "java_parity_test"
+path = "tests/java_parity_test.rs"
+
 [[bench]]
 name = "read_ome_tiff"
 harness = false

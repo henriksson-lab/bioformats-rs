@@ -519,6 +519,11 @@ fn parse_fuji(inf_file: &Path) -> Result<(ImageMetadata, FujiHeader)> {
     let pixels_file = fuji_sibling(inf_file, "img").ok_or_else(|| {
         BioFormatsError::UnsupportedFormat("Fuji LAS: could not locate companion .img file".into())
     })?;
+    if !pixels_file.is_file() {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "Fuji LAS: could not locate companion .img file".into(),
+        ));
+    }
 
     let text = std::fs::read_to_string(inf_file).map_err(BioFormatsError::Io)?;
     let lines = fuji_split_lines(&text);
@@ -617,6 +622,7 @@ impl FormatReader for FujiReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.close()?;
         // Java initFile redirects to the .inf companion when given the .img.
         let ext = path
             .extension()
@@ -657,14 +663,14 @@ impl FormatReader for FujiReader {
     }
 
     fn series_count(&self) -> usize {
-        1
+        usize::from(self.meta.is_some())
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 {
-            Err(BioFormatsError::SeriesOutOfRange(s))
-        } else {
+        if self.meta.is_some() && s == 0 {
             Ok(())
+        } else {
+            Err(BioFormatsError::SeriesOutOfRange(s))
         }
     }
 
@@ -974,7 +980,50 @@ fn parse_pict(path: &Path) -> Result<PictDecoded> {
     parse_pict_bytes(&data)
 }
 
+fn pict_text_masquerade(data: &[u8]) -> bool {
+    let prefix_len = data.len().min(128);
+    let text = String::from_utf8_lossy(&data[..prefix_len]);
+    let trimmed = text.trim_start_matches('\u{feff}').trim_start();
+    let prefix = trimmed
+        .chars()
+        .take(32)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    prefix.starts_with("<!doctype html")
+        || prefix.starts_with("<html")
+        || prefix.starts_with("<?xml")
+}
+
+fn pict_header_probe(header: &[u8]) -> bool {
+    if pict_text_masquerade(header) {
+        return false;
+    }
+    if header.len() < 524 {
+        return false;
+    }
+    let top = i16::from_be_bytes([header[514], header[515]]);
+    let left = i16::from_be_bytes([header[516], header[517]]);
+    let bottom = i16::from_be_bytes([header[518], header[519]]);
+    let right = i16::from_be_bytes([header[520], header[521]]);
+    if bottom <= top || right <= left {
+        return false;
+    }
+    match &header[522..524] {
+        [0x11, 0x01] => true,
+        [0x00, 0x11] => header
+            .get(524..526)
+            .is_some_and(|version| version == [0x02, 0xff]),
+        _ => false,
+    }
+}
+
 pub(crate) fn parse_pict_bytes(data: &[u8]) -> Result<PictDecoded> {
+    if pict_text_masquerade(data) {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "PICT reader received a text/HTML document, not an Apple PICT image".into(),
+        ));
+    }
+
     let mut c = PictCursor::new(data);
     c.seek(518)?;
     let mut height = c.read_i16()?.max(0) as u32;
@@ -1094,6 +1143,7 @@ fn parse_pict_image(
     if is_bitmap && opcode != PICT_PIXMAP_9A {
         let row_bytes = (row_bytes_raw & 0x3fff) as usize;
         let (width, height) = read_pict_image_rect(c, opcode, fallback_width, fallback_height)?;
+        skip_pict_mask_region(c, opcode)?;
         let rows = read_pict_rows(c, opcode, row_bytes, width as usize, height as usize, 1, 1)?;
         let mut pixels = Vec::with_capacity(width as usize * height as usize);
         for row in rows {
@@ -1146,9 +1196,7 @@ fn parse_pict_image(
     };
 
     c.skip(18)?;
-    if opcode == PICT_BITSRGN || opcode == PICT_PACKBITSRGN {
-        c.skip(2)?;
-    }
+    skip_pict_mask_region(c, opcode)?;
 
     let rows = read_pict_rows(
         c,
@@ -1168,6 +1216,17 @@ fn parse_pict_image(
         lookup_table,
         version_one,
     )
+}
+
+fn skip_pict_mask_region(c: &mut PictCursor<'_>, opcode: u16) -> Result<()> {
+    if opcode == PICT_BITSRGN || opcode == PICT_PACKBITSRGN {
+        let len = c.read_u16()? as usize;
+        if len < 2 {
+            return Err(BioFormatsError::Format("PICT: invalid mask region".into()));
+        }
+        c.skip(len - 2)?;
+    }
+    Ok(())
 }
 
 fn read_pict_image_rect(
@@ -1442,13 +1501,11 @@ impl FormatReader for PictReader {
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
-        matches!(
-            header.get(522..524),
-            Some([0x11, 0x01]) | Some([0x00, 0x11])
-        )
+        pict_header_probe(header)
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.close()?;
         let decoded = parse_pict(path)?;
         self.path = Some(path.to_path_buf());
         self.meta = Some(decoded.meta);
@@ -1464,14 +1521,14 @@ impl FormatReader for PictReader {
     }
 
     fn series_count(&self) -> usize {
-        1
+        usize::from(self.meta.is_some())
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 {
-            Err(BioFormatsError::SeriesOutOfRange(s))
-        } else {
+        if self.meta.is_some() && s == 0 {
             Ok(())
+        } else {
+            Err(BioFormatsError::SeriesOutOfRange(s))
         }
     }
 
@@ -1759,6 +1816,11 @@ mod tests {
         let meta = reader.metadata();
         assert_eq!((meta.size_x, meta.size_y), (8, 2));
         assert!(meta.is_indexed);
+        assert_eq!(meta.image_count, 1);
+        assert_eq!(meta.dimension_order, DimensionOrder::XYCZT);
+        assert!(!meta.is_rgb);
+        assert!(!meta.is_interleaved);
+        assert!(!meta.is_little_endian);
         assert_eq!(
             reader.open_bytes(0).unwrap(),
             vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
@@ -1773,6 +1835,82 @@ mod tests {
                 .contains("width and height must be non-zero"),
             "unexpected error: {err}"
         );
+        let ome = reader.ome_metadata().unwrap();
+        assert_eq!(ome.images.len(), 1);
+        assert_eq!(ome.images[0].channels.len(), 1);
+        assert_eq!(ome.images[0].channels[0].samples_per_pixel, 1);
+
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn pict_packbits_region_skips_full_mask_region() {
+        let path = tmp("packbits_region");
+        let mut data = pict_v2_prefix(8, 1);
+        if data.len() & 1 != 0 {
+            data.push(0);
+        }
+        push_u16(&mut data, PICT_PACKBITSRGN);
+        push_u16(&mut data, 0x8000 | 8);
+        push_u16(&mut data, 0);
+        push_u16(&mut data, 0);
+        push_u16(&mut data, 1);
+        push_u16(&mut data, 8);
+        data.extend_from_slice(&[0; 18]);
+        push_u16(&mut data, 8);
+        push_u16(&mut data, 1);
+        data.extend_from_slice(&[0; 14]);
+        data.extend_from_slice(&[0; 4]);
+        push_u16(&mut data, 0);
+        push_u16(&mut data, 1);
+        for i in 0..2u8 {
+            push_u16(&mut data, i as u16);
+            data.extend_from_slice(&[i, 0, i, 0, i, 0]);
+        }
+        data.extend_from_slice(&[0; 18]);
+        push_u16(&mut data, 10);
+        data.extend_from_slice(&[0, 0, 0, 1, 0, 8, 0, 0]);
+        data.push(9);
+        data.extend_from_slice(&[7, 1, 2, 3, 4, 5, 6, 7, 8]);
+        if data.len() & 1 != 0 {
+            data.push(0);
+        }
+        push_u16(&mut data, PICT_END);
+        std::fs::write(&path, data).unwrap();
+
+        let mut reader = PictReader::new();
+        reader.set_id(&path).unwrap();
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 3, 4, 5, 6, 7, 8]);
+
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn pict_bitmap_bits_region_skips_full_mask_region() {
+        let path = tmp("bitmap_bits_region");
+        let mut data = pict_v2_prefix(8, 1);
+        if data.len() & 1 != 0 {
+            data.push(0);
+        }
+        push_u16(&mut data, PICT_BITSRGN);
+        push_u16(&mut data, 1);
+        push_u16(&mut data, 0);
+        push_u16(&mut data, 0);
+        push_u16(&mut data, 1);
+        push_u16(&mut data, 8);
+        data.extend_from_slice(&[0; 18]);
+        push_u16(&mut data, 10);
+        data.extend_from_slice(&[0, 0, 0, 1, 0, 8, 0, 0]);
+        data.push(0b1010_0101);
+        if data.len() & 1 != 0 {
+            data.push(0);
+        }
+        push_u16(&mut data, PICT_END);
+        std::fs::write(&path, data).unwrap();
+
+        let mut reader = PictReader::new();
+        reader.set_id(&path).unwrap();
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 0, 1, 0, 0, 1, 0, 1]);
 
         std::fs::remove_file(path).ok();
     }
@@ -1826,6 +1964,92 @@ mod tests {
         reader.set_id(&path).unwrap();
         assert_eq!(reader.metadata().size_c, 3);
         assert_eq!(reader.open_bytes(0).unwrap(), vec![31, 0, 31, 0, 31, 31]);
+
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn pict_32_bit_direct_color_skips_alpha_plane() {
+        let path = tmp("pixmap32");
+        let mut data = pict_v2_prefix(2, 1);
+        if data.len() & 1 != 0 {
+            data.push(0);
+        }
+        push_u16(&mut data, PICT_BITSRECT);
+        push_u16(&mut data, 0x8008);
+        push_u16(&mut data, 0);
+        push_u16(&mut data, 0);
+        push_u16(&mut data, 1);
+        push_u16(&mut data, 2);
+        data.extend_from_slice(&[0; 18]);
+        push_u16(&mut data, 32);
+        push_u16(&mut data, 4);
+        data.extend_from_slice(&[0; 14]);
+        data.extend_from_slice(&[0; 4]);
+        push_u16(&mut data, 0);
+        push_u16(&mut data, 0);
+        push_u16(&mut data, 0);
+        data.extend_from_slice(&[0; 6]);
+        data.extend_from_slice(&[0; 18]);
+        data.push(9);
+        data.extend_from_slice(&[7, 0xaa, 0xbb, 1, 2, 3, 4, 5, 6]);
+        if data.len() & 1 != 0 {
+            data.push(0);
+        }
+        push_u16(&mut data, PICT_END);
+        std::fs::write(&path, data).unwrap();
+
+        let mut reader = PictReader::new();
+        reader.set_id(&path).unwrap();
+        let meta = reader.metadata();
+        assert_eq!((meta.size_x, meta.size_y, meta.size_c), (2, 1, 3));
+        assert!(meta.is_rgb);
+        assert!(!meta.is_interleaved);
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(
+            reader.open_bytes_region(0, 1, 0, 1, 1).unwrap(),
+            vec![2, 4, 6]
+        );
+
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn pict_jpeg_payload_reads_interleaved_rgb_and_crops() {
+        let path = tmp("jpeg_payload");
+        let mut jpeg = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 100)
+            .encode(&[255, 0, 0, 0, 255, 0], 2, 1, image::ColorType::Rgb8.into())
+            .unwrap();
+
+        let mut data = pict_v2_prefix(2, 1);
+        if data.len() & 1 != 0 {
+            data.push(0);
+        }
+        push_u16(&mut data, PICT_JPEG);
+        data.extend_from_slice(&[0; 2]);
+        data.extend_from_slice(&jpeg);
+        std::fs::write(&path, data).unwrap();
+
+        let mut reader = PictReader::new();
+        reader.set_id(&path).unwrap();
+        let meta = reader.metadata();
+        assert_eq!((meta.size_x, meta.size_y, meta.size_c), (2, 1, 3));
+        assert!(meta.is_rgb);
+        assert!(meta.is_interleaved);
+        assert_eq!(meta.image_count, 1);
+        assert_eq!(meta.dimension_order, DimensionOrder::XYCZT);
+        assert!(!meta.is_little_endian);
+        let pixels = reader.open_bytes(0).unwrap();
+        assert_eq!(pixels.len(), 6);
+        assert_eq!(
+            reader.open_bytes_region(0, 1, 0, 1, 1).unwrap(),
+            pixels[3..6]
+        );
+        let ome = reader.ome_metadata().unwrap();
+        assert_eq!(ome.images.len(), 1);
+        assert_eq!(ome.images[0].channels.len(), 1);
+        assert_eq!(ome.images[0].channels[0].samples_per_pixel, 3);
 
         std::fs::remove_file(path).ok();
     }
@@ -1893,6 +2117,179 @@ mod tests {
         );
 
         std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn pict_byte_detection_requires_bounding_rect_and_v2_marker() {
+        let reader = PictReader::new();
+        let mut masquerade = vec![b' '; 526];
+        masquerade[..15].copy_from_slice(b"<!doctype html>");
+        masquerade[522] = 0x00;
+        masquerade[523] = 0x11;
+        assert!(!reader.is_this_type_by_bytes(&masquerade));
+
+        let mut valid_looking_html = vec![b' '; 526];
+        valid_looking_html[..12].copy_from_slice(b" <HTML>\xffbody");
+        valid_looking_html[514..522].copy_from_slice(&[0, 0, 0, 0, 0, 1, 0, 1]);
+        valid_looking_html[522..526].copy_from_slice(&[0x00, 0x11, 0x02, 0xff]);
+        assert!(!reader.is_this_type_by_bytes(&valid_looking_html));
+
+        let mut valid = pict_v2_prefix(1, 1);
+        valid.resize(526, 0);
+        assert!(reader.is_this_type_by_bytes(&valid));
+
+        valid[525] = 0xfe;
+        assert!(!reader.is_this_type_by_bytes(&valid));
+    }
+
+    #[test]
+    fn pict_text_masquerade_and_truncated_files_fail_cleanly() {
+        let html = tmp("html_masquerade");
+        std::fs::write(&html, b"\xef\xbb\xbf  <HTML><body></body>").unwrap();
+        let xml = tmp("xml_masquerade");
+        std::fs::write(&xml, b"  <?XML version=\"1.0\"?><root/>").unwrap();
+
+        let mut reader = PictReader::new();
+        let err = reader.set_id(&html).unwrap_err();
+        assert!(
+            matches!(err, BioFormatsError::UnsupportedFormat(ref message)
+                if message.contains("text/HTML document")),
+            "unexpected error: {err}"
+        );
+        assert_eq!(reader.series_count(), 0);
+
+        let err = reader.set_id(&xml).unwrap_err();
+        assert!(
+            matches!(err, BioFormatsError::UnsupportedFormat(ref message)
+                if message.contains("text/HTML document")),
+            "unexpected error: {err}"
+        );
+        assert_eq!(reader.series_count(), 0);
+
+        let unicode_html = tmp("unicode_html_masquerade");
+        std::fs::write(
+            &unicode_html,
+            "<html>                         \u{e9}</html>",
+        )
+        .unwrap();
+        let err = reader.set_id(&unicode_html).unwrap_err();
+        assert!(
+            matches!(err, BioFormatsError::UnsupportedFormat(ref message)
+                if message.contains("text/HTML document")),
+            "unexpected error: {err}"
+        );
+        assert_eq!(reader.series_count(), 0);
+
+        let invalid_utf8_html = tmp("invalid_utf8_html_masquerade");
+        std::fs::write(&invalid_utf8_html, b" <html><body>\xff</body>").unwrap();
+        let err = reader.set_id(&invalid_utf8_html).unwrap_err();
+        assert!(
+            matches!(err, BioFormatsError::UnsupportedFormat(ref message)
+                if message.contains("text/HTML document")),
+            "unexpected error: {err}"
+        );
+        assert_eq!(reader.series_count(), 0);
+
+        let truncated = tmp("truncated");
+        let mut data = pict_v2_prefix(1, 1);
+        data.push(0);
+        push_u16(&mut data, PICT_PACKBITSRECT);
+        std::fs::write(&truncated, data).unwrap();
+
+        let err = reader.set_id(&truncated).unwrap_err();
+        assert!(
+            err.to_string().contains("unexpected end")
+                || err.to_string().contains("no supported bitmap"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(reader.series_count(), 0);
+
+        std::fs::remove_file(html).ok();
+        std::fs::remove_file(xml).ok();
+        std::fs::remove_file(unicode_html).ok();
+        std::fs::remove_file(invalid_utf8_html).ok();
+        std::fs::remove_file(truncated).ok();
+    }
+
+    #[test]
+    fn pict_direct_rgb_nonzero_crop_is_planar_and_bounded() {
+        let path = tmp("rgb_crop");
+        let mut data = pict_v2_prefix(3, 2);
+        if data.len() & 1 != 0 {
+            data.push(0);
+        }
+        push_u16(&mut data, PICT_BITSRECT);
+        push_u16(&mut data, 0x8006);
+        push_u16(&mut data, 0);
+        push_u16(&mut data, 0);
+        push_u16(&mut data, 2);
+        push_u16(&mut data, 3);
+        data.extend_from_slice(&[0; 18]);
+        push_u16(&mut data, 16);
+        push_u16(&mut data, 1);
+        data.extend_from_slice(&[0; 14]);
+        data.extend_from_slice(&[0; 4]);
+        push_u16(&mut data, 0);
+        push_u16(&mut data, 0);
+        push_u16(&mut data, 0);
+        data.extend_from_slice(&[0; 6]);
+        data.extend_from_slice(&[0; 18]);
+        for sample in [0x7c00u16, 0x03e0, 0x001f, 0x7fff, 0x03ff, 0x7fe0] {
+            push_u16(&mut data, sample);
+        }
+        if data.len() & 1 != 0 {
+            data.push(0);
+        }
+        push_u16(&mut data, PICT_END);
+        std::fs::write(&path, data).unwrap();
+
+        let mut reader = PictReader::new();
+        reader.set_id(&path).unwrap();
+        assert_eq!(
+            reader.open_bytes_region(0, 1, 1, 2, 1).unwrap(),
+            vec![0, 31, 31, 31, 31, 0]
+        );
+        let err = reader.open_bytes_region(0, 2, 1, 2, 1).unwrap_err();
+        assert!(err.to_string().contains("outside image bounds"));
+
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn pict_failed_second_set_id_clears_previous_pixels() {
+        let good = tmp("good_then_bad");
+        let bad = tmp("bad_after_good");
+        let mut data = vec![0; 512];
+        push_u16(&mut data, 0);
+        push_u16(&mut data, 0);
+        push_u16(&mut data, 0);
+        push_u16(&mut data, 1);
+        push_u16(&mut data, 1);
+        data.extend_from_slice(&[0x11, 0x01, PICT_BITSRECT as u8]);
+        push_u16(&mut data, 1);
+        push_u16(&mut data, 0);
+        push_u16(&mut data, 0);
+        push_u16(&mut data, 1);
+        push_u16(&mut data, 1);
+        data.extend_from_slice(&[0; 18]);
+        data.extend_from_slice(&[0x80, PICT_END as u8]);
+        std::fs::write(&good, data).unwrap();
+        std::fs::write(&bad, b"not a pict").unwrap();
+
+        let mut reader = PictReader::new();
+        reader.set_id(&good).unwrap();
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![1]);
+
+        assert!(reader.set_id(&bad).is_err());
+        assert_eq!(reader.series_count(), 0);
+        assert!(reader.set_series(0).is_err());
+        assert!(matches!(
+            reader.open_bytes(0),
+            Err(BioFormatsError::NotInitialized)
+        ));
+
+        std::fs::remove_file(good).ok();
+        std::fs::remove_file(bad).ok();
     }
 
     fn fuji_tmp_dir(name: &str) -> PathBuf {
@@ -2002,6 +2399,28 @@ mod tests {
     }
 
     #[test]
+    fn fuji_set_id_rejects_header_without_img_companion() {
+        let dir = fuji_tmp_dir("missing_img");
+        let inf = dir.join("gel.inf");
+        std::fs::write(&inf, fuji_inf("missing img", "1.0", "1.0", 8, 1, 1)).unwrap();
+
+        let mut reader = FujiReader::new();
+        let err = reader.set_id(&inf).unwrap_err();
+        assert!(
+            matches!(err, BioFormatsError::UnsupportedFormat(ref message)
+                if message.contains("companion .img")),
+            "unexpected error: {err}"
+        );
+        assert_eq!(reader.series_count(), 0);
+        assert!(matches!(
+            reader.open_bytes(0),
+            Err(BioFormatsError::NotInitialized)
+        ));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn fuji_maps_64_bit_samples_like_java_pixel_type_from_bytes() {
         let dir = fuji_tmp_dir("float64");
         let inf = dir.join("gel.inf");
@@ -2059,6 +2478,52 @@ mod tests {
             reader.set_id(&inf),
             Err(BioFormatsError::Format(message)) if message.contains("invalid physical size")
         ));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn fuji_failed_second_set_id_clears_previous_dataset() {
+        let dir = fuji_tmp_dir("failed_second");
+        let inf = dir.join("gel.inf");
+        let img = dir.join("gel.img");
+        let bad = dir.join("bad.inf");
+
+        std::fs::write(&inf, fuji_inf("my gel", "1.0", "1.0", 8, 1, 1)).unwrap();
+        std::fs::write(&img, [7u8]).unwrap();
+        std::fs::write(&bad, "not enough lines").unwrap();
+
+        let mut reader = FujiReader::new();
+        reader.set_id(&inf).unwrap();
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![7]);
+
+        assert!(reader.set_id(&bad).is_err());
+        assert_eq!(reader.series_count(), 0);
+        assert!(reader.set_series(0).is_err());
+        assert!(matches!(
+            reader.open_bytes(0),
+            Err(BioFormatsError::NotInitialized)
+        ));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn fuji_direct_inf_path_reads_nonzero_region() {
+        let dir = fuji_tmp_dir("direct_inf_region");
+        let inf = dir.join("gel.inf");
+        let img = dir.join("gel.img");
+
+        std::fs::write(&inf, fuji_inf("direct inf", "2.0", "3.0", 8, 3, 2)).unwrap();
+        std::fs::write(&img, [1u8, 2, 3, 4, 5, 6]).unwrap();
+
+        let mut reader = FujiReader::new();
+        reader.set_id(&inf).unwrap();
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(reader.open_bytes_region(0, 1, 1, 2, 1).unwrap(), vec![5, 6]);
+        let ome = reader.ome_metadata().unwrap();
+        assert_eq!(ome.images[0].physical_size_x, Some(2.0));
+        assert_eq!(ome.images[0].physical_size_y, Some(3.0));
 
         std::fs::remove_dir_all(&dir).ok();
     }
