@@ -70,6 +70,14 @@ path = "src/bin/bioformats_convert.rs"
 name = "java_parity_test"
 path = "tests/java_parity_test.rs"
 
+[[test]]
+name = "write_test"
+path = "tests/write_test.rs"
+
+[[test]]
+name = "new_features_test"
+path = "tests/new_features_test.rs"
+
 [[bench]]
 name = "read_ome_tiff"
 harness = false

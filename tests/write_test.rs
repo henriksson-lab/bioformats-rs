@@ -115,6 +115,12 @@ fn dicom_writer_derives_16_bit_depth_from_pixel_type_when_default_bits_per_pixel
     let (vr, pixel_data) = dicom_element(&path, 0x7FE0, 0x0010);
     assert_eq!(vr, *b"OW");
     assert_eq!(pixel_data, data);
+
+    let mut reader = ImageReader::open(&path).expect("DICOM read failed");
+    assert_eq!(reader.metadata().size_x, 2);
+    assert_eq!(reader.metadata().size_y, 1);
+    assert_eq!(reader.metadata().pixel_type, PixelType::Uint16);
+    assert_eq!(reader.open_bytes(0).expect("DICOM plane read failed"), data);
 }
 
 #[test]
@@ -136,6 +142,15 @@ fn dicom_writer_uses_pixel_type_when_bits_per_pixel_is_inconsistent() {
     let (vr, pixel_data) = dicom_element(&path, 0x7FE0, 0x0010);
     assert_eq!(vr, *b"OB");
     assert_eq!(pixel_data, vec![3, 4]);
+
+    let mut reader = ImageReader::open(&path).expect("DICOM read failed");
+    assert_eq!(reader.metadata().size_x, 2);
+    assert_eq!(reader.metadata().size_y, 1);
+    assert_eq!(reader.metadata().pixel_type, PixelType::Uint8);
+    assert_eq!(
+        reader.open_bytes(0).expect("DICOM plane read failed"),
+        vec![3, 4]
+    );
 }
 
 #[test]
@@ -962,6 +977,77 @@ fn stack_writer_meta() -> ImageMetadata {
     meta.size_t = 1;
     meta.image_count = 2;
     meta
+}
+
+#[test]
+fn scientific_stack_writers_round_trip_z_stacks() {
+    let meta = stack_writer_meta();
+    let planes: Vec<Vec<u8>> = vec![(0u8..16).collect(), (100u8..116).collect()];
+
+    for (name, file) in [
+        ("MRC", "roundtrip_stack.mrc"),
+        ("FITS", "roundtrip_stack.fits"),
+        ("MetaImage", "roundtrip_stack.mha"),
+        ("CellH5", "roundtrip_stack.ch5"),
+    ] {
+        let path = temp_path(file);
+        ImageWriter::save(&path, &meta, &planes)
+            .unwrap_or_else(|e| panic!("{name}: write failed: {e}"));
+
+        let mut reader =
+            ImageReader::open(&path).unwrap_or_else(|e| panic!("{name}: read failed: {e}"));
+        let read_meta = reader.metadata().clone();
+        assert_eq!(read_meta.size_x, meta.size_x, "{name}: size_x");
+        assert_eq!(read_meta.size_y, meta.size_y, "{name}: size_y");
+        assert_eq!(
+            read_meta.image_count, meta.image_count,
+            "{name}: image_count"
+        );
+
+        for (i, expected) in planes.iter().enumerate() {
+            let actual = reader
+                .open_bytes(i as u32)
+                .unwrap_or_else(|e| panic!("{name}: plane {i} read failed: {e}"));
+            assert_eq!(actual, *expected, "{name}: plane {i}");
+        }
+    }
+}
+
+#[test]
+fn image_writer_dispatches_v3draw_writer() {
+    let mut meta = stack_writer_meta();
+    meta.size_x = 2;
+    meta.size_y = 3;
+    meta.size_z = 2;
+    meta.image_count = 2;
+
+    let plane0 = vec![10, 11, 12, 13, 14, 15];
+    let plane1 = vec![20, 21, 22, 23, 24, 25];
+    let path = temp_path("public_dispatch.v3draw");
+    ImageWriter::save(&path, &meta, &[plane0.clone(), plane1.clone()]).unwrap();
+
+    let bytes = std::fs::read(&path).unwrap();
+    assert_eq!(&bytes[0..24], b"raw_image_stack_by_hpeng");
+    assert_eq!(bytes[24], b'L');
+    assert_eq!(u16::from_le_bytes([bytes[25], bytes[26]]), 1);
+    assert_eq!(
+        i32::from_le_bytes([bytes[27], bytes[28], bytes[29], bytes[30]]),
+        2
+    );
+    assert_eq!(
+        i32::from_le_bytes([bytes[31], bytes[32], bytes[33], bytes[34]]),
+        3
+    );
+    assert_eq!(
+        i32::from_le_bytes([bytes[35], bytes[36], bytes[37], bytes[38]]),
+        2
+    );
+    assert_eq!(
+        i32::from_le_bytes([bytes[39], bytes[40], bytes[41], bytes[42]]),
+        1
+    );
+    assert_eq!(&bytes[43..49], &plane0[..]);
+    assert_eq!(&bytes[49..55], &plane1[..]);
 }
 
 #[test]
@@ -2244,6 +2330,12 @@ fn generic_ome_tiff_suffix_writes_embedded_ome_xml_like_java_writer_selection() 
         "OME-XML missing from TIFF comment"
     );
     assert!(text.contains(r#"SizeC="2""#));
+
+    let mut reader = ImageReader::open(&path).unwrap();
+    assert_eq!(reader.metadata().size_c, 2);
+    assert_eq!(reader.metadata().image_count, 2);
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![7]);
+    assert_eq!(reader.open_bytes(1).unwrap(), vec![9]);
 }
 
 #[test]
@@ -2261,6 +2353,110 @@ fn jpeg_writer_accepts_jpe_suffix_like_java() {
     let path = temp_path("suffix_java.jpe");
     ImageWriter::save(&path, &meta, &[vec![255, 0, 0, 0, 255, 0]]).unwrap();
     assert!(path.exists());
+}
+
+#[test]
+fn jpeg_writer_round_trip_rgb8_with_lossy_tolerance() {
+    let mut meta = ImageMetadata::default();
+    meta.size_x = 16;
+    meta.size_y = 16;
+    meta.size_c = 3;
+    meta.is_rgb = true;
+    meta.is_interleaved = true;
+    meta.pixel_type = PixelType::Uint8;
+    meta.bits_per_pixel = 8;
+    meta.image_count = 1;
+
+    let mut interleaved = Vec::with_capacity((meta.size_x * meta.size_y * 3) as usize);
+    for y in 0..meta.size_y {
+        for x in 0..meta.size_x {
+            interleaved.push((x * 12 + y * 3) as u8);
+            interleaved.push((x * 5 + y * 9) as u8);
+            interleaved.push((80 + x * 4 + y * 2) as u8);
+        }
+    }
+    let path = temp_path("roundtrip_rgb.jpg");
+    ImageWriter::save(&path, &meta, &[interleaved.clone()]).unwrap();
+
+    let mut reader = ImageReader::open(&path).unwrap();
+    assert_eq!(reader.metadata().size_x, meta.size_x);
+    assert_eq!(reader.metadata().size_y, meta.size_y);
+    assert_eq!(reader.metadata().size_c, 3);
+    let actual = reader.open_bytes(0).unwrap();
+
+    let plane = (meta.size_x * meta.size_y) as usize;
+    let mut expected_planar = vec![0u8; interleaved.len()];
+    for (i, px) in interleaved.chunks_exact(3).enumerate() {
+        expected_planar[i] = px[0];
+        expected_planar[plane + i] = px[1];
+        expected_planar[2 * plane + i] = px[2];
+    }
+
+    let total_abs_diff: u64 = actual
+        .iter()
+        .zip(expected_planar.iter())
+        .map(|(&a, &e)| a.abs_diff(e) as u64)
+        .sum();
+    let mean_abs_diff = total_abs_diff as f64 / actual.len() as f64;
+    let max_abs_diff = actual
+        .iter()
+        .zip(expected_planar.iter())
+        .map(|(&a, &e)| a.abs_diff(e))
+        .max()
+        .unwrap_or(0);
+    assert!(
+        mean_abs_diff < 8.0 && max_abs_diff < 40,
+        "JPEG round-trip drift too high: mean={mean_abs_diff:.2}, max={max_abs_diff}"
+    );
+}
+
+#[cfg(feature = "jpeg2000-write")]
+#[test]
+fn jpeg2000_writer_round_trip_gray8_lossless() {
+    let mut meta = ImageMetadata::default();
+    meta.size_x = 5;
+    meta.size_y = 4;
+    meta.size_c = 1;
+    meta.pixel_type = PixelType::Uint8;
+    meta.bits_per_pixel = 8;
+    meta.image_count = 1;
+
+    let data: Vec<u8> = (0u8..20).map(|v| v.wrapping_mul(11)).collect();
+    let path = temp_path("roundtrip_gray.jp2");
+    ImageWriter::save(&path, &meta, &[data.clone()]).unwrap();
+
+    let mut reader = ImageReader::open(&path).unwrap();
+    assert_eq!(reader.metadata().size_x, meta.size_x);
+    assert_eq!(reader.metadata().size_y, meta.size_y);
+    assert_eq!(reader.metadata().pixel_type, PixelType::Uint8);
+    assert_eq!(reader.open_bytes(0).unwrap(), data);
+}
+
+#[cfg(feature = "jpeg2000-write")]
+#[test]
+fn jpeg2000_writer_round_trip_rgb8_lossless() {
+    let mut meta = ImageMetadata::default();
+    meta.size_x = 3;
+    meta.size_y = 2;
+    meta.size_c = 3;
+    meta.is_rgb = true;
+    meta.is_interleaved = true;
+    meta.pixel_type = PixelType::Uint8;
+    meta.bits_per_pixel = 8;
+    meta.image_count = 1;
+
+    let data = vec![
+        1, 2, 3, 4, 5, 6, 20, 21, 22, 23, 24, 25, 100, 101, 102, 103, 104, 105,
+    ];
+    let path = temp_path("roundtrip_rgb.jp2");
+    ImageWriter::save(&path, &meta, &[data.clone()]).unwrap();
+
+    let mut reader = ImageReader::open(&path).unwrap();
+    assert_eq!(reader.metadata().size_x, meta.size_x);
+    assert_eq!(reader.metadata().size_y, meta.size_y);
+    assert_eq!(reader.metadata().size_c, 3);
+    assert!(reader.metadata().is_rgb);
+    assert_eq!(reader.open_bytes(0).unwrap(), data);
 }
 
 #[test]
@@ -2350,6 +2546,31 @@ fn planar_rgb_writer_inputs_are_interleaved_like_java() {
         mov_reader.open_bytes(0).unwrap(),
         vec![10, 20, 30, 40, 50, 60]
     );
+}
+
+#[test]
+fn bmp_writer_round_trip_odd_width_rgb8() {
+    let mut meta = ImageMetadata::default();
+    meta.size_x = 3;
+    meta.size_y = 2;
+    meta.size_c = 3;
+    meta.is_rgb = true;
+    meta.is_interleaved = true;
+    meta.pixel_type = PixelType::Uint8;
+    meta.bits_per_pixel = 8;
+    meta.image_count = 1;
+
+    let interleaved = vec![
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 20, 21, 22, 23, 24, 25, 26, 27, 28,
+    ];
+    let path = temp_path("odd_width_rgb.bmp");
+    ImageWriter::save(&path, &meta, &[interleaved.clone()]).unwrap();
+
+    let mut reader = ImageReader::open(&path).unwrap();
+    assert_eq!(reader.metadata().size_x, 3);
+    assert_eq!(reader.metadata().size_y, 2);
+    assert_eq!(reader.metadata().size_c, 3);
+    assert_eq!(reader.open_bytes(0).unwrap(), interleaved);
 }
 
 #[test]

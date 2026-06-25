@@ -155,7 +155,7 @@ fn avi_round_trip_gray8() {
     let path = tmp("test.avi");
     ImageWriter::save(&path, &meta, &[plane0.clone(), plane1.clone()]).expect("AVI write failed");
 
-    let reader = ImageReader::open(&path).expect("AVI read failed");
+    let mut reader = ImageReader::open(&path).expect("AVI read failed");
     let rmeta = reader.metadata();
     assert_eq!(rmeta.size_x, 8);
     assert_eq!(rmeta.size_y, 8);
@@ -163,6 +163,14 @@ fn avi_round_trip_gray8() {
         rmeta.image_count >= 2,
         "expected at least 2 frames, got {}",
         rmeta.image_count
+    );
+    assert_eq!(
+        reader.open_bytes(0).expect("AVI plane 0 read failed"),
+        plane0
+    );
+    assert_eq!(
+        reader.open_bytes(1).expect("AVI plane 1 read failed"),
+        plane1
     );
 }
 
