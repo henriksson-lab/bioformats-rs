@@ -12,6 +12,7 @@ WARMUP="${BIOFORMATS_RS_OME_IMAGES_WARMUP:-1}"
 MEASURE="${BIOFORMATS_RS_OME_IMAGES_MEASURE:-3}"
 PLANES="${BIOFORMATS_RS_OME_IMAGES_PLANES:-1}"
 REGION="${BIOFORMATS_RS_OME_IMAGES_REGION:-256x256}"
+TIMEOUT="${BIOFORMATS_RS_OME_IMAGES_TIMEOUT:-120}"
 MODE="all"
 ALL_FLAG=()
 
@@ -30,6 +31,7 @@ Environment:
   BIOFORMATS_RS_OME_IMAGES_PER_FORMAT=2
   BIOFORMATS_RS_OME_IMAGES_WARMUP=1
   BIOFORMATS_RS_OME_IMAGES_MEASURE=3
+  BIOFORMATS_RS_OME_IMAGES_TIMEOUT=120
 EOF
 }
 
@@ -78,6 +80,7 @@ if [[ "$MODE" == "all" || "$MODE" == "bench" ]]; then
     --measure "$MEASURE" \
     --planes "$PLANES" \
     --region "$REGION" \
+    --timeout "$TIMEOUT" \
     --out bench/target/ome-images-subset.csv \
     --markdown bench/target/ome-images-subset.md
 fi

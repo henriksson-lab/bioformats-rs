@@ -9,6 +9,7 @@
 #   --measure N       measured iterations per engine (default: 5)
 #   --planes N        planes read per series (default: 1)
 #   --region WxH      centered crop size, clamped to image bounds (default: 256x256)
+#   --timeout SEC     per Java/Rust engine timeout, 0 disables (default: 120)
 #   --manifest FILE   newline-delimited paths to benchmark
 #   --out FILE        CSV output path (default: bench/target/subset-comparison.csv)
 #   --markdown FILE   Markdown output path (default: bench/target/subset-comparison.md)
@@ -26,6 +27,7 @@ MEASURE=5
 PLANES=1
 REGION_W=256
 REGION_H=256
+TIMEOUT_SEC="${BIOFORMATS_RS_BENCH_TIMEOUT:-120}"
 OUT="bench/target/subset-comparison.csv"
 MARKDOWN="bench/target/subset-comparison.md"
 MANIFEST=""
@@ -52,6 +54,8 @@ while [[ $# -gt 0 ]]; do
       REGION_W="${2%x*}"
       REGION_H="${2#*x}"
       shift 2 ;;
+    --timeout)
+      TIMEOUT_SEC="$2"; shift 2 ;;
     --manifest)
       MANIFEST="$2"; shift 2 ;;
     --out)
@@ -193,14 +197,19 @@ run_engine() {
   local path="$2"
   local out_file="$3"
   local err_file="$4"
+  local timeout_cmd=()
+
+  if [[ "${TIMEOUT_SEC:-0}" != "0" ]]; then
+    timeout_cmd=(timeout --kill-after=5s "${TIMEOUT_SEC}s")
+  fi
 
   if [[ "$engine" == "java" ]]; then
-    /usr/bin/time -f "__rss_kb=%M" \
+    "${timeout_cmd[@]}" /usr/bin/time -f "__rss_kb=%M" \
       java -cp "bioformats_package.jar:$CLASS_DIR" BfSubsetBench \
       "$path" "$WARMUP" "$MEASURE" "$PLANES" "$REGION_W" "$REGION_H" \
       > "$out_file" 2> "$err_file" || true
   else
-    /usr/bin/time -f "__rss_kb=%M" \
+    "${timeout_cmd[@]}" /usr/bin/time -f "__rss_kb=%M" \
       "$RUST_BIN" "$path" "$WARMUP" "$MEASURE" "$PLANES" "$REGION_W" "$REGION_H" \
       > "$out_file" 2> "$err_file" || true
   fi

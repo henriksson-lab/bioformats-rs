@@ -18,6 +18,8 @@
 //! errors.
 
 use std::collections::{BTreeMap, HashSet};
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use quick_xml::events::Event;
@@ -133,6 +135,7 @@ impl LifReader {
         (0, 0)
     }
 
+    #[allow(dead_code)]
     fn parse(&mut self, data: &[u8]) -> Result<()> {
         if data.len() < 13 {
             return Err(BioFormatsError::Format("LIF file too short".into()));
@@ -254,6 +257,129 @@ impl LifReader {
 
         Ok(())
     }
+
+    fn parse_file_metadata(&mut self, path: &Path) -> Result<()> {
+        let mut file = File::open(path).map_err(BioFormatsError::Io)?;
+        self.file_len = file.metadata().map_err(BioFormatsError::Io)?.len();
+        if self.file_len < 13 {
+            return Err(BioFormatsError::Format("LIF file too short".into()));
+        }
+
+        let mut header = [0u8; 9];
+        file.read_exact(&mut header).map_err(BioFormatsError::Io)?;
+        if header[0] != LIF_MAGIC_BYTE && header[3] != LIF_MAGIC_BYTE {
+            return Err(BioFormatsError::Format("Not a valid Leica LIF file".into()));
+        }
+        if header[8] != LIF_MEMORY_BYTE {
+            return Err(BioFormatsError::Format(
+                "Invalid LIF XML description".into(),
+            ));
+        }
+        let nc = read_i32_file(&mut file)? as i64;
+        let xml_bytes = nc
+            .checked_mul(2)
+            .filter(|n| *n >= 0)
+            .ok_or_else(|| BioFormatsError::Format("Invalid LIF XML length".into()))?
+            as usize;
+        let mut xml_buf = vec![0; xml_bytes];
+        file.read_exact(&mut xml_buf).map_err(BioFormatsError::Io)?;
+        let xml = decode_utf16le(&xml_buf);
+        let mut off = 13u64
+            .checked_add(xml_bytes as u64)
+            .ok_or_else(|| BioFormatsError::Format("LIF XML offset overflows".into()))?;
+
+        let mut raw_blocks: Vec<MemoryBlock> = Vec::new();
+        let mut end_pointer: u64 = 0;
+        while off < self.file_len {
+            if off + 4 > self.file_len {
+                break;
+            }
+            file.seek(SeekFrom::Start(off))
+                .map_err(BioFormatsError::Io)?;
+            let check = read_i32_file(&mut file)?;
+            off += 4;
+            if check != LIF_MAGIC_BYTE as i32 {
+                if check == 0 && !raw_blocks.is_empty() {
+                    end_pointer = off;
+                    break;
+                }
+                return Err(BioFormatsError::Format(format!(
+                    "Invalid LIF memory block: magic {check}"
+                )));
+            }
+            off += 4;
+            file.seek(SeekFrom::Start(off))
+                .map_err(BioFormatsError::Io)?;
+            let mut marker = [0u8; 1];
+            file.read_exact(&mut marker).map_err(BioFormatsError::Io)?;
+            if marker[0] != LIF_MEMORY_BYTE {
+                return Err(BioFormatsError::Format(
+                    "Invalid LIF memory description".into(),
+                ));
+            }
+            off += 1;
+
+            let mut block_length = read_i32_file(&mut file)? as u32 as u64;
+            off += 4;
+            file.read_exact(&mut marker).map_err(BioFormatsError::Io)?;
+            off += 1;
+            if marker[0] != LIF_MEMORY_BYTE {
+                off -= 5;
+                file.seek(SeekFrom::Start(off))
+                    .map_err(BioFormatsError::Io)?;
+                block_length = read_i64_file(&mut file)? as u64;
+                off += 8;
+                file.read_exact(&mut marker).map_err(BioFormatsError::Io)?;
+                if marker[0] != LIF_MEMORY_BYTE {
+                    return Err(BioFormatsError::Format(
+                        "Invalid LIF memory description (64-bit)".into(),
+                    ));
+                }
+                off += 1;
+            }
+
+            let descr_len = (read_i32_file(&mut file)? as usize)
+                .checked_mul(2)
+                .ok_or_else(|| BioFormatsError::Format("Invalid LIF block ID length".into()))?;
+            off += 4;
+            if off + descr_len as u64 > self.file_len {
+                return Err(BioFormatsError::Format("LIF block ID past EOF".into()));
+            }
+            let mut id_buf = vec![0; descr_len];
+            file.read_exact(&mut id_buf).map_err(BioFormatsError::Io)?;
+            let mem_id = decode_utf16le(&id_buf);
+            off += descr_len as u64;
+            if block_length > 0 {
+                raw_blocks.push(MemoryBlock {
+                    file_offset: off,
+                    byte_len: block_length,
+                    id: mem_id,
+                });
+            }
+            off = off.saturating_add(block_length);
+        }
+        if end_pointer == 0 {
+            end_pointer = self.file_len;
+        }
+        self.end_pointer = end_pointer;
+
+        let (mut series, ordered_ids) = parse_xml(&xml)?;
+        if series.is_empty() {
+            return Err(BioFormatsError::Format("No images found in LIF".into()));
+        }
+        let (memory_blocks, mapping_status) =
+            select_lif_memory_blocks(&series, &ordered_ids, &raw_blocks);
+        self.memory_blocks = memory_blocks;
+        annotate_lif_storage(
+            &mut series,
+            &ordered_ids,
+            &self.memory_blocks,
+            mapping_status,
+        );
+        annotate_lif_compression_payloads_from_file(path, &mut series, &self.memory_blocks)?;
+        self.series = series;
+        Ok(())
+    }
 }
 
 impl Default for LifReader {
@@ -301,8 +427,7 @@ impl FormatReader for LifReader {
         self.series.clear();
         self.memory_blocks.clear();
 
-        let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
-        self.parse(&data)?;
+        self.parse_file_metadata(path)?;
         Ok(())
     }
 
@@ -376,6 +501,20 @@ impl FormatReader for LifReader {
             None => return blank_lif_region(m, &info.layout, w, h),
         };
         let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        if info.layout.compression.is_none() {
+            let mut file = File::open(path).map_err(BioFormatsError::Io)?;
+            return decode_lif_uncompressed_region_from_file(
+                &mut file,
+                block,
+                info,
+                tile as u64,
+                plane_index,
+                x,
+                y,
+                w,
+                h,
+            );
+        }
         let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
         decode_lif_region(&data, block, info, tile as u64, plane_index, x, y, w, h)
     }
@@ -576,6 +715,251 @@ fn decode_lif_region(
         bgr_to_rgb(&mut out, true, bps as usize, rgb_samples as usize);
     }
     Ok(out)
+}
+
+fn decode_lif_uncompressed_region_from_file(
+    file: &mut File,
+    block: &MemoryBlock,
+    info: &SeriesInfo,
+    tile: u64,
+    plane_index: u32,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+) -> Result<Vec<u8>> {
+    let meta = &info.meta;
+    let bps = meta.pixel_type.bytes_per_sample() as u64;
+    let plane_layout = lif_plane_layout(meta, &info.layout)?;
+    let rgb_samples = lif_rgb_channel_count(meta);
+    let samples = match plane_layout {
+        LifPlaneLayout::InterleavedColor => rgb_samples as u64,
+        LifPlaneLayout::Scalar
+        | LifPlaneLayout::PlanarColor
+        | LifPlaneLayout::PaddedPlanarColor => 1,
+    };
+    let pixel_stride = checked_mul_u64(bps, samples, "Leica LIF pixel stride")?;
+    let layout = &info.layout;
+    if layout.x_stride != bps {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "Leica LIF unsupported X stride {}; expected {bps} bytes for {:?}",
+            layout.x_stride, meta.pixel_type
+        )));
+    }
+    let min_row = u64::from(meta.size_x)
+        .checked_mul(pixel_stride)
+        .ok_or_else(|| BioFormatsError::Format("Leica LIF row size overflows".into()))?;
+    if layout.y_stride < min_row {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "Leica LIF unsupported Y stride {}; expected at least {min_row}",
+            layout.y_stride
+        )));
+    }
+
+    let (z, c, t) = zct_for_plane(plane_index, meta);
+    let tile_offset = if tile == 0 {
+        0
+    } else {
+        let stride = info.layout.tile_stride.ok_or_else(|| {
+            BioFormatsError::UnsupportedFormat(format!(
+                "Leica LIF missing tile byte stride for {} tiles",
+                info.tile_count.max(1)
+            ))
+        })?;
+        checked_mul_u64(tile, stride, "Leica LIF tile offset")?
+    };
+    let mut plane_base = tile_offset;
+    if !meta.is_rgb {
+        plane_base = checked_add_u64(
+            plane_base,
+            axis_offset(c, meta.size_c, layout.c_stride, "channel")?,
+            "Leica LIF channel offset",
+        )?;
+    }
+    plane_base = checked_add_u64(
+        plane_base,
+        axis_offset(z, meta.size_z, layout.z_stride, "Z")?,
+        "Leica LIF Z offset",
+    )?;
+    plane_base = checked_add_u64(
+        plane_base,
+        axis_offset(t, meta.size_t, layout.t_stride, "T")?,
+        "Leica LIF T offset",
+    )?;
+
+    if matches!(
+        plane_layout,
+        LifPlaneLayout::PlanarColor | LifPlaneLayout::PaddedPlanarColor
+    ) {
+        return decode_lif_uncompressed_planar_color_region_from_file(
+            file, block, info, plane_base, c, x, y, w, h,
+        );
+    }
+
+    let row_start_delta = checked_add_u64(
+        checked_mul_u64(u64::from(y), layout.y_stride, "Leica LIF row offset")?,
+        checked_mul_u64(u64::from(x), pixel_stride, "Leica LIF column offset")?,
+        "Leica LIF region offset",
+    )?;
+    let rgb_group_base = if matches!(plane_layout, LifPlaneLayout::InterleavedColor) {
+        lif_rgb_group_offsets(layout, c, rgb_samples)?[0]
+    } else {
+        0
+    };
+    let out_row = checked_mul_u64(u64::from(w), pixel_stride, "Leica LIF output row")? as usize;
+    let mut row_ranges = Vec::with_capacity(h as usize);
+    for row in 0..u64::from(h) {
+        let src = checked_add_u64(
+            checked_add_u64(plane_base, rgb_group_base, "Leica LIF RGB group offset")?,
+            checked_add_u64(
+                row_start_delta,
+                checked_mul_u64(row, layout.y_stride, "Leica LIF row offset")?,
+                "Leica LIF row offset",
+            )?,
+            "Leica LIF source offset",
+        )?;
+        let end = checked_add_u64(src, out_row as u64, "Leica LIF source end")?;
+        row_ranges.push((src, end));
+    }
+
+    let mut out = Vec::with_capacity(
+        (h as usize)
+            .checked_mul(out_row)
+            .ok_or_else(|| BioFormatsError::Format("Leica LIF output size overflows".into()))?,
+    );
+    if !copy_lif_uncompressed_file_ranges(file, block, &row_ranges, &mut out)? {
+        return blank_lif_region(meta, layout, w, h);
+    }
+    if matches!(plane_layout, LifPlaneLayout::InterleavedColor) && rgb_samples == 3 {
+        bgr_to_rgb(&mut out, true, bps as usize, rgb_samples as usize);
+    }
+    Ok(out)
+}
+
+fn decode_lif_uncompressed_planar_color_region_from_file(
+    file: &mut File,
+    block: &MemoryBlock,
+    info: &SeriesInfo,
+    plane_base: u64,
+    c: u32,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+) -> Result<Vec<u8>> {
+    let meta = &info.meta;
+    let layout = &info.layout;
+    let bps = meta.pixel_type.bytes_per_sample() as u64;
+    let out_row = checked_mul_u64(u64::from(w), bps, "Leica LIF output row")? as usize;
+    let mut out = Vec::with_capacity(
+        (h as usize)
+            .checked_mul(out_row)
+            .and_then(|n| n.checked_mul(meta.size_c as usize))
+            .ok_or_else(|| BioFormatsError::Format("Leica LIF output size overflows".into()))?,
+    );
+    let row_start_delta = checked_add_u64(
+        checked_mul_u64(u64::from(y), layout.y_stride, "Leica LIF row offset")?,
+        checked_mul_u64(u64::from(x), bps, "Leica LIF column offset")?,
+        "Leica LIF region offset",
+    )?;
+
+    let mut row_ranges = Vec::with_capacity(meta.size_c as usize * h as usize);
+    let rgb_samples = lif_rgb_channel_count(meta) as usize;
+    let first_channel = (c as usize)
+        .checked_mul(rgb_samples)
+        .ok_or_else(|| BioFormatsError::Format("Leica LIF RGB channel index overflows".into()))?;
+    let group_offsets = layout
+        .channel_offsets
+        .get(first_channel..first_channel + rgb_samples)
+        .ok_or_else(|| {
+            BioFormatsError::UnsupportedFormat(format!(
+                "Leica LIF RGB channel group {c} is not described by channel offsets {:?}",
+                layout.channel_offsets
+            ))
+        })?;
+    for &channel_offset in group_offsets {
+        let channel_base =
+            checked_add_u64(plane_base, channel_offset, "Leica LIF RGB channel offset")?;
+        for row in 0..u64::from(h) {
+            let src = checked_add_u64(
+                channel_base,
+                checked_add_u64(
+                    row_start_delta,
+                    checked_mul_u64(row, layout.y_stride, "Leica LIF row offset")?,
+                    "Leica LIF row offset",
+                )?,
+                "Leica LIF source offset",
+            )?;
+            let end = checked_add_u64(src, out_row as u64, "Leica LIF source end")?;
+            row_ranges.push((src, end));
+        }
+    }
+    if !copy_lif_uncompressed_file_ranges(file, block, &row_ranges, &mut out)? {
+        return blank_lif_region(meta, layout, w, h);
+    }
+    if rgb_samples == 3 {
+        bgr_to_rgb(&mut out, false, bps as usize, rgb_samples);
+    }
+    Ok(out)
+}
+
+fn copy_lif_uncompressed_file_ranges(
+    file: &mut File,
+    block: &MemoryBlock,
+    row_ranges: &[(u64, u64)],
+    out: &mut Vec<u8>,
+) -> Result<bool> {
+    let block_end = block
+        .file_offset
+        .checked_add(block.byte_len)
+        .ok_or_else(|| BioFormatsError::Format("Leica LIF block end overflows".into()))?;
+    let file_len = file.metadata().map_err(BioFormatsError::Io)?.len();
+    if let (Some(&(first_src, _)), Some(&(_, last_end))) = (row_ranges.first(), row_ranges.last()) {
+        if row_ranges.windows(2).all(|pair| pair[0].1 <= pair[1].0) {
+            let abs_src = checked_add_u64(block.file_offset, first_src, "Leica LIF source offset")?;
+            let abs_end = checked_add_u64(block.file_offset, last_end, "Leica LIF source end")?;
+            if abs_end > block_end || abs_end > file_len {
+                return Ok(false);
+            }
+            let span_len = usize::try_from(abs_end - abs_src)
+                .map_err(|_| BioFormatsError::Format("Leica LIF row span is too large".into()))?;
+            if span_len <= 64 * 1024 * 1024 {
+                let mut span = vec![0; span_len];
+                file.seek(SeekFrom::Start(abs_src))
+                    .map_err(BioFormatsError::Io)?;
+                file.read_exact(&mut span).map_err(BioFormatsError::Io)?;
+                for &(src, end) in row_ranges {
+                    let start = usize::try_from(src - first_src).map_err(|_| {
+                        BioFormatsError::Format("Leica LIF row offset is too large".into())
+                    })?;
+                    let len = usize::try_from(end - src).map_err(|_| {
+                        BioFormatsError::Format("Leica LIF row slice is too large".into())
+                    })?;
+                    out.extend_from_slice(&span[start..start + len]);
+                }
+                return Ok(true);
+            }
+        }
+    }
+
+    for &(src, end) in row_ranges {
+        let abs_src = checked_add_u64(block.file_offset, src, "Leica LIF source offset")?;
+        let abs_end = checked_add_u64(block.file_offset, end, "Leica LIF source end")?;
+        if abs_end > block_end || abs_end > file_len {
+            return Ok(false);
+        }
+        let len = usize::try_from(abs_end - abs_src)
+            .map_err(|_| BioFormatsError::Format("Leica LIF row slice is too large".into()))?;
+        let start = out.len();
+        out.resize(start + len, 0);
+        file.seek(SeekFrom::Start(abs_src))
+            .map_err(BioFormatsError::Io)?;
+        if let Err(err) = file.read_exact(&mut out[start..]) {
+            out.truncate(start);
+            return Err(BioFormatsError::Io(err));
+        }
+    }
+    Ok(true)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -932,6 +1316,7 @@ fn is_generic_compressed_hint(compression: &str) -> bool {
     matches!(value.as_str(), "1" | "true" | "yes" | "compressed")
 }
 
+#[allow(dead_code)]
 fn lif_block_payload<'a>(data: &'a [u8], block: &MemoryBlock) -> Option<&'a [u8]> {
     let start = usize::try_from(block.file_offset).ok()?;
     let len = usize::try_from(block.byte_len).ok()?;
@@ -1157,12 +1542,25 @@ fn read_i32(data: &[u8], off: usize) -> Result<i32> {
     ]))
 }
 
+#[allow(dead_code)]
 fn read_i64(data: &[u8], off: usize) -> Result<i64> {
     if off + 8 > data.len() {
         return Err(BioFormatsError::Format("LIF: read past EOF (i64)".into()));
     }
     let mut b = [0u8; 8];
     b.copy_from_slice(&data[off..off + 8]);
+    Ok(i64::from_le_bytes(b))
+}
+
+fn read_i32_file(file: &mut File) -> Result<i32> {
+    let mut b = [0u8; 4];
+    file.read_exact(&mut b).map_err(BioFormatsError::Io)?;
+    Ok(i32::from_le_bytes(b))
+}
+
+fn read_i64_file(file: &mut File) -> Result<i64> {
+    let mut b = [0u8; 8];
+    file.read_exact(&mut b).map_err(BioFormatsError::Io)?;
     Ok(i64::from_le_bytes(b))
 }
 
@@ -1557,6 +1955,7 @@ fn annotate_lif_storage(
     }
 }
 
+#[allow(dead_code)]
 fn annotate_lif_compression_payloads(
     series: &mut [SeriesInfo],
     memory_blocks: &[MemoryBlock],
@@ -1610,6 +2009,78 @@ fn annotate_lif_compression_payloads(
 
         series_index = end;
         group_index += 1;
+    }
+}
+
+fn annotate_lif_compression_payloads_from_file(
+    path: &Path,
+    series: &mut [SeriesInfo],
+    memory_blocks: &[MemoryBlock],
+) -> Result<()> {
+    let mut file: Option<File> = None;
+    let mut series_index = 0usize;
+    let mut group_index = 0usize;
+    while series_index < series.len() {
+        let tiles = series[series_index].tile_count.max(1) as usize;
+        let end = (series_index + tiles).min(series.len());
+
+        if series[series_index].layout.compression.is_some() {
+            if let Some(block) = memory_blocks.get(group_index) {
+                let len = usize::try_from(block.byte_len).map_err(|_| {
+                    BioFormatsError::Format("Leica LIF compressed block is too large".into())
+                })?;
+                let f = match file.as_mut() {
+                    Some(f) => f,
+                    None => {
+                        file = Some(File::open(path).map_err(BioFormatsError::Io)?);
+                        file.as_mut().unwrap()
+                    }
+                };
+                f.seek(SeekFrom::Start(block.file_offset))
+                    .map_err(BioFormatsError::Io)?;
+                let mut payload = vec![0; len];
+                f.read_exact(&mut payload).map_err(BioFormatsError::Io)?;
+                annotate_lif_compression_payload(&mut series[series_index..end], &payload);
+            }
+        }
+
+        series_index = end;
+        group_index += 1;
+    }
+    Ok(())
+}
+
+fn annotate_lif_compression_payload(series: &mut [SeriesInfo], payload: &[u8]) {
+    let signature = lif_payload_signature(payload);
+    let first_bytes = lif_payload_first_bytes(payload);
+    for info in series {
+        if let Some(compression) = info.layout.compression.as_deref() {
+            if lif_compression_kind(compression).is_none() {
+                if let Some(kind) = lif_compression_kind_for_payload(compression, payload) {
+                    info.meta.series_metadata.insert(
+                        "lif.compression.status".to_string(),
+                        MetadataValue::String(format!(
+                            "{}_payload_signature",
+                            kind.metadata_status()
+                        )),
+                    );
+                    info.meta.series_metadata.insert(
+                        "lif.compression.diagnostic".to_string(),
+                        MetadataValue::String(format!(
+                            "Leica LIF compressed pixel payload declares generic/unsupported compression hint {compression}; routing by bounded payload signature {signature}"
+                        )),
+                    );
+                }
+            }
+        }
+        info.meta.series_metadata.insert(
+            "lif.compression.payload_signature".to_string(),
+            MetadataValue::String(signature.to_string()),
+        );
+        info.meta.series_metadata.insert(
+            "lif.compression.payload_first_bytes".to_string(),
+            MetadataValue::String(first_bytes.clone()),
+        );
     }
 }
 

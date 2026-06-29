@@ -1080,11 +1080,23 @@ impl TiffReader {
 
         let mut label_index: Option<usize> = None;
         let mut macro_index: Option<usize> = None;
+        let mut skip_positions: Vec<usize> = Vec::new();
 
         for (i, &ifd_idx) in main_ifds.iter().enumerate() {
             let ifd = &file.ifds[ifd_idx];
             let comment = ifd.get_str(tag::IMAGE_DESCRIPTION);
             let subfile_type = ifd.get_u32(tag::NEW_SUBFILE_TYPE).unwrap_or(0);
+            let stripped_thumbnail = subfile_type != 0
+                && ifd.get(tag::STRIP_BYTE_COUNTS).is_some()
+                && ifd.get(tag::TILE_BYTE_COUNTS).is_none()
+                && matches!(
+                    Compression::from(ifd.get_u16(tag::COMPRESSION).unwrap_or(1)),
+                    Compression::Lzw
+                );
+            if stripped_thumbnail {
+                skip_positions.push(i);
+                continue;
+            }
 
             match comment {
                 None => {
@@ -1128,7 +1140,7 @@ impl TiffReader {
         // Resolution images are the main IFDs that are NOT label/macro, in order.
         let extra: Vec<usize> = [label_index, macro_index].into_iter().flatten().collect();
         let resolution_positions: Vec<usize> = (0..main_ifds.len())
-            .filter(|i| !extra.contains(i))
+            .filter(|i| !extra.contains(i) && !skip_positions.contains(i))
             .collect();
         if resolution_positions.is_empty() {
             return Ok(());
@@ -1458,9 +1470,9 @@ impl TiffReader {
         let planarize_rgb = should_planarize_chunky_rgb(info, self.path.as_deref());
 
         let file = self.file.as_mut().ok_or(BioFormatsError::NotInitialized)?;
-        // JPEG-compressed YCbCr decodes to RGB inside the JPEG codec, so it takes
-        // the generic chunky path below (ycbcr = false). Only the manual TIFF
-        // YCbCr conversion path has the 8-bit/chunky restriction.
+        // JPEG/JPEG-XR-compressed YCbCr decodes to RGB inside the codec, so it
+        // takes the generic chunky path below (ycbcr = false). Only the manual
+        // TIFF YCbCr conversion path has the 8-bit/chunky restriction.
         let jpeg_ycbcr = ycbcr_decoded_by_jpeg(info);
         if info.photometric == Photometric::YCbCr && !jpeg_ycbcr && is_unsupported_ycbcr(info) {
             return Err(BioFormatsError::UnsupportedFormat(
@@ -2276,9 +2288,9 @@ impl TiffReader {
             return self.read_planar_tiled_plane(info, x, y, w, h);
         }
 
-        // JPEG-compressed YCbCr tiles decode to chunky RGB inside the JPEG codec;
-        // fall through to the generic chunky-RGB tile path. Only non-JPEG YCbCr
-        // uses the manual TIFF YCbCr (tag 529/532) conversion.
+        // JPEG/JPEG-XR-compressed YCbCr tiles decode to chunky RGB inside the
+        // codec; fall through to the generic chunky-RGB tile path. Only
+        // non-codec YCbCr uses the manual TIFF YCbCr (tag 529/532) conversion.
         if info.photometric == Photometric::YCbCr && !ycbcr_decoded_by_jpeg(info) {
             if is_unsupported_ycbcr(info) {
                 return Err(BioFormatsError::UnsupportedFormat(
@@ -4057,14 +4069,15 @@ fn apply_photometric(
     }
 }
 
-/// True when a YCbCr IFD is JPEG-compressed (old- or new-style). The JPEG
-/// decoder performs the YCbCr->RGB conversion internally and emits chunky RGB,
-/// so these IFDs are decoded through the generic RGB path rather than the manual
-/// TIFF YCbCr (tag 529/532) conversion. Mirrors Java, where the JPEG codec
-/// returns RGB and TiffParser does not re-apply YCbCr math to JPEG output.
+/// True when a YCbCr IFD is codec-compressed to RGB bytes (old/new-style JPEG
+/// or JPEG-XR). These IFDs are decoded through the generic RGB path rather than
+/// the manual TIFF YCbCr (tag 529/532) conversion.
 fn ycbcr_decoded_by_jpeg(info: &IfdInfo) -> bool {
     info.photometric == Photometric::YCbCr
-        && matches!(info.compression, Compression::Jpeg | Compression::JpegNew)
+        && matches!(
+            info.compression,
+            Compression::Jpeg | Compression::JpegNew | Compression::JpegXR
+        )
 }
 
 /// Decide how a JPEG-compressed strip/tile's components map to output channels.
@@ -4084,10 +4097,7 @@ fn jpeg_color_for(info: &IfdInfo) -> JpegColor {
 }
 
 fn is_unsupported_ycbcr(info: &IfdInfo) -> bool {
-    info.bits_per_sample != 8
-        || info.planar_config != 1
-        || info.samples_per_pixel < 3
-        || matches!(info.compression, Compression::JpegXR)
+    info.bits_per_sample != 8 || info.planar_config != 1 || info.samples_per_pixel < 3
 }
 
 fn ycbcr_strip_bytes(width: u32, rows: u32, subsampling: (u16, u16)) -> usize {

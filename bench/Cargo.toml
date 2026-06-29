@@ -11,5 +11,12 @@ path = "bench_rust.rs"
 name = "bench_subset_rust"
 path = "bench_subset_rust.rs"
 
+[[bin]]
+name = "bench_profile_rust"
+path = "bench_profile_rust.rs"
+
 [dependencies]
 bioformats = { path = ".." }
+
+[patch.crates-io]
+hdf5-pure-rust = { path = "../vendor/hdf5-pure-rust" }

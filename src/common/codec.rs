@@ -264,17 +264,24 @@ pub fn decompress_jpeg2000_with_endianness(data: &[u8], little_endian: bool) -> 
     })?;
 
     for (idx, component) in components.iter().enumerate() {
-        if component.width() as usize != width || component.height() as usize != height {
-            return Err(BioFormatsError::Codec(format!(
-                "JPEG 2000: unsupported component geometry mismatch at component {idx}"
-            )));
-        }
         if component.precision() != first_precision {
             return Err(BioFormatsError::Codec(format!(
                 "JPEG 2000: unsupported component precision mismatch at component {idx}"
             )));
         }
-        if component.data().len() < component_pixels {
+        let component_width = component.width() as usize;
+        let component_height = component.height() as usize;
+        if component_width == 0 || component_height == 0 {
+            return Err(BioFormatsError::Codec(format!(
+                "JPEG 2000: component {idx} has zero geometry"
+            )));
+        }
+        let own_pixels = component_width
+            .checked_mul(component_height)
+            .ok_or_else(|| {
+                BioFormatsError::Codec(format!("JPEG 2000: component {idx} geometry is too large"))
+            })?;
+        if component.data().len() < own_pixels {
             return Err(BioFormatsError::Codec(format!(
                 "JPEG 2000: component {idx} data is shorter than its geometry"
             )));
@@ -304,7 +311,12 @@ pub fn decompress_jpeg2000_with_endianness(data: &[u8], little_endian: bool) -> 
     for y in 0..height {
         for x in 0..width {
             for c in 0..n_components {
-                let val = components[c].data()[y * width + x];
+                let component = &components[c];
+                let cw = component.width() as usize;
+                let ch = component.height() as usize;
+                let cx = x * cw / width;
+                let cy = y * ch / height;
+                let val = component.data()[cy * cw + cx];
                 if little_endian {
                     let bytes = val.to_le_bytes();
                     out.extend_from_slice(&bytes[..bps]);

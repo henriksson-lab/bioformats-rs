@@ -1,0 +1,8 @@
+group	url	local_path	mode
+# mode=file downloads one file. mode=index downloads every file linked by that directory index.
+ventana	https://downloads.openmicroscopy.org/images/Ventana/openslide/	userdata/openmicroscopy-images/Ventana/openslide	index
+bdv-samples	https://downloads.openmicroscopy.org/images/BDV/samples/	userdata/openmicroscopy-images/BDV/samples	index
+ics-jan	https://downloads.openmicroscopy.org/images/ICS/jan/	userdata/openmicroscopy-images/ICS/jan	index
+leica-scn-1	https://downloads.openmicroscopy.org/images/Leica-SCN/openslide/Leica-1/	userdata/openmicroscopy-images/Leica-SCN/openslide/Leica-1	index
+sdt-gh-4198	https://downloads.openmicroscopy.org/images/SDT/gh-4198/	userdata/openmicroscopy-images/SDT/gh-4198	index
+cv7000-cpg0016	https://downloads.openmicroscopy.org/images/CV7000/cpg0016/Dest21053D1-15214/	userdata/openmicroscopy-images/CV7000/cpg0016/Dest21053D1-15214	index

@@ -624,6 +624,170 @@ impl IcsReader {
         Ok(data)
     }
 
+    fn data_file_and_offset(&self) -> Result<(File, u64)> {
+        let hdr = self
+            .header
+            .as_ref()
+            .ok_or(BioFormatsError::NotInitialized)?;
+        let ics_path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let data_path = Self::data_path(ics_path, hdr)?;
+        let data_offset = if hdr.version < 2.0 {
+            0
+        } else {
+            hdr.data_offset
+        };
+        let file = File::open(&data_path).map_err(BioFormatsError::Io)?;
+        Ok((file, data_offset))
+    }
+
+    fn axis_strides(hdr: &IcsHeader) -> Result<Vec<usize>> {
+        let mut strides = vec![0usize; hdr.order.len()];
+        let mut stride = 1usize;
+        for (i, (axis, &size)) in hdr.order.iter().zip(hdr.sizes.iter()).enumerate() {
+            if axis == "bits" {
+                strides[i] = 0;
+                continue;
+            }
+            strides[i] = stride;
+            stride = stride
+                .checked_mul(size.max(1) as usize)
+                .ok_or_else(|| BioFormatsError::InvalidData("ICS axis size overflow".into()))?;
+        }
+        Ok(strides)
+    }
+
+    fn read_raw_region(&self, plane_index: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let hdr = self
+            .header
+            .as_ref()
+            .ok_or(BioFormatsError::NotInitialized)?;
+
+        if x.checked_add(w).is_none_or(|v| v > meta.size_x)
+            || y.checked_add(h).is_none_or(|v| v > meta.size_y)
+        {
+            return Err(BioFormatsError::InvalidData(format!(
+                "ICS region {x},{y} {w}x{h} outside {}x{}",
+                meta.size_x, meta.size_y
+            )));
+        }
+
+        if hdr.gzip_compressed {
+            let full = self.load_raw_data(plane_index)?;
+            let samples_per_pixel = if meta.is_rgb { meta.size_c.max(1) } else { 1 } as usize;
+            return crop_full_plane("ICS", &full, meta, samples_per_pixel, x, y, w, h);
+        }
+
+        let bytes_per_sample = meta.pixel_type.bytes_per_sample();
+        let samples_per_pixel = if meta.is_rgb { meta.size_c.max(1) } else { 1 } as usize;
+        let out_len = (w as usize)
+            .checked_mul(h as usize)
+            .and_then(|px| px.checked_mul(samples_per_pixel))
+            .and_then(|samples| samples.checked_mul(bytes_per_sample))
+            .ok_or_else(|| BioFormatsError::InvalidData("ICS region byte size overflow".into()))?;
+        let fixed_coords = self.axis_coords_for_plane(meta, plane_index)?;
+        let strides = Self::axis_strides(hdr)?;
+        let x_axis = hdr
+            .order
+            .iter()
+            .position(|axis| axis == "x" || axis == "width")
+            .ok_or_else(|| BioFormatsError::Format("ICS missing X axis".into()))?;
+        let y_axis = hdr
+            .order
+            .iter()
+            .position(|axis| axis == "y" || axis == "height")
+            .ok_or_else(|| BioFormatsError::Format("ICS missing Y axis".into()))?;
+        let channel_axis = meta
+            .is_rgb
+            .then(|| {
+                hdr.order.iter().position(|axis| {
+                    !matches!(
+                        axis.as_str(),
+                        "bits" | "x" | "width" | "y" | "height" | "z" | "depth" | "t" | "time"
+                    )
+                })
+            })
+            .flatten();
+        let mut out = vec![0u8; out_len];
+        let (mut file, data_offset) = self.data_file_and_offset()?;
+
+        for row in 0..h as usize {
+            let logical_y = y as usize + row;
+            let source_y = if hdr.invert_y {
+                meta.size_y as usize - 1 - logical_y
+            } else {
+                logical_y
+            };
+
+            if samples_per_pixel == 1 && strides[x_axis] == 1 {
+                let mut coords = fixed_coords.clone();
+                coords[x_axis] = x;
+                coords[y_axis] = source_y as u32;
+                let sample_index = coords
+                    .iter()
+                    .zip(strides.iter())
+                    .try_fold(0usize, |acc, (&coord, &stride)| {
+                        (coord as usize)
+                            .checked_mul(stride)
+                            .and_then(|v| acc.checked_add(v))
+                    })
+                    .ok_or_else(|| {
+                        BioFormatsError::InvalidData("ICS sample offset overflow".into())
+                    })?;
+                let src = data_offset
+                    .checked_add(sample_index.checked_mul(bytes_per_sample).ok_or_else(|| {
+                        BioFormatsError::InvalidData("ICS byte offset overflow".into())
+                    })? as u64)
+                    .ok_or_else(|| {
+                        BioFormatsError::InvalidData("ICS byte offset overflow".into())
+                    })?;
+                let row_bytes = w as usize * bytes_per_sample;
+                let dst = row * row_bytes;
+                file.seek(SeekFrom::Start(src))
+                    .map_err(BioFormatsError::Io)?;
+                file.read_exact(&mut out[dst..dst + row_bytes])
+                    .map_err(BioFormatsError::Io)?;
+                continue;
+            }
+
+            for col in 0..w as usize {
+                for s in 0..samples_per_pixel {
+                    let mut coords = fixed_coords.clone();
+                    coords[x_axis] = x + col as u32;
+                    coords[y_axis] = source_y as u32;
+                    if let Some(axis) = channel_axis {
+                        coords[axis] = s as u32;
+                    }
+                    let sample_index = coords
+                        .iter()
+                        .zip(strides.iter())
+                        .try_fold(0usize, |acc, (&coord, &stride)| {
+                            (coord as usize)
+                                .checked_mul(stride)
+                                .and_then(|v| acc.checked_add(v))
+                        })
+                        .ok_or_else(|| {
+                            BioFormatsError::InvalidData("ICS sample offset overflow".into())
+                        })?;
+                    let src = data_offset
+                        .checked_add(sample_index.checked_mul(bytes_per_sample).ok_or_else(
+                            || BioFormatsError::InvalidData("ICS byte offset overflow".into()),
+                        )? as u64)
+                        .ok_or_else(|| {
+                            BioFormatsError::InvalidData("ICS byte offset overflow".into())
+                        })?;
+                    let dst = ((row * w as usize + col) * samples_per_pixel + s) * bytes_per_sample;
+                    file.seek(SeekFrom::Start(src))
+                        .map_err(BioFormatsError::Io)?;
+                    file.read_exact(&mut out[dst..dst + bytes_per_sample])
+                        .map_err(BioFormatsError::Io)?;
+                }
+            }
+        }
+
+        self.normalize_endianness(out)
+    }
+
     fn load_raw_data(&self, plane_index: u32) -> Result<Vec<u8>> {
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         let hdr = self
@@ -643,18 +807,7 @@ impl IcsReader {
 
         let payload = self.data_payload()?;
         let fixed_coords = self.axis_coords_for_plane(meta, plane_index)?;
-        let mut strides = vec![0usize; hdr.order.len()];
-        let mut stride = 1usize;
-        for (i, (axis, &size)) in hdr.order.iter().zip(hdr.sizes.iter()).enumerate() {
-            if axis == "bits" {
-                strides[i] = 0;
-                continue;
-            }
-            strides[i] = stride;
-            stride = stride
-                .checked_mul(size.max(1) as usize)
-                .ok_or_else(|| BioFormatsError::InvalidData("ICS axis size overflow".into()))?;
-        }
+        let strides = Self::axis_strides(hdr)?;
 
         let x_axis = hdr
             .order
@@ -816,10 +969,11 @@ impl FormatReader for IcsReader {
         w: u32,
         h: u32,
     ) -> Result<Vec<u8>> {
-        let full = self.open_bytes(plane_index)?;
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        let samples_per_pixel = if meta.is_rgb { meta.size_c.max(1) } else { 1 } as usize;
-        crop_full_plane("ICS", &full, meta, samples_per_pixel, x, y, w, h)
+        let count = self.meta.as_ref().map(|m| m.image_count).unwrap_or(0);
+        if plane_index >= count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        self.read_raw_region(plane_index, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {

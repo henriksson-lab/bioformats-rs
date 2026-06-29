@@ -117,6 +117,15 @@ pub(crate) fn open_reader(path: &Path) -> Result<Box<dyn FormatReader>> {
         return Ok(r);
     }
 
+    // ICS1 datasets are a text `.ics` header plus raw `.ids` pixels. The raw
+    // companion has no ICS magic and can accidentally match unrelated byte
+    // probes, but Java ICSReader accepts either side by suffix.
+    if has_ics_extension(path) || (has_ids_extension(path) && ics_header_sibling_exists(path)) {
+        let mut r = boxed_reader(crate::formats::ics::IcsReader::new());
+        r.set_id(path)?;
+        return Ok(r);
+    }
+
     let header = peek_header(path, DETECTION_HEADER_BYTES)?;
     let mut best_error = None;
 
@@ -132,10 +141,14 @@ pub(crate) fn open_reader(path: &Path) -> Result<Box<dyn FormatReader>> {
     // route straight to the HDF5 Imaris reader before any TIFF-based handling.
     if has_ims_extension(path) && is_hdf5_header(&header) {
         let mut r = boxed_reader(crate::formats::imaris_hdf::ImarisHdfReader::new());
-        match r.set_id(path) {
-            Ok(()) => return Ok(r),
-            Err(err) => remember_set_id_error(&mut best_error, err),
-        }
+        r.set_id(path)?;
+        return Ok(r);
+    }
+
+    if has_h5_extension(path) && is_hdf5_header(&header) && has_bdv_xml_sibling(path) {
+        let mut r = boxed_reader(crate::formats::bdv::BdvReader::new());
+        r.set_id(path)?;
+        return Ok(r);
     }
 
     // ZVI is an OLE/CFB container whose magic bytes are shared with many other
@@ -282,6 +295,32 @@ fn has_klb_extension(path: &Path) -> bool {
         .and_then(|ext| ext.to_str())
         .map(|ext| ext.eq_ignore_ascii_case("klb"))
         .unwrap_or(false)
+}
+
+fn has_ics_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.eq_ignore_ascii_case("ics"))
+        .unwrap_or(false)
+}
+
+fn has_ids_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.eq_ignore_ascii_case("ids"))
+        .unwrap_or(false)
+}
+
+fn ics_header_sibling_exists(path: &Path) -> bool {
+    let Some(ext) = path.extension().and_then(|ext| ext.to_str()) else {
+        return false;
+    };
+    let ics_ext = if ext.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+        "ICS"
+    } else {
+        "ics"
+    };
+    path.with_extension(ics_ext).exists()
 }
 
 fn has_zvi_extension(path: &Path) -> bool {
@@ -439,6 +478,30 @@ fn has_ims_extension(path: &Path) -> bool {
         .and_then(|e| e.to_str())
         .map(|e| e.eq_ignore_ascii_case("ims"))
         .unwrap_or(false)
+}
+
+fn has_h5_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("h5"))
+        .unwrap_or(false)
+}
+
+fn has_bdv_xml_sibling(path: &Path) -> bool {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let base = file_name
+        .find('.')
+        .map(|i| &file_name[..i])
+        .unwrap_or(file_name);
+    let candidate = parent.join(format!("{base}.xml"));
+    let Ok(xml) = std::fs::read_to_string(candidate) else {
+        return false;
+    };
+    let lower = xml.to_ascii_lowercase();
+    xml.contains("SpimData")
+        && lower.contains("bdv.hdf5")
+        && lower.contains(&file_name.to_ascii_lowercase())
 }
 
 fn has_tiff_extension(path: &Path) -> bool {

@@ -1,0 +1,82 @@
+format	path	status	size_bytes	suffix
+AmiraMesh	/big/henriksson/ome_images/AmiraMesh/ignacio/test.am	present	18130	.am
+AmiraMesh	/big/henriksson/ome_images/AmiraMesh/imagesc-50585/BF_Check.tif	present	10284	.tif
+BDV	/big/henriksson/ome_images/BDV/idr0038/Lam-Cytok-MV-f0.h5	present	13279437715	.h5
+BDV	/big/henriksson/ome_images/BDV/idr0038/Lam-Cytok-MV-f0.xml	present	2554	.xml
+CV7000	/big/henriksson/ome_images/CV7000/cpg0016/Dest21053D1-15214/crosstalk_parameter.xml	present	1821	.xml
+CV7000	/big/henriksson/ome_images/CV7000/cpg0016/Dest21053D1-15214/DC_DCAM#1_CAM3.tif	present	8005522	.tif
+CellH5	/big/henriksson/ome_images/CellH5/idr0013/00001_01.ch5	present	67519830	.ch5
+CellH5	/big/henriksson/ome_images/CellH5/samples/full/0013.ch5	present	341756246	.ch5
+CellSens	/big/henriksson/ome_images/CellSens/evident/Image_V4.1_BF.vsi	present	1270466	.vsi
+CellSens	/big/henriksson/ome_images/CellSens/evident/Image_V4.1_FL_2D.vsi	present	981224	.vsi
+DCIMG	/big/henriksson/ome_images/DCIMG/zenodo-14268554/bead_bot4_018/bead_bot4__560_00000_00000.dcimg	present	820384	.dcimg
+DCIMG	/big/henriksson/ome_images/DCIMG/zenodo-14268554/bead_bot4_018/bead_bot4__560_00000_00001.dcimg	present	820384	.dcimg
+DICOM	/big/henriksson/ome_images/DICOM/samples/CR-MONO1-10-chest.dcm	present	387976	.dcm
+DICOM	/big/henriksson/ome_images/DICOM/samples/CT-MONO2-12-lomb-an2.dcm	present	525518	.dcm
+DV	/big/henriksson/ome_images/DV/alexia/cajal-bodies/090829_10_HeLa_siCTL_coilin_ATUB01_10_R3D_D3D.dv	present	78668800	.dv
+DV	/big/henriksson/ome_images/DV/alexia/cajal-bodies/090829_11_HeLa_siCTL_coilin_ATUB01_11_R3D_D3D.dv	present	78668800	.dv
+Flex	/big/henriksson/ome_images/Flex/idr0001/X_110331_S13/Meas_01(2011-03-31_11-53-03)/001001000.flex	present	91651181	.flex
+Flex	/big/henriksson/ome_images/Flex/idr0001/X_110331_S13/Meas_01(2011-03-31_11-53-03)/001002000.flex	present	91651213	.flex
+Gatan	/big/henriksson/ome_images/Gatan/EMPIAR/EMPIAR-10013/BGal_000438_frames.dm4	present	8657894391	.dm4
+Gatan	/big/henriksson/ome_images/Gatan/imagesc-36590/191041a_ctl_M2_3VBSED_0045.dm4	present	200614673	.dm4
+HCS	/big/henriksson/ome_images/HCS/INCELL2000/idr0017/2011-11-17_X-Man_LOPAC_X01_LP_S01_1/A - 1(fld 1 wv Cy3 - Cy3).tif	present	8389026	.tif
+HCS	/big/henriksson/ome_images/HCS/INCELL2000/idr0017/2011-11-17_X-Man_LOPAC_X01_LP_S01_1/A - 1(fld 1 wv DAPI - DAPI).tif	present	8389028	.tif
+Hamamatsu-NDPI	/big/henriksson/ome_images/Hamamatsu-NDPI/hamamatsu/DM0014 - 2020-04-02 10.25.21.ndpi	present	2817876014	.ndpi
+Hamamatsu-NDPI	/big/henriksson/ome_images/Hamamatsu-NDPI/hamamatsu/DM0014 - 2020-04-02 11.10.47.ndpi	present	2106109404	.ndpi
+Hamamatsu-VMS	/big/henriksson/ome_images/Hamamatsu-VMS/openslide/CMU-1/CMU-1-40x - 2010-01-12 13.24.05.vms	present	711	.vms
+Hamamatsu-VMS	/big/henriksson/ome_images/Hamamatsu-VMS/openslide/CMU-2/CMU-2-40x - 2010-01-12 13.38.58.vms	present	826	.vms
+ICS	/big/henriksson/ome_images/ICS/gh-4197/20240612_training_test-tiles_01_stitched.ics	present	477	.ics
+ICS	/big/henriksson/ome_images/ICS/gh-4197/20240612_training_test-tiles_01_stitched.ids	present	1267924800	.ids
+Imaris-IMS	/big/henriksson/ome_images/Imaris-IMS/bitplane/lz4/croppedCDM3DLz4.ims	present	3018452	.ims
+Imaris-IMS	/big/henriksson/ome_images/Imaris-IMS/bitplane/lz4/croppedRetinaLz4.ims	present	1006389	.ims
+InCell2000	/big/henriksson/ome_images/InCell2000/idr0017/2011-11-17_X-Man_LOPAC_X01_LP_S01_1/A - 1(fld 1 wv Cy3 - Cy3).tif	present	8389026	.tif
+InCell2000	/big/henriksson/ome_images/InCell2000/idr0017/2011-11-17_X-Man_LOPAC_X01_LP_S01_1/A - 1(fld 1 wv DAPI - DAPI).tif	present	8389028	.tif
+InCell3000	/big/henriksson/ome_images/InCell3000/BBBC013/BBBC013_v1_images_frm/20041103 1049_01_REF-1049-03 - EvoTec_0_A10_0.frm	present	927744	.frm
+InCell3000	/big/henriksson/ome_images/InCell3000/BBBC013/BBBC013_v1_images_frm/20041103 1049_01_REF-1049-03 - EvoTec_0_A11_0.frm	present	979456	.frm
+KLB	/big/henriksson/ome_images/KLB/idr0044/Mmu_E1_CAGTAG1.TM000000_timeFused_blending/SPM00_TM000000_CM00_CM01_CHN00.fusedStack.corrected.shifted.klb	present	3448048	.klb
+KLB	/big/henriksson/ome_images/KLB/idr0044/Mmu_E1_CAGTAG1.TM000000_timeFused_blending/SPM00_TM000000_CM00_CM01_CHN00.fusedStack_xyProjection.corrected.shifted.klb	present	27620	.klb
+LEO	/big/henriksson/ome_images/LEO/dmankus/2160grating 1024.tif	present	888791	.tif
+LEO	/big/henriksson/ome_images/LEO/dmankus/2160grating 3072.tif	present	7180224	.tif
+Leica-LIF	/big/henriksson/ome_images/Leica-LIF/imagesc-110520/AMR1.lif	present	3011996417	.lif
+Leica-LIF	/big/henriksson/ome_images/Leica-LIF/imagesc-30856/20191025 Test FRET 585. 423, 426.lif	present	49313199	.lif
+Leica-SCN	/big/henriksson/ome_images/Leica-SCN/openslide/Leica-1/Leica-1.scn	present	291812870	.scn
+Leica-SCN	/big/henriksson/ome_images/Leica-SCN/openslide/Leica-2/Leica-2.scn	present	2252519322	.scn
+Leica-XLEF	/big/henriksson/ome_images/Leica-XLEF/2020_06_23_sample 3 U2OS/XLEF-LOF 2020_06_23_sample 3 U2OS/XLEF-LOF 2020_06_23_sample 3 U2OS.xlef	present	1532	.xlef
+Leica-XLEF	/big/henriksson/ome_images/Leica-XLEF/2020_06_23_sample 3 U2OS/XLEF-TIF 2020_06_23_sample 3 U2OS/2020_06_23_sample 3 U2OS.xlef	present	1491	.xlef
+MetaXpress	/big/henriksson/ome_images/MetaXpress/idr0005/Primary_001/2011-04-19-plate-1.HTD	present	967	.htd
+MetaXpress	/big/henriksson/ome_images/MetaXpress/idr0006/plate 11001_Plate_136/plate 11001.HTD	present	1242	.htd
+Metamorph	/big/henriksson/ome_images/Metamorph/zenodo-13642395/test_timelapse_20240816.nd	present	358	.nd
+Metamorph	/big/henriksson/ome_images/Metamorph/zenodo-13642395/test_timelapse_20240816_s1_t1.TIF	present	2104744	.tif
+Micro-Manager	/big/henriksson/ome_images/Micro-Manager/1.4.23/jens/fucci_GFP-geminin_RFP-cdt1_2_MMStack_Pos0.ome.tif	present	435040571	.ome.tif
+ND2	/big/henriksson/ome_images/ND2/aryeh/4_2_1_cont_NoMR001.nd2	present	331821144	.nd2
+ND2	/big/henriksson/ome_images/ND2/aryeh/4_con_2_1_cot002.nd2	present	788786722	.nd2
+NIfTI	/big/henriksson/ome_images/NIfTI/NIH/103.1.sirp.xml	present	190325	.xml
+NIfTI	/big/henriksson/ome_images/NIfTI/NIH/avg152T1_LR_nifti.nii	present	902981	.nii
+OME-TIFF	/big/henriksson/ome_images/OME-TIFF/2003-FC/Iron-Plate.ome.tiff	present	820963	.ome.tiff
+OME-TIFF	/big/henriksson/ome_images/OME-TIFF/2003-FC/single-channel.ome.tif	present	42053	.ome.tif
+OME-XML	/big/henriksson/ome_images/OME-XML/2008-09/dataset-group-project.ome.xml	present	2307	.xml
+OME-XML	/big/henriksson/ome_images/OME-XML/2008-09/instrument.ome.xml	present	3264	.xml
+Olympus-FluoView	/big/henriksson/ome_images/Olympus-FluoView/imagesc-71616/20220824_4492_cord_dapi__iba568_60x.oib	present	26001408	.oib
+Olympus-OIR	/big/henriksson/ome_images/Olympus-OIR/etienne/amy slice z stack_0001.oir	present	25957525	.oir
+Olympus-OIR	/big/henriksson/ome_images/Olympus-OIR/etienne/amy slice z stack_0001.ome.tif	present	24734542	.ome.tif
+PNG	/big/henriksson/ome_images/PNG/user-1/dataset-user-1/user-1 01 TEST.png	present	6316	.png
+PNG	/big/henriksson/ome_images/PNG/user-1/dataset-user-1/user-1 02 TEST.png	present	8721	.png
+PerkinElmer-Columbus	/big/henriksson/ome_images/PerkinElmer-Columbus/idr0019/22_lines_HC_EGF_200145913/002002-1.tif	present	1839988	.tif
+PerkinElmer-Columbus	/big/henriksson/ome_images/PerkinElmer-Columbus/idr0019/22_lines_HC_EGF_200145913/002002-10.tif	present	1948588	.tif
+PerkinElmer-Operetta	/big/henriksson/ome_images/PerkinElmer-Operetta/omer/006P_M3/006P_M3_overview.png	present	1538108	.png
+PerkinElmer-Operetta	/big/henriksson/ome_images/PerkinElmer-Operetta/omer/006P_M3/006P_M3_overview_fields.png	present	1540829	.png
+SDT	/big/henriksson/ome_images/SDT/gh-4198/FocalCheck_A1_20x_8xzoom_800nm.sdt	present	30039135	.sdt
+SPC-FIFO	/big/henriksson/ome_images/SPC-FIFO/biofisika/conv-256x256.spc	present	32888548	.spc
+SVS	/big/henriksson/ome_images/SVS/77917.svs	present	704041277	.svs
+SVS	/big/henriksson/ome_images/SVS/77928.svs	present	609174117	.svs
+ScanR	/big/henriksson/ome_images/ScanR/idr0009/0307-10--2007-05-30/experiment_descriptor.xml	present	51477	.xml
+TIFF	/big/henriksson/ome_images/TIFF/condensation/A1.pattern1.tif	present	6749329	.tif
+TIFF	/big/henriksson/ome_images/TIFF/condensation/A1.pattern2.tif	present	6749329	.tif
+Trestle	/big/henriksson/ome_images/Trestle/openslide/CMU-1/CMU-1.tif	present	163649046	.tif
+Trestle	/big/henriksson/ome_images/Trestle/openslide/CMU-2/CMU-2.tif	present	314982018	.tif
+Vectra-QPTIFF	/big/henriksson/ome_images/Vectra-QPTIFF/perkinelmer/PKI_fields/HandEcompressed_[11004,54205]_2x2component_data.tif	present	116848824	.tif
+Vectra-QPTIFF	/big/henriksson/ome_images/Vectra-QPTIFF/perkinelmer/PKI_fields/HnE_3_1x1component_data.tif	present	24152250	.tif
+Zeiss-CZI	/big/henriksson/ome_images/Zeiss-CZI/idr0011/Plate1-Blue-A_TS-Stinger/Plate1-Blue-A-02-Scene-1-P2-E1-01.czi	present	43560352	.czi
+Zeiss-CZI	/big/henriksson/ome_images/Zeiss-CZI/idr0011/Plate1-Blue-A_TS-Stinger/Plate1-Blue-A-02-Scene-2-P1-E1-02.czi	present	43560704	.czi
+gateway_tests	/big/henriksson/ome_images/gateway_tests/big.tiff	present	67174663	.tiff
+gateway_tests	/big/henriksson/ome_images/gateway_tests/CHOBI_d3d.dv	present	36712448	.dv

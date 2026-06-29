@@ -6648,7 +6648,24 @@ impl FormatReader for Jpeg2000Reader {
         for y in 0..h {
             for x in 0..w {
                 for c in 0..nc {
-                    let val = components[c].data()[y * w + x];
+                    let component = &components[c];
+                    let cw = component.width() as usize;
+                    let ch = component.height() as usize;
+                    if cw == 0 || ch == 0 {
+                        return Err(BioFormatsError::Codec(format!(
+                            "JPEG 2000: component {c} has zero geometry"
+                        )));
+                    }
+                    let cx = x * cw / w;
+                    let cy = y * ch / h;
+                    let data = component.data();
+                    let idx = cy * cw + cx;
+                    if idx >= data.len() {
+                        return Err(BioFormatsError::Codec(format!(
+                            "JPEG 2000: component {c} data is shorter than its geometry"
+                        )));
+                    }
+                    let val = data[idx];
                     append_jpeg2000_sample(&mut pixels, val, bps, signed);
                 }
             }

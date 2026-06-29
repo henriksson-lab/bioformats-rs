@@ -742,13 +742,12 @@ fn parse_ims(path: &Path) -> Result<ImsParse> {
     }
 
     // ── Determine pixel type from first Data dataset ────────────────────────
-    let data_path = ims_data_path(&file, 0, 0, 0).ok_or_else(|| {
+    let (data_path, ds) = ims_data_dataset(&file, 0, 0, 0).ok_or_else(|| {
         BioFormatsError::UnsupportedFormat(
-            "Imaris: missing DataSet/ResolutionLevel 0/TimePoint 0/Channel 0/Data or DataSet/ResolutionLevel_0/TimePoint_0/Channel_0/Data".into(),
+            "Imaris: missing DataSet/ResolutionLevel 0/TimePoint 0/Channel 0/Data or \
+             DataSet/ResolutionLevel_0/TimePoint_0/Channel_0/Data"
+                .into(),
         )
-    })?;
-    let ds = file.dataset(&data_path).map_err(|e| {
-        BioFormatsError::UnsupportedFormat(format!("Imaris: missing {data_path}: {e}"))
     })?;
     let (pixel_type, bytes_per_sample) = {
         let dtype = ds.dtype().map_err(|e| {
@@ -772,7 +771,7 @@ fn parse_ims(path: &Path) -> Result<ImsParse> {
             }
         }
     };
-    validate_ims_data_dataset(&file, &data_path, size_x, size_y, size_z, bytes_per_sample)?;
+    validate_ims_data_dataset(&ds, &data_path, size_x, size_y, size_z, bytes_per_sample)?;
 
     // ── Collect channel metadata ────────────────────────────────────────────
     let mut meta_map: HashMap<String, MetadataValue> = HashMap::new();
@@ -977,13 +976,13 @@ fn parse_ims(path: &Path) -> Result<ImsParse> {
         lvl.size_z = lz;
         lvl.size_y = ly;
         lvl.size_x = lx;
-        let level_data_path = ims_data_path(&file, level, 0, 0).ok_or_else(|| {
+        let (level_data_path, level_ds) = ims_data_dataset(&file, level, 0, 0).ok_or_else(|| {
             BioFormatsError::UnsupportedFormat(format!(
                 "Imaris: missing DataSet/ResolutionLevel {level}/TimePoint 0/Channel 0/Data or DataSet/ResolutionLevel_{level}/TimePoint_0/Channel_0/Data"
             ))
         })?;
         validate_ims_data_dataset(
-            &file,
+            &level_ds,
             &level_data_path,
             lvl.size_x,
             lvl.size_y,
@@ -2613,12 +2612,17 @@ fn count_imaris_indexed_members(members: &[String], prefix: &str) -> Result<u32>
 }
 
 fn imaris_indexed_member_number(name: &str, prefix: &str) -> Option<u32> {
-    name.strip_prefix(prefix)?.parse::<u32>().ok()
+    if let Some(rest) = name.strip_prefix(prefix) {
+        return rest.parse::<u32>().ok();
+    }
+    let escaped_prefix = prefix.replace(' ', "\\ ");
+    name.strip_prefix(&escaped_prefix)?.parse::<u32>().ok()
 }
 
 fn ims_resolution_group_path(file: &hdf5_pure_rust::File, level: usize) -> Option<String> {
     [
         format!("DataSet/ResolutionLevel {level}"),
+        format!("DataSet/ResolutionLevel\\ {level}"),
         format!("DataSet/ResolutionLevel_{level}"),
     ]
     .into_iter()
@@ -2633,48 +2637,97 @@ fn ims_timepoint_group_path(
     let resolution = ims_resolution_group_path(file, level)?;
     [
         format!("{resolution}/TimePoint {timepoint}"),
+        format!("{resolution}/TimePoint\\ {timepoint}"),
         format!("{resolution}/TimePoint_{timepoint}"),
     ]
     .into_iter()
     .find(|path| file.group(path).is_ok())
 }
 
-fn ims_data_path(
+fn ims_data_dataset(
     file: &hdf5_pure_rust::File,
     level: usize,
     timepoint: usize,
     channel: usize,
-) -> Option<String> {
-    let timepoint = ims_timepoint_group_path(file, level, timepoint)?;
-    [
-        format!("{timepoint}/Channel {channel}/Data"),
-        format!("{timepoint}/Channel_{channel}/Data"),
-    ]
-    .into_iter()
-    .find(|path| file.dataset(path).is_ok())
+) -> Option<(String, hdf5_pure_rust::Dataset)> {
+    let data_set = file.group("DataSet").ok()?;
+    let (resolution_name, resolution) = imaris_child_group(
+        &data_set,
+        &[
+            format!("ResolutionLevel {level}"),
+            format!("ResolutionLevel_{level}"),
+        ],
+    )?;
+    let (timepoint_name, timepoint_group) = imaris_child_group(
+        &resolution,
+        &[
+            format!("TimePoint {timepoint}"),
+            format!("TimePoint_{timepoint}"),
+        ],
+    )?;
+    let (channel_name, channel_group) = imaris_child_group(
+        &timepoint_group,
+        &[format!("Channel {channel}"), format!("Channel_{channel}")],
+    )?;
+    let (data_name, ds) = imaris_child_dataset(&channel_group, &["Data"])?;
+    let path = format!("DataSet/{resolution_name}/{timepoint_name}/{channel_name}/{data_name}");
+    Some((path, ds))
 }
 
 fn ims_dataset_info_channel_path(file: &hdf5_pure_rust::File, channel: u32) -> Option<String> {
     [
         format!("DataSetInfo/Channel {channel}"),
+        format!("DataSetInfo/Channel\\ {channel}"),
         format!("DataSetInfo/Channel_{channel}"),
     ]
     .into_iter()
     .find(|path| file.group(path).is_ok())
 }
 
+fn imaris_child_group(
+    parent: &hdf5_pure_rust::Group,
+    names: &[String],
+) -> Option<(String, hdf5_pure_rust::Group)> {
+    for group in parent.groups().ok()? {
+        let base = imaris_hdf_basename(group.name());
+        if names.iter().any(|name| name == base) {
+            return Some((base.to_string(), group));
+        }
+    }
+    None
+}
+
+fn imaris_child_dataset(
+    parent: &hdf5_pure_rust::Group,
+    names: &[&str],
+) -> Option<(String, hdf5_pure_rust::Dataset)> {
+    for &name in names {
+        if let Ok(dataset) = parent.dataset(name) {
+            return Some((name.to_string(), dataset));
+        }
+    }
+    for dataset in parent.datasets().ok()? {
+        let base = imaris_hdf_basename(dataset.name());
+        if names.iter().any(|name| *name == base) {
+            return Some((base.to_string(), dataset));
+        }
+    }
+    None
+}
+
+fn imaris_hdf_basename(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
 /// Read the (z, y, x) pixel dimensions of a resolution level from its
 /// full-resolution Channel-0 `Data` dataset shape (the authoritative source,
 /// vs. the unreliable DataSetInfo X/Y/Z and per-level ImageSize* attributes).
 fn ims_level_dims(file: &hdf5_pure_rust::File, level: usize) -> Result<(u32, u32, u32)> {
-    let path = ims_data_path(file, level, 0, 0).ok_or_else(|| {
+    let (path, ds) = ims_data_dataset(file, level, 0, 0).ok_or_else(|| {
         BioFormatsError::UnsupportedFormat(format!(
             "Imaris: missing DataSet/ResolutionLevel {level}/TimePoint 0/Channel 0/Data or DataSet/ResolutionLevel_{level}/TimePoint_0/Channel_0/Data"
         ))
     })?;
-    let ds = file
-        .dataset(&path)
-        .map_err(|e| BioFormatsError::UnsupportedFormat(format!("Imaris: missing {path}: {e}")))?;
     let shape = ds.shape().map_err(|e| {
         BioFormatsError::Format(format!("Imaris: cannot read shape for {path}: {e}"))
     })?;
@@ -2691,16 +2744,13 @@ fn ims_level_dims(file: &hdf5_pure_rust::File, level: usize) -> Result<(u32, u32
 }
 
 fn validate_ims_data_dataset(
-    file: &hdf5_pure_rust::File,
+    ds: &hdf5_pure_rust::Dataset,
     path: &str,
     size_x: u32,
     size_y: u32,
     size_z: u32,
     bytes_per_sample: usize,
 ) -> Result<()> {
-    let ds = file
-        .dataset(path)
-        .map_err(|e| BioFormatsError::UnsupportedFormat(format!("Imaris: missing {path}: {e}")))?;
     let shape = ds.shape().map_err(|e| {
         BioFormatsError::Format(format!("Imaris: cannot read shape for {path}: {e}"))
     })?;
@@ -2932,14 +2982,11 @@ impl FormatReader for ImarisHdfReader {
         };
         if need_load {
             let file = self.file.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-            let data_path = ims_data_path(&file, res, t, c).ok_or_else(|| {
+            let (_data_path, ds) = ims_data_dataset(&file, res, t, c).ok_or_else(|| {
                 BioFormatsError::UnsupportedFormat(format!(
                     "Imaris: missing DataSet/ResolutionLevel {res}/TimePoint {t}/Channel {c}/Data or DataSet/ResolutionLevel_{res}/TimePoint_{t}/Channel_{c}/Data"
                 ))
             })?;
-            let ds = file
-                .dataset(&data_path)
-                .map_err(|e| BioFormatsError::Format(format!("dataset {data_path}: {e}")))?;
 
             // The dataset is shaped [z, y, x]; use a hyperslab selection to read
             // ONLY the requested z-plane. The returned vec is exactly that plane
@@ -3010,14 +3057,11 @@ impl FormatReader for ImarisHdfReader {
             .ok_or_else(|| BioFormatsError::Format("Imaris region byte count overflows".into()))?;
 
         let file = self.file.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        let data_path = ims_data_path(&file, res, t, c).ok_or_else(|| {
+        let (_data_path, ds) = ims_data_dataset(&file, res, t, c).ok_or_else(|| {
             BioFormatsError::UnsupportedFormat(format!(
                 "Imaris: missing DataSet/ResolutionLevel {res}/TimePoint {t}/Channel {c}/Data or DataSet/ResolutionLevel_{res}/TimePoint_{t}/Channel_{c}/Data"
             ))
         })?;
-        let ds = file
-            .dataset(&data_path)
-            .map_err(|e| BioFormatsError::Format(format!("dataset {data_path}: {e}")))?;
         let sel = Selection::Hyperslab(vec![
             HyperslabDim::new(z as u64, 1, 1, 1),
             HyperslabDim::new(y as u64, 1, h as u64, 1),

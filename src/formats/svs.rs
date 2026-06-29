@@ -331,6 +331,9 @@ impl FormatReader for SvsReader {
             .unwrap_or(false);
         if is_svs {
             self.inner.regroup_as_svs_pyramid()?;
+            // Java's default ImageReader exposes each SVS pyramid resolution as
+            // its own top-level series, followed by label/macro extras.
+            let _ = self.inner.flatten_resolutions_into_series();
         }
         self.parse_aperio_metadata();
         Ok(())

@@ -1000,8 +1000,10 @@ impl FlexReader {
                         }
                         "Plate" => {
                             parent_qname = qname.clone();
-                            next_plate += 1;
-                            self.plate_count += 1;
+                            if populate_core {
+                                next_plate += 1;
+                                self.plate_count += 1;
+                            }
                         }
                         "Slider" => {
                             if let Some(name) = attr("Name") {
@@ -1644,7 +1646,7 @@ fn compute_core_metadata(
         }
     }
 
-    if field_count == 1 {
+    if field_count == 1 && n_files == 1 {
         field_count *= n_files.max(1);
     }
 
