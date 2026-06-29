@@ -538,56 +538,56 @@ below use the post-fix focused rerun in `bench/target/ics-after-region.csv`.
 The HDF5-backed BDV, CellH5, and Imaris-IMS rows use the focused benchmark
 outputs in `bench/target/bdv-flex-lif-after.md`,
 `bench/target/cellh5-after.md`, and `bench/target/imaris-after.md`; the
-vendored HDF5 dependency is currently `hdf5-pure-rust` 0.3.7 with the local
-standalone LZ4 filter-32004 hook retained.
+HDF5 dependency is currently crates.io `hdf5-pure-rust` 0.3 with its `lz4`
+feature enabled.
 `Worst speedup J/R` and `Worst RSS J/R` are Java divided by Rust, so values
 below `1.0x` mean Rust was slower or used more RSS for that comparable row.
 
-| Device / folder | Files | Comparable | Java ms max | Rust ms max | Worst speedup J/R | Java RSS max KiB | Rust RSS max KiB | Worst RSS J/R | Status / next action |
+| Device / folder | Files | Comparable | Java ms max | Rust ms max | Worst speedup J/R | Java RSS max KiB | Rust RSS max KiB | Worst RSS J/R | Notes |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| AmiraMesh | 2 | 2 | 511.4 | 10.5 | 33.66x | 120516 | 16640 | 5.29x | OK in screening pass |
-| BDV | 2 | 2 | 31002.3 | 641.5 | 2.32x | 214728 | 151876 | 0.93x | Recorded HDF5 parity/speed/RSS row: `.h5` sidecar dispatch routes BDV HDF5 directly to `BdvReader`; the direct `.h5` row is much faster and lower RSS than Java, while the XML entry still has a small Rust RSS delta in the HDF5 hyperslab/chunk path. |
-| CV7000 | 2 | 1 | 683.5 | 109.1 | 6.26x | 180664 | 10560 | 17.11x | One XML sidecar rejected by both; TIFF comparable row OK. |
-| CellH5 | 2 | 2 | 6609.7 | 2016.6 | 3.28x | 195192 | 344960 | 0.57x | Recorded HDF5 parity/speed/RSS row: region reads request only the selected HDF5 slab; RSS remains high on `samples/full/0013.ch5`, pointing at the HDF5 metadata/chunk path rather than CellH5 plane buffering. |
-| CellSens | 2 | 2 | 2209.9 | 1517.0 | 1.42x | 327452 | 123864 | 1.94x | OK in screening pass |
-| DCIMG | 2 | 2 | 473.7 | 5.8 | 71.02x | 116152 | 13520 | 8.57x | OK in screening pass |
-| DICOM | 2 | 2 | 726.1 | 12.3 | 44.78x | 146424 | 9920 | 14.36x | OK in screening pass |
-| DV | 2 | 2 | 407.8 | 6.9 | 58.38x | 98224 | 12160 | 8.03x | OK in screening pass |
-| Flex | 2 | 2 | 1957.4 | 937.8 | 2.06x | 232048 | 18124 | 12.80x | Fixed: grouped directory files now expose 96 series instead of multiplying plate/well/field counts. |
-| Gatan | 2 | 2 | 555.4 | 14.6 | 36.61x | 114572 | 11200 | 10.18x | OK in screening pass |
-| HCS | 2 | 2 | 705.4 | 420.0 | 1.68x | 183028 | 25280 | 7.16x | OK in screening pass |
-| Hamamatsu-NDPI | 2 | 2 | 7059.3 | 4672.4 | 1.51x | 624488 | 150256 | 4.16x | Fixed: JPEG-XR-compressed YCbCr NDPI tiles now decode through the codec RGB path instead of the manual non-JPEG YCbCr guard. |
-| Hamamatsu-VMS | 2 | 2 | 10689.9 | 1257.8 | 4.25x | 710084 | 636776 | 1.10x | OK in screening pass |
-| ICS | 2 | 2 | 434.8 | 2.5 | 165.73x | 122840 | 8320 | 12.31x | Audited: speedup is from direct uncompressed row-window reads; bytes/planes match Java for `.ics` and `.ids`, and `.ids` companions dispatch to `IcsReader` before byte sniffing. |
-| Imaris-IMS | 2 | 2 | 1301.8 | 121.1 | 5.67x | 149684 | 12160 | 12.31x | Recorded HDF5 parity/speed/RSS row: HDF5 v2 custom-filter parsing and standalone filter 32004 LZ4 decode read the 2 sampled `.ims` fixtures; Rust is faster and lower RSS than Java on both rows. |
-| InCell2000 | 2 | 2 | 600.0 | 84.9 | 7.04x | 183680 | 25600 | 7.12x | OK in screening pass |
-| InCell3000 | 2 | 2 | 437.7 | 11.0 | 39.84x | 105356 | 14476 | 7.28x | OK in screening pass |
-| KLB | 2 | 2 | 440.7 | 311.8 | 1.24x | 123712 | 19364 | 5.34x | OK in screening pass |
-| LEO | 2 | 2 | 490.7 | 181.5 | 2.66x | 126304 | 25776 | 4.90x | OK in screening pass |
-| Leica-LIF | 2 | 2 | 1421.1 | 128.1 | 11.09x | 259828 | 49024 | 5.30x | Fixed: uncompressed LIF metadata is parsed by streaming block descriptors, and region reads coalesce row spans instead of reloading the whole file. |
-| Leica-SCN | 2 | 2 | 5015.1 | 115.4 | 14.48x | 237488 | 12356 | 17.25x | OK in screening pass |
-| Leica-XLEF | 3 | 3 | 3909.0 | 1321.0 | 2.72x | 569516 | 144960 | 3.93x | Fixed: Java-readable `.xlef` benchmark projects now open; case-insensitive component path resolution and missing nested metadata/provenance references are handled. |
-| MetaXpress | 2 | 1 | 13189.6 | 4298.8 | 3.07x | 452448 | 16640 | 27.19x | One missing-companion plate rejected by both; comparable row OK. |
-| Metamorph | 2 | 2 | 2257.7 | 178.2 | 12.67x | 193800 | 17268 | 8.18x | OK in screening pass |
-| Micro-Manager | 1 | 1 | 2952.3 | 138.7 | 21.28x | 190492 | 21752 | 8.76x | OK in screening pass |
-| ND2 | 2 | 2 | 9279.1 | 4596.8 | 2.02x | 1045252 | 784492 | 1.17x | OK in screening pass |
-| NIfTI | 2 | 1 | 375.2 | 3.1 | 119.61x | 107852 | 12480 | 8.64x | Audited: one XML sidecar rejected by both; the `.nii` row seeks directly to the requested plane and matches Java bytes/planes. |
-| OME-TIFF | 2 | 2 | 1009.8 | 14.1 | 67.35x | 173852 | 9600 | 14.41x | OK in screening pass |
-| OME-XML | 2 | 2 | 1026.7 | 2.4 | 425.37x | 155684 | 11200 | 13.26x | Audited: sampled files are tiny inline BinData planes; parser covers legacy pixel metadata, external TiffData/UUID companions, split RGB BinData, and metadata-only blank-plane semantics. |
-| Olympus-FluoView | 1 | 1 | 985.3 | 333.7 | 2.95x | 183212 | 36480 | 5.02x | OK in screening pass |
-| Olympus-OIR | 2 | 2 | 882.6 | 230.9 | 3.70x | 202244 | 47120 | 3.73x | OK in screening pass |
-| PNG | 2 | 2 | 394.2 | 4.4 | 85.99x | 86436 | 11520 | 7.47x | Audited: still PNG decodes complete planes, APNG is routed separately, and sampled rows match Java bytes/planes; speedup is not from skipped pixel reads. |
-| PerkinElmer-Columbus | 1 | 1 | 40318.5 | 17335.4 | 2.33x | 1509724 | 34080 | 44.30x | Fixed: Columbus TIFF leaves with a sibling `MeasurementIndex.ColumbusIDX.xml` route to `ColumbusReader`; benchmark uses the XML index and matches Java at 3696 planes. |
-| PerkinElmer-Operetta | 2 | 2 | 616.1 | 28.9 | 16.80x | 94724 | 17172 | 5.49x | OK in screening pass |
-| SDT | 1 | 1 | 8751.9 | 465.3 | 18.81x | 670068 | 40336 | 16.61x | OK in screening pass |
-| SPC-FIFO | 1 | 1 | 940.0 | 132.4 | 7.10x | 144976 | 43200 | 3.36x | OK in screening pass |
-| SVS | 2 | 2 | 2088.2 | 276.0 | 5.45x | 211200 | 13196 | 16.01x | Fixed: JPEG 2000 subsampled components are upsampled to the full grid, and SVS pyramid resolutions are flattened while the stripped LZW thumbnail is skipped like Java. |
-| ScanR | 1 | 0 | - | - | - | - | - | - | Added `scanr-benchmark-smoke` fixture rows and `bench/manifests/scanr-benchmark-smoke.paths`; current `/big` mirror is still missing the `data/` TIFF planes needed to run Java locally. |
-| TIFF | 2 | 2 | 698.0 | 20.6 | 31.72x | 190516 | 10240 | 18.57x | OK in screening pass |
-| Trestle | 2 | 2 | 1261.7 | 71.0 | 16.64x | 216484 | 11520 | 18.10x | OK in screening pass |
-| Vectra-QPTIFF | 2 | 2 | 1047.8 | 63.0 | 15.73x | 177832 | 12000 | 14.78x | OK in screening pass |
-| Zeiss-CZI | 2 | 2 | 793.8 | 14.2 | 54.51x | 134988 | 13784 | 9.77x | OK in screening pass |
-| gateway_tests | 2 | 2 | 697.8 | 17.2 | 40.48x | 196864 | 11840 | 8.00x | OK in screening pass |
+| AmiraMesh | 2 | 2 | 511.4 | 10.5 | 33.66x | 120516 | 16640 | 5.29x | - |
+| BDV | 2 | 2 | 31002.3 | 641.5 | 2.32x | 214728 | 151876 | 0.93x | XML entry still has a small Rust RSS delta in the HDF5 hyperslab/chunk path. |
+| CV7000 | 2 | 1 | 683.5 | 109.1 | 6.26x | 180664 | 10560 | 17.11x | One XML sidecar rejected by both. |
+| CellH5 | 2 | 2 | 6609.7 | 2016.6 | 3.28x | 195192 | 344960 | 0.57x | High RSS on `samples/full/0013.ch5` appears to be in the HDF5 metadata/chunk path. |
+| CellSens | 2 | 2 | 2209.9 | 1517.0 | 1.42x | 327452 | 123864 | 1.94x | - |
+| DCIMG | 2 | 2 | 473.7 | 5.8 | 71.02x | 116152 | 13520 | 8.57x | - |
+| DICOM | 2 | 2 | 726.1 | 12.3 | 44.78x | 146424 | 9920 | 14.36x | - |
+| DV | 2 | 2 | 407.8 | 6.9 | 58.38x | 98224 | 12160 | 8.03x | - |
+| Flex | 2 | 2 | 1957.4 | 937.8 | 2.06x | 232048 | 18124 | 12.80x | - |
+| Gatan | 2 | 2 | 555.4 | 14.6 | 36.61x | 114572 | 11200 | 10.18x | - |
+| HCS | 2 | 2 | 705.4 | 420.0 | 1.68x | 183028 | 25280 | 7.16x | - |
+| Hamamatsu-NDPI | 2 | 2 | 7059.3 | 4672.4 | 1.51x | 624488 | 150256 | 4.16x | - |
+| Hamamatsu-VMS | 2 | 2 | 10689.9 | 1257.8 | 4.25x | 710084 | 636776 | 1.10x | - |
+| ICS | 2 | 2 | 434.8 | 2.5 | 165.73x | 122840 | 8320 | 12.31x | Direct uncompressed row-window reads. |
+| Imaris-IMS | 2 | 2 | 1301.8 | 121.1 | 5.67x | 149684 | 12160 | 12.31x | Includes HDF5 filter-32004 LZ4 fixtures. |
+| InCell2000 | 2 | 2 | 600.0 | 84.9 | 7.04x | 183680 | 25600 | 7.12x | - |
+| InCell3000 | 2 | 2 | 437.7 | 11.0 | 39.84x | 105356 | 14476 | 7.28x | - |
+| KLB | 2 | 2 | 440.7 | 311.8 | 1.24x | 123712 | 19364 | 5.34x | - |
+| LEO | 2 | 2 | 490.7 | 181.5 | 2.66x | 126304 | 25776 | 4.90x | - |
+| Leica-LIF | 2 | 2 | 1421.1 | 128.1 | 11.09x | 259828 | 49024 | 5.30x | - |
+| Leica-SCN | 2 | 2 | 5015.1 | 115.4 | 14.48x | 237488 | 12356 | 17.25x | - |
+| Leica-XLEF | 3 | 3 | 3909.0 | 1321.0 | 2.72x | 569516 | 144960 | 3.93x | - |
+| MetaXpress | 2 | 1 | 13189.6 | 4298.8 | 3.07x | 452448 | 16640 | 27.19x | One missing-companion plate rejected by both. |
+| Metamorph | 2 | 2 | 2257.7 | 178.2 | 12.67x | 193800 | 17268 | 8.18x | - |
+| Micro-Manager | 1 | 1 | 2952.3 | 138.7 | 21.28x | 190492 | 21752 | 8.76x | - |
+| ND2 | 2 | 2 | 9279.1 | 4596.8 | 2.02x | 1045252 | 784492 | 1.17x | - |
+| NIfTI | 2 | 1 | 375.2 | 3.1 | 119.61x | 107852 | 12480 | 8.64x | One XML sidecar rejected by both. |
+| OME-TIFF | 2 | 2 | 1009.8 | 14.1 | 67.35x | 173852 | 9600 | 14.41x | - |
+| OME-XML | 2 | 2 | 1026.7 | 2.4 | 425.37x | 155684 | 11200 | 13.26x | Sampled files are tiny inline BinData planes. |
+| Olympus-FluoView | 1 | 1 | 985.3 | 333.7 | 2.95x | 183212 | 36480 | 5.02x | - |
+| Olympus-OIR | 2 | 2 | 882.6 | 230.9 | 3.70x | 202244 | 47120 | 3.73x | - |
+| PNG | 2 | 2 | 394.2 | 4.4 | 85.99x | 86436 | 11520 | 7.47x | Complete-plane decodes; APNG is routed separately. |
+| PerkinElmer-Columbus | 1 | 1 | 40318.5 | 17335.4 | 2.33x | 1509724 | 34080 | 44.30x | XML-index benchmark with 3696 planes. |
+| PerkinElmer-Operetta | 2 | 2 | 616.1 | 28.9 | 16.80x | 94724 | 17172 | 5.49x | - |
+| SDT | 1 | 1 | 8751.9 | 465.3 | 18.81x | 670068 | 40336 | 16.61x | - |
+| SPC-FIFO | 1 | 1 | 940.0 | 132.4 | 7.10x | 144976 | 43200 | 3.36x | - |
+| SVS | 2 | 2 | 2088.2 | 276.0 | 5.45x | 211200 | 13196 | 16.01x | - |
+| ScanR | 1 | 0 | - | - | - | - | - | - | Missing `data/` TIFF planes in the local mirror, so Java benchmark cannot run. |
+| TIFF | 2 | 2 | 698.0 | 20.6 | 31.72x | 190516 | 10240 | 18.57x | - |
+| Trestle | 2 | 2 | 1261.7 | 71.0 | 16.64x | 216484 | 11520 | 18.10x | - |
+| Vectra-QPTIFF | 2 | 2 | 1047.8 | 63.0 | 15.73x | 177832 | 12000 | 14.78x | - |
+| Zeiss-CZI | 2 | 2 | 793.8 | 14.2 | 54.51x | 134988 | 13784 | 9.77x | - |
+| gateway_tests | 2 | 2 | 697.8 | 17.2 | 40.48x | 196864 | 11840 | 8.00x | - |
 
 
 

@@ -23,12 +23,12 @@ include = [
 
 [workspace]
 resolver = "2"
-exclude = ["bench", "vendor/hdf5-pure-rust"]
+exclude = ["bench"]
 
 [dependencies]
 thiserror    = "2"
 log          = "0.4"
-hdf5-pure-rust = "0.3"
+hdf5-pure-rust = { version = "0.3", features = ["lz4"] }
 zip          = { version = "2", default-features = false, features = ["deflate", "deflate64", "lzma", "aes-crypto", "time"] }
 flate2       = "1"
 weezl        = "0.2"
@@ -61,9 +61,6 @@ jpeg2000-write = ["dep:openjp2"]
 zarr = ["dep:zarrs"]
 # TissueFAXS (.aqproj/.tfcyto) reads SQLite project databases.
 tissuefaxs = ["dep:rusqlite"]
-
-[patch.crates-io]
-hdf5-pure-rust = { path = "vendor/hdf5-pure-rust" }
 
 [[bin]]
 name = "bioformats-convert"
