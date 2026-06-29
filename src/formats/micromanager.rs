@@ -286,6 +286,34 @@ impl Position {
         let detector_id = create_lsid("Detector", &[0, series]);
 
         if let Some(image) = ome.images.get_mut(0) {
+            if image.name.is_none() {
+                if let Some(MetadataValue::String(name)) =
+                    self.meta.series_metadata.get("image_name")
+                {
+                    image.name = Some(name.clone());
+                }
+            }
+            if image.physical_size_x.is_none() {
+                if let Some(MetadataValue::Float(value)) =
+                    self.meta.series_metadata.get("physicalSizeX")
+                {
+                    image.physical_size_x = Some(*value);
+                }
+            }
+            if image.physical_size_y.is_none() {
+                if let Some(MetadataValue::Float(value)) =
+                    self.meta.series_metadata.get("physicalSizeY")
+                {
+                    image.physical_size_y = Some(*value);
+                }
+            }
+            if image.time_increment.is_none() {
+                if let Some(MetadataValue::Float(value)) =
+                    self.meta.series_metadata.get("timeIncrement")
+                {
+                    image.time_increment = Some(*value);
+                }
+            }
             image.planes = planes;
             image.imaging_environment_temperature = self.temperature;
 
@@ -295,6 +323,13 @@ impl Position {
                     break;
                 }
                 let ch = &mut image.channels[c];
+                if ch.name.is_none() {
+                    if let Some(MetadataValue::String(name)) =
+                        self.meta.series_metadata.get(&format!("channel_name[{c}]"))
+                    {
+                        ch.name = Some(name.clone());
+                    }
+                }
                 ch.detector_settings_binning = self.binning.clone();
                 ch.detector_settings_gain = self.gain.map(|g| g as f64);
                 if let Some(v) = self.voltage.get(c) {
@@ -445,6 +480,10 @@ fn parse_position(meta_path: &Path) -> Result<Position> {
                 format!("channel_name[{q}]"),
                 MetadataValue::String(name.clone()),
             );
+            meta_map.insert(
+                format!("channel.{q}.name"),
+                MetadataValue::String(name.clone()),
+            );
         }
     }
     if let Some(colors) = json_str_array(summary, "ChColors") {
@@ -459,6 +498,11 @@ fn parse_position(meta_path: &Path) -> Result<Position> {
         if px > 0.0 {
             meta_map.insert("physicalSizeX".into(), MetadataValue::Float(px));
             meta_map.insert("physicalSizeY".into(), MetadataValue::Float(px));
+        }
+    }
+    if let Some(interval) = json_float(summary, "Interval_ms") {
+        if interval > 0.0 {
+            meta_map.insert("timeIncrement".into(), MetadataValue::Float(interval));
         }
     }
     if let Some(step) = json_float(summary, "z-step_um") {
@@ -476,6 +520,15 @@ fn parse_position(meta_path: &Path) -> Result<Position> {
     if let Some(name) = json_str(&json, "PositionName") {
         if name != "null" && !name.is_empty() {
             meta_map.insert("image_name".into(), MetadataValue::String(name));
+        }
+    }
+    if !meta_map.contains_key("image_name") {
+        if let Some(name) = meta_path.file_name().and_then(|name| name.to_str()) {
+            let name = name
+                .strip_suffix("_metadata.txt")
+                .or_else(|| name.strip_suffix("_metadata.json"))
+                .unwrap_or(name);
+            meta_map.insert("image_name".into(), MetadataValue::String(name.to_string()));
         }
     }
 
@@ -801,7 +854,14 @@ fn metadata_file_has_micromanager_marker(path: &Path) -> bool {
 }
 
 fn prefix_metadata_name(name: &str) -> String {
-    let stem = name.rsplit_once('.').map(|(stem, _)| stem).unwrap_or(name);
+    let lower = name.to_ascii_lowercase();
+    let stem = if lower.ends_with(".ome.tiff") {
+        &name[..name.len() - ".ome.tiff".len()]
+    } else if lower.ends_with(".ome.tif") {
+        &name[..name.len() - ".ome.tif".len()]
+    } else {
+        name.rsplit_once('.').map(|(stem, _)| stem).unwrap_or(name)
+    };
     format!("{stem}_metadata.txt")
 }
 

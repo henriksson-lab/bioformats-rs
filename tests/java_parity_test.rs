@@ -33,6 +33,7 @@ use bioformats::common::pixel_type::PixelType;
 use bioformats::ImageReader;
 use serde_json::Value;
 use std::env;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
@@ -86,6 +87,17 @@ const FILES: &[&str] = &[
     "bmp/scribble_P_RGB.bmp",
     // NOTE: testdata/mha/HeadMRVolume.mhd is NOT here — Java Bio-Formats has no
     // MetaImage reader, so there is no oracle to compare against (Rust-only).
+    // Optional Open Microscopy downloads mirror. These are skipped unless
+    // scripts/download_openmicroscopy_images.py has populated userdata/.
+    "userdata/openmicroscopy-images/Ventana/openslide/OS-1.bif",
+    "userdata/openmicroscopy-images/Ventana/openslide/OS-2.bif",
+    "userdata/openmicroscopy-images/Ventana/openslide/Ventana-1.bif",
+    "userdata/openmicroscopy-images/BDV/samples/HisYFP-SPIM.h5",
+    "userdata/openmicroscopy-images/BDV/samples/drosophila.h5",
+    "userdata/openmicroscopy-images/ICS/jan/benchmark_v1_2018_x64y64z5c2s1t11_w1Laser4054BD4BP_5c8bc101d6559_hrm.ics",
+    "userdata/openmicroscopy-images/Leica-SCN/openslide/Leica-1/Leica-1.scn",
+    "userdata/openmicroscopy-images/SDT/gh-4198/FocalCheck_A1_20x_8xzoom_800nm.sdt",
+    "userdata/openmicroscopy-images/CV7000/cpg0016/Dest21053D1-15214/Dest210531-152149.wpi",
 ];
 
 /// Upper bound on planes compared per series. Raised from 8 so deep Z/C/T
@@ -247,7 +259,11 @@ fn run_oracle(cp: &str, path: &Path, max_planes: u32, full_plane: bool) -> Optio
 /// producing no oracle output. The bounded crop + offset reads still work, so
 /// disabling full-plane reads keeps the file comparable (and ⚠-classified).
 fn oracle_no_full_plane(rel: &str) -> bool {
-    rel.contains("bdv/")
+    let lower = rel.to_ascii_lowercase();
+    lower.contains("bdv/")
+        || lower.contains("ventana/")
+        || lower.contains("leica-scn/")
+        || lower.contains("cv7000/")
 }
 
 /// Per-file plane cap. bdv has 34 series and our HDF5 reader does an uncached
@@ -255,7 +271,10 @@ fn oracle_no_full_plane(rel: &str) -> bool {
 /// cap still exercises core+OME parity and the ⚠ Java-bug planes (s31/s32) while
 /// keeping runtime sane. Everything else uses the full MAX_PLANES depth.
 fn oracle_max_planes(rel: &str) -> u32 {
-    if rel.contains("bdv/") {
+    let lower = rel.to_ascii_lowercase();
+    if lower.contains("bdv/") {
+        2
+    } else if lower.contains("cv7000/") {
         2
     } else {
         MAX_PLANES
@@ -395,6 +414,53 @@ fn picoquant_fixture_gate() {
     }
 }
 
+fn java_parity_manifest_inputs() -> Vec<String> {
+    let manifest = env::var("BIOFORMATS_RS_JAVA_PARITY_MANIFEST").unwrap_or_default();
+    if manifest.trim().is_empty() {
+        return Vec::new();
+    }
+
+    let mut inputs = Vec::new();
+    for manifest_path in env::split_paths(&manifest) {
+        let Ok(text) = fs::read_to_string(&manifest_path) else {
+            eprintln!(
+                "skip manifest (unreadable): {}",
+                manifest_path.to_string_lossy()
+            );
+            continue;
+        };
+
+        let mut path_column: Option<usize> = None;
+        for raw_line in text.lines() {
+            let line = raw_line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+
+            let fields: Vec<&str> = line.split('\t').collect();
+            if fields.len() > 1 {
+                if path_column.is_none() {
+                    path_column = fields.iter().position(|field| {
+                        matches!(field.trim(), "path" | "local_path" | "file" | "filename")
+                    });
+                    if path_column.is_some() {
+                        continue;
+                    }
+                }
+                let idx = path_column.unwrap_or(fields.len() - 1);
+                if let Some(path) = fields.get(idx).map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                    inputs.push(path.to_string());
+                }
+            } else {
+                inputs.push(line.to_string());
+            }
+        }
+    }
+    inputs.sort();
+    inputs.dedup();
+    inputs
+}
+
 #[test]
 fn java_parity() {
     if env::var("BIOFORMATS_RS_JAVA_PARITY").as_deref() != Ok("1") {
@@ -406,10 +472,11 @@ fn java_parity() {
     // Optional comma-separated substring filter, so a worker can verify just its
     // own files quickly: BIOFORMATS_RS_JAVA_PARITY_FILES="lsm/,nd2/"
     let filter = env::var("BIOFORMATS_RS_JAVA_PARITY_FILES").unwrap_or_default();
+    let manifest_only = filter.trim() == "__manifest_only__";
     let filters: Vec<&str> = filter
         .split(',')
         .map(str::trim)
-        .filter(|s| !s.is_empty())
+        .filter(|s| !s.is_empty() && *s != "__manifest_only__")
         .collect();
     let Some(cp) = oracle_classpath() else { return };
 
@@ -424,7 +491,11 @@ fn java_parity() {
     let mut checked = 0u32;
 
     let extra = env::var("BIOFORMATS_RS_JAVA_PARITY_EXTRA_FILES").unwrap_or_default();
-    let mut inputs: Vec<String> = FILES.iter().map(|s| (*s).to_string()).collect();
+    let mut inputs: Vec<String> = if manifest_only {
+        Vec::new()
+    } else {
+        FILES.iter().map(|s| (*s).to_string()).collect()
+    };
     inputs.extend(
         extra
             .split(',')
@@ -432,6 +503,7 @@ fn java_parity() {
             .filter(|s| !s.is_empty())
             .map(str::to_string),
     );
+    inputs.extend(java_parity_manifest_inputs());
 
     for rel in &inputs {
         if !filters.is_empty() && !filters.iter().any(|f| rel.contains(f)) {

@@ -25,11 +25,14 @@ use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue, ModuloAnnotation};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
-use crate::common::region::crop_full_plane;
+use crate::common::region::{crop_full_plane, validate_region};
 
 const SDT_MAX_CURVE_PAYLOAD_BYTES: u64 = 128 * 1024 * 1024;
 const SDT_MAX_ZIP_HEADER_PREVIEW_BYTES: usize = 256;
 const SDT_MAX_ZIP_FILE_NAME_PREVIEW_BYTES: usize = 64;
+const SDT_REGION_CACHE_SLOTS: usize = 2;
+const SDT_REGION_CACHE_MAX_BINS: usize = 64;
+const SDT_REGION_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 fn r_i16_le(b: &[u8], off: usize) -> i16 {
     i16::from_le_bytes([b[off], b[off + 1]])
@@ -144,38 +147,65 @@ fn extract_int(s: &str) -> Option<u32> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn read_sdt_raw_plane(
+fn read_sdt_raw_region_window(
     f: &mut File,
-    size_x: usize,
-    size_y: usize,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
     time_bins: usize,
-    time_bin: usize,
-    plane_bytes: usize,
+    first_time_bin: usize,
+    bins: usize,
     padded_width: usize,
 ) -> Result<Vec<u8>> {
-    // SDTReader.java:176 — rows are stored at a width padded up to a multiple
-    // of 4 pixels. Each disk row holds `paddedWidth` pixels worth of decays,
-    // but the output plane only contains the unpadded `size_x` columns
-    // (SDTReader.java:185-190 drops the padding columns). The caller computes
-    // the effective `padded_width`, which may collapse to `size_x` when the
-    // block length indicates the data is not actually padded.
     let row_len = padded_width
         .checked_mul(time_bins)
         .and_then(|v| v.checked_mul(2))
         .ok_or_else(|| BioFormatsError::Format("SDT row size overflow".into()))?;
-    let mut row = vec![0u8; row_len];
-    let mut out = vec![0u8; plane_bytes];
-    let sample_offset = time_bin
+    let in_row_offset = x
+        .checked_mul(time_bins)
+        .and_then(|v| v.checked_mul(2))
+        .ok_or_else(|| BioFormatsError::Format("SDT region x offset overflow".into()))?;
+    let in_row_len = w
+        .checked_mul(time_bins)
+        .and_then(|v| v.checked_mul(2))
+        .ok_or_else(|| BioFormatsError::Format("SDT region row size overflow".into()))?;
+    let out_row_len = w
         .checked_mul(2)
-        .ok_or_else(|| BioFormatsError::Format("SDT time-bin offset overflow".into()))?;
+        .ok_or_else(|| BioFormatsError::Format("SDT output row size overflow".into()))?;
+    let out_plane_bytes = h
+        .checked_mul(out_row_len)
+        .ok_or_else(|| BioFormatsError::Format("SDT output plane size overflow".into()))?;
+    let mut row = vec![0u8; in_row_len];
+    let mut out = vec![
+        0u8;
+        bins.checked_mul(out_plane_bytes).ok_or_else(|| {
+            BioFormatsError::Format("SDT output region cache size overflow".into())
+        })?
+    ];
+    let channel_start = f.stream_position().map_err(BioFormatsError::Io)?;
 
-    for y in 0..size_y {
+    for row_idx in 0..h {
+        let offset = (y + row_idx)
+            .checked_mul(row_len)
+            .and_then(|v| v.checked_add(in_row_offset))
+            .ok_or_else(|| BioFormatsError::Format("SDT region seek offset overflow".into()))?;
+        f.seek(SeekFrom::Start(
+            channel_start
+                .checked_add(offset as u64)
+                .ok_or_else(|| BioFormatsError::Format("SDT region seek offset overflow".into()))?,
+        ))
+        .map_err(BioFormatsError::Io)?;
         f.read_exact(&mut row).map_err(BioFormatsError::Io)?;
-        copy_time_bin_row(
+        copy_time_bin_window_row(
             &row,
-            &mut out[y * size_x * 2..(y + 1) * size_x * 2],
+            &mut out,
             time_bins,
-            sample_offset,
+            first_time_bin,
+            bins,
+            row_idx,
+            out_plane_bytes,
+            out_row_len,
         );
     }
     Ok(out)
@@ -231,14 +261,30 @@ fn apply_sdt_incr(buf: &mut [u8], incr: u16) {
     }
 }
 
+fn read_exact_discard<R: Read>(reader: &mut R, mut len: usize, context: &str) -> Result<()> {
+    let mut buf = [0u8; 65536];
+    while len > 0 {
+        let n = len.min(buf.len());
+        reader
+            .read_exact(&mut buf[..n])
+            .map_err(|e| BioFormatsError::Codec(format!("SDT ZIP {context} skip failed: {e}")))?;
+        len -= n;
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
-fn read_sdt_zip_plane(
+fn read_sdt_zip_region_window(
     f: &mut File,
     block: &SdtBlock,
-    size_x: usize,
     size_y: usize,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
     time_bins: usize,
-    time_bin: usize,
+    first_time_bin: usize,
+    bins: usize,
     channel: usize,
     padded_width: usize,
 ) -> Result<Vec<u8>> {
@@ -248,52 +294,69 @@ fn read_sdt_zip_plane(
     let payload = zip_deflate_payload(&compressed)?;
     let mut decoder = flate2::read::DeflateDecoder::new(Cursor::new(payload));
 
-    // Output plane is unpadded (size_x columns); disk rows are padded_width
-    // wide (SDTReader.java:176,185-190). The effective padded_width is supplied
-    // by the caller.
-    let plane_bytes = size_x
-        .checked_mul(size_y)
-        .and_then(|v| v.checked_mul(2))
-        .ok_or_else(|| BioFormatsError::Format("SDT plane size overflow".into()))?;
     let row_len = padded_width
         .checked_mul(time_bins)
         .and_then(|v| v.checked_mul(2))
         .ok_or_else(|| BioFormatsError::Format("SDT row size overflow".into()))?;
-    let sample_offset = time_bin
+    let in_row_offset = x
+        .checked_mul(time_bins)
+        .and_then(|v| v.checked_mul(2))
+        .ok_or_else(|| BioFormatsError::Format("SDT region x offset overflow".into()))?;
+    let in_row_len = w
+        .checked_mul(time_bins)
+        .and_then(|v| v.checked_mul(2))
+        .ok_or_else(|| BioFormatsError::Format("SDT region row size overflow".into()))?;
+    let out_row_len = w
         .checked_mul(2)
-        .ok_or_else(|| BioFormatsError::Format("SDT time-bin offset overflow".into()))?;
-
-    // Skip preceding channels in the decompressed stream
-    // (SDTReader.java:221: codec.skip(channel * planeSize)).
+        .ok_or_else(|| BioFormatsError::Format("SDT output row size overflow".into()))?;
+    let out_plane_bytes = h
+        .checked_mul(out_row_len)
+        .ok_or_else(|| BioFormatsError::Format("SDT output plane size overflow".into()))?;
     let channel_plane_size = padded_width
         .checked_mul(size_y)
         .and_then(|v| v.checked_mul(time_bins))
         .and_then(|v| v.checked_mul(2))
         .ok_or_else(|| BioFormatsError::Format("SDT channel plane size overflow".into()))?;
-    let mut to_skip = channel
+    let channel_skip = channel
         .checked_mul(channel_plane_size)
         .ok_or_else(|| BioFormatsError::Format("SDT channel skip overflow".into()))?;
-    let mut skip_buf = [0u8; 65536];
-    while to_skip > 0 {
-        let n = to_skip.min(skip_buf.len());
-        decoder
-            .read_exact(&mut skip_buf[..n])
-            .map_err(|e| BioFormatsError::Codec(format!("SDT ZIP channel skip failed: {e}")))?;
-        to_skip -= n;
-    }
+    read_exact_discard(&mut decoder, channel_skip, "channel")?;
 
-    let mut row = vec![0u8; row_len];
-    let mut out = vec![0u8; plane_bytes];
-    for y in 0..size_y {
+    let y_skip = y
+        .checked_mul(row_len)
+        .ok_or_else(|| BioFormatsError::Format("SDT region y skip overflow".into()))?;
+    read_exact_discard(&mut decoder, y_skip, "leading rows")?;
+
+    let suffix_len = row_len
+        .checked_sub(in_row_offset)
+        .and_then(|v| v.checked_sub(in_row_len))
+        .ok_or_else(|| BioFormatsError::Format("SDT region row range overflows".into()))?;
+    let mut row = vec![0u8; in_row_len];
+    let mut out = vec![
+        0u8;
+        bins.checked_mul(out_plane_bytes).ok_or_else(|| {
+            BioFormatsError::Format("SDT output region cache size overflow".into())
+        })?
+    ];
+
+    for row_idx in 0..h {
+        read_exact_discard(&mut decoder, in_row_offset, "row prefix")?;
         decoder
             .read_exact(&mut row)
-            .map_err(|e| BioFormatsError::Codec(format!("SDT ZIP decode failed: {e}")))?;
-        copy_time_bin_row(
+            .map_err(|e| BioFormatsError::Codec(format!("SDT ZIP region decode failed: {e}")))?;
+        copy_time_bin_window_row(
             &row,
-            &mut out[y * size_x * 2..(y + 1) * size_x * 2],
+            &mut out,
             time_bins,
-            sample_offset,
+            first_time_bin,
+            bins,
+            row_idx,
+            out_plane_bytes,
+            out_row_len,
         );
+        if row_idx + 1 < h {
+            read_exact_discard(&mut decoder, suffix_len, "row suffix")?;
+        }
     }
     Ok(out)
 }
@@ -324,10 +387,24 @@ fn read_sdt_zip_payload_bounded(
     Ok(decoded)
 }
 
-fn copy_time_bin_row(row: &[u8], out: &mut [u8], time_bins: usize, sample_offset: usize) {
-    for x in 0..out.len() / 2 {
-        let input = (x * time_bins * 2) + sample_offset;
-        out[x * 2..x * 2 + 2].copy_from_slice(&row[input..input + 2]);
+#[allow(clippy::too_many_arguments)]
+fn copy_time_bin_window_row(
+    row: &[u8],
+    out: &mut [u8],
+    time_bins: usize,
+    first_time_bin: usize,
+    bins: usize,
+    row_index: usize,
+    out_plane_bytes: usize,
+    out_row_bytes: usize,
+) {
+    for b in 0..bins {
+        let sample_offset = (first_time_bin + b) * 2;
+        let out_base = b * out_plane_bytes + row_index * out_row_bytes;
+        for x in 0..out_row_bytes / 2 {
+            let input = (x * time_bins * 2) + sample_offset;
+            out[out_base + x * 2..out_base + x * 2 + 2].copy_from_slice(&row[input..input + 2]);
+        }
     }
 }
 
@@ -1321,6 +1398,18 @@ struct SdtSeries {
     incr: u16,
 }
 
+struct SdtRegionCache {
+    series: usize,
+    channel: usize,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    first_time_bin: usize,
+    bins: usize,
+    data: Vec<u8>,
+}
+
 pub struct SdtReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
@@ -1328,6 +1417,7 @@ pub struct SdtReader {
     blocks: Vec<SdtBlock>,
     series: Vec<SdtSeries>,
     current_series: usize,
+    region_caches: Vec<SdtRegionCache>,
 }
 
 impl SdtReader {
@@ -1339,6 +1429,7 @@ impl SdtReader {
             blocks: Vec::new(),
             series: Vec::new(),
             current_series: 0,
+            region_caches: Vec::new(),
         }
     }
 
@@ -1383,6 +1474,133 @@ impl SdtReader {
             modulo_t: None,
         });
         self.n_time = adc_re;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn open_image_region_cached(
+        &mut self,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        validate_region("SDT", meta.size_x, meta.size_y, x, y, w, h)?;
+
+        let size_x = meta.size_x as usize;
+        let size_y = meta.size_y as usize;
+        let times = self.n_time as usize;
+        let time_bin = plane_index as usize % times;
+        let channel = plane_index as usize / times;
+        let out_plane_bytes = (w as usize)
+            .checked_mul(h as usize)
+            .and_then(|v| v.checked_mul(2))
+            .ok_or_else(|| BioFormatsError::Format("SDT output plane size overflow".into()))?;
+
+        if let Some(cache) = self.region_caches.iter().find(|cache| {
+            cache.series == self.current_series
+                && cache.channel == channel
+                && cache.x == x
+                && cache.y == y
+                && cache.w == w
+                && cache.h == h
+                && time_bin >= cache.first_time_bin
+                && time_bin < cache.first_time_bin + cache.bins
+        }) {
+            let bin = time_bin - cache.first_time_bin;
+            let start = bin.checked_mul(out_plane_bytes).ok_or_else(|| {
+                BioFormatsError::Format("SDT cache plane offset overflows".into())
+            })?;
+            let end = start.checked_add(out_plane_bytes).ok_or_else(|| {
+                BioFormatsError::Format("SDT cache plane offset overflows".into())
+            })?;
+            return Ok(cache.data[start..end].to_vec());
+        }
+
+        let block = self
+            .series
+            .get(self.current_series)
+            .map(|s| s.block.clone())
+            .or_else(|| self.blocks.first().cloned())
+            .ok_or_else(|| BioFormatsError::Format("SDT plane has no data block".into()))?;
+        let series_block_length = self
+            .series
+            .get(self.current_series)
+            .map(|s| s.block_length)
+            .unwrap_or(0);
+        let series_incr = self
+            .series
+            .get(self.current_series)
+            .map(|s| s.incr)
+            .unwrap_or(1);
+        let series_size_c = meta.size_c as usize;
+        let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let padded_width =
+            effective_padded_width(size_x, size_y, times, series_size_c, series_block_length);
+        let bins_by_bytes = (SDT_REGION_CACHE_MAX_BYTES / out_plane_bytes).max(1);
+        let bins = SDT_REGION_CACHE_MAX_BINS
+            .min(bins_by_bytes)
+            .min(times - time_bin);
+
+        let mut f = File::open(path).map_err(BioFormatsError::Io)?;
+        f.seek(SeekFrom::Start(block.data_offset))
+            .map_err(BioFormatsError::Io)?;
+        let mut signature = [0u8; 2];
+        f.read_exact(&mut signature).map_err(BioFormatsError::Io)?;
+        f.seek(SeekFrom::Start(block.data_offset))
+            .map_err(BioFormatsError::Io)?;
+
+        let channel_plane_size = (padded_width * size_y * times * 2) as u64;
+        let mut data = if &signature == b"PK" {
+            read_sdt_zip_region_window(
+                &mut f,
+                &block,
+                size_y,
+                x as usize,
+                y as usize,
+                w as usize,
+                h as usize,
+                times,
+                time_bin,
+                bins,
+                channel,
+                padded_width,
+            )?
+        } else {
+            f.seek(SeekFrom::Current(
+                channel as i64 * channel_plane_size as i64,
+            ))
+            .map_err(BioFormatsError::Io)?;
+            read_sdt_raw_region_window(
+                &mut f,
+                x as usize,
+                y as usize,
+                w as usize,
+                h as usize,
+                times,
+                time_bin,
+                bins,
+                padded_width,
+            )?
+        };
+        apply_sdt_incr(&mut data, series_incr);
+        let result = data[..out_plane_bytes].to_vec();
+        if self.region_caches.len() >= SDT_REGION_CACHE_SLOTS {
+            self.region_caches.remove(0);
+        }
+        self.region_caches.push(SdtRegionCache {
+            series: self.current_series,
+            channel,
+            x,
+            y,
+            w,
+            h,
+            first_time_bin: time_bin,
+            bins,
+            data,
+        });
+        Ok(result)
     }
 }
 
@@ -1872,6 +2090,7 @@ impl FormatReader for SdtReader {
         self.blocks.clear();
         self.series.clear();
         self.current_series = 0;
+        self.region_caches.clear();
         Ok(())
     }
     fn series_count(&self) -> usize {
@@ -1880,6 +2099,9 @@ impl FormatReader for SdtReader {
     fn set_series(&mut self, s: usize) -> Result<()> {
         if s >= self.series.len().max(1) {
             return Err(BioFormatsError::SeriesOutOfRange(s));
+        }
+        if self.current_series != s {
+            self.region_caches.clear();
         }
         self.current_series = s;
         if let Some(series) = self.series.get(s) {
@@ -1902,36 +2124,12 @@ impl FormatReader for SdtReader {
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
-        // Each plane is one lifetime-bin slice: size_x × size_y × uint16.
-        let size_x = meta.size_x as usize;
-        let size_y = meta.size_y as usize;
-        let plane_bytes = size_x * size_y * 2;
-        // Within a series (one data block), planes are laid out channel-major:
-        //   no = channel * times + timeBin   (SDTReader.java)
-        let times = self.n_time as usize;
-        let time_bin = plane_index as usize % times;
-        let channel = plane_index as usize / times;
-
         let block = self
             .series
             .get(self.current_series)
             .map(|s| s.block.clone())
             .or_else(|| self.blocks.first().cloned())
             .ok_or_else(|| BioFormatsError::Format("SDT plane has no data block".into()))?;
-        // Becker & Hickl block length and count-increment for this series
-        // (SDTReader.java:174,278). Used by the padding heuristic and incr
-        // division below.
-        let series_block_length = self
-            .series
-            .get(self.current_series)
-            .map(|s| s.block_length)
-            .unwrap_or(0);
-        let series_incr = self
-            .series
-            .get(self.current_series)
-            .map(|s| s.incr)
-            .unwrap_or(1);
-        let series_size_c = meta.size_c as usize;
         if let Some(curve_len) = self
             .series
             .get(self.current_series)
@@ -1971,56 +2169,7 @@ impl FormatReader for SdtReader {
                 "unsupported Becker & Hickl SDT/SPC data block layout: {reason}"
             )));
         }
-        let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        let mut f = File::open(path).map_err(BioFormatsError::Io)?;
-
-        f.seek(SeekFrom::Start(block.data_offset))
-            .map_err(BioFormatsError::Io)?;
-        let mut signature = [0u8; 2];
-        f.read_exact(&mut signature).map_err(BioFormatsError::Io)?;
-        f.seek(SeekFrom::Start(block.data_offset))
-            .map_err(BioFormatsError::Io)?;
-
-        // planeSize for one channel = paddedWidth * sizeY * times * bpp
-        // (SDTReader.java:181). Rows on disk are padded to a multiple of 4
-        // pixels in width, but the padding may be dropped when the block length
-        // shows the data is unpadded (SDTReader.java:185-190).
-        let padded_width =
-            effective_padded_width(size_x, size_y, times, series_size_c, series_block_length);
-        let channel_plane_size = (padded_width * size_y * times * 2) as u64;
-
-        let mut plane = if &signature == b"PK" {
-            // For ZIP blocks we cannot random-seek; decode and skip preceding
-            // channels by reading from the start of the decompressed stream.
-            read_sdt_zip_plane(
-                &mut f,
-                &block,
-                size_x,
-                size_y,
-                times,
-                time_bin,
-                channel,
-                padded_width,
-            )?
-        } else {
-            // Skip to the requested channel within the block.
-            f.seek(SeekFrom::Current(
-                channel as i64 * channel_plane_size as i64,
-            ))
-            .map_err(BioFormatsError::Io)?;
-            read_sdt_raw_plane(
-                &mut f,
-                size_x,
-                size_y,
-                times,
-                time_bin,
-                plane_bytes,
-                padded_width,
-            )?
-        };
-        // Divide out the count increment if > 1 (SDTReader.java:278-295).
-        apply_sdt_incr(&mut plane, series_incr);
-        Ok(plane)
+        self.open_image_region_cached(plane_index, 0, 0, meta.size_x, meta.size_y)
     }
 
     fn open_bytes_region(
@@ -2031,9 +2180,28 @@ impl FormatReader for SdtReader {
         w: u32,
         h: u32,
     ) -> Result<Vec<u8>> {
-        let full = self.open_bytes(plane_index)?;
-        let meta = self.meta.as_ref().unwrap();
-        crop_full_plane("SDT", &full, meta, 1, x, y, w, h)
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        if plane_index >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        validate_region("SDT", meta.size_x, meta.size_y, x, y, w, h)?;
+
+        if self
+            .series
+            .get(self.current_series)
+            .and_then(|s| s.raw_curve_payload_len.or(s.compressed_curve_payload_len))
+            .is_some()
+            || self
+                .series
+                .get(self.current_series)
+                .and_then(|s| s.unsupported_layout_reason.as_ref())
+                .is_some()
+        {
+            let full = self.open_bytes(plane_index)?;
+            let meta = self.meta.as_ref().unwrap();
+            return crop_full_plane("SDT", &full, meta, 1, x, y, w, h);
+        }
+        self.open_image_region_cached(plane_index, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {

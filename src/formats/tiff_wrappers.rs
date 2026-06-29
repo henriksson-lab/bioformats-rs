@@ -1608,6 +1608,7 @@ pub struct VentanaReader {
     metadata_override: Option<ImageMetadata>,
     ome_images: Vec<crate::common::ome_metadata::OmeImage>,
     pyramid_start_ifd: usize,
+    file_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1659,6 +1660,7 @@ impl VentanaReader {
             metadata_override: None,
             ome_images: Vec::new(),
             pyramid_start_ifd: 0,
+            file_name: None,
         }
     }
 
@@ -1704,6 +1706,21 @@ impl VentanaReader {
             let Some(ifd) = self.inner.ifd(idx) else {
                 continue;
             };
+            if ifd
+                .get_str(crate::tiff::ifd::tag::IMAGE_DESCRIPTION)
+                .map(|desc| {
+                    desc.split_whitespace()
+                        .any(|token| token.starts_with("level="))
+                })
+                .unwrap_or(false)
+            {
+                return idx;
+            }
+        }
+        for idx in 0..self.inner.ifd_count() {
+            let Some(ifd) = self.inner.ifd(idx) else {
+                continue;
+            };
             if !ifd
                 .get_vec_u64(crate::tiff::ifd::tag::TILE_OFFSETS)
                 .is_empty()
@@ -1738,10 +1755,12 @@ impl VentanaReader {
         // We track nesting by index ranges between ImageInfo start tags.
         let mut areas: Vec<VentanaArea> = Vec::new();
         let mut i = 0usize;
+        let mut image_info_index = 0i64;
         while i < tags.len() {
             if tags[i].name == "ImageInfo" {
                 let info = &tags[i];
                 if info.attrs.get("AOIScanned").map(|s| s.as_str()) == Some("0") {
+                    image_info_index += 1;
                     i += 1;
                     continue;
                 }
@@ -1750,7 +1769,7 @@ impl VentanaReader {
                         .attrs
                         .get("AOIIndex")
                         .and_then(|s| s.parse().ok())
-                        .unwrap_or(areas.len() as i64),
+                        .unwrap_or(image_info_index),
                     tile_rows: info
                         .attrs
                         .get("NumRows")
@@ -1794,6 +1813,7 @@ impl VentanaReader {
                     j += 1;
                 }
                 areas.push(area);
+                image_info_index += 1;
                 i = j;
             } else {
                 i += 1;
@@ -2040,12 +2060,14 @@ impl VentanaReader {
                     if index >= tiles.len() {
                         continue;
                     }
-                    tiles[index].real_x -= (right_sum * col as f64) as i64;
+                    tiles[index].real_x =
+                        (tiles[index].real_x as f64 - (right_sum * col as f64)) as i64;
                     tiles[index].real_x -= left_col_adjust;
                     if let Some(&adj) = column_x_adjust.get(&col) {
                         left_col_adjust += adj;
                     }
-                    tiles[index].real_y -= (up_sum * row as f64) as i64;
+                    tiles[index].real_y =
+                        (tiles[index].real_y as f64 - (up_sum * row as f64)) as i64;
                     if let Some(&adj) = column_y_adjust.get(&col) {
                         tiles[index].real_y += adj;
                     }
@@ -2061,6 +2083,7 @@ impl VentanaReader {
         let mut min_y = i64::MAX;
         let mut max_x = 0i64;
         let mut max_y = 0i64;
+        let mut valid_areas = Vec::new();
         for area in &mut self.areas {
             let tile_row = area.y_origin / th as i64;
             let tile_col = area.x_origin / tw as i64;
@@ -2079,15 +2102,27 @@ impl VentanaReader {
                     }
                 }
             }
+            if area_min_x == i64::MAX || area_min_y == i64::MAX {
+                continue;
+            }
             area.bb_x = area_min_x;
             area.bb_y = area_min_y + max_y_adjust;
             area.bb_w = area_max_x - area_min_x;
             area.bb_h = area_max_y - area_min_y - (3 * max_y_adjust);
+            if area.bb_w <= 0 || area.bb_h <= 0 {
+                continue;
+            }
 
             min_x = area_min_x.min(min_x);
             max_x = area_max_x.max(max_x);
             min_y = area.bb_y.min(min_y);
             max_y = (area.bb_y + area.bb_h).max(max_y);
+            valid_areas.push(area.clone());
+        }
+        self.areas = valid_areas;
+        if self.areas.is_empty() {
+            self.tiles = tiles;
+            return;
         }
         for area in &mut self.areas {
             let tile_row = area.y_origin / th as i64;
@@ -2194,10 +2229,11 @@ impl VentanaReader {
         use crate::common::ome_metadata::{OmeChannel, OmeImage};
         self.ome_images.clear();
         let physical = self.physical_pixel_size;
+        let file_name = self.file_name.as_deref().unwrap_or("Ventana image");
         for (i, s) in self.inner.series_list().iter().enumerate() {
             let channels = s.metadata.size_c.max(1);
             self.ome_images.push(OmeImage {
-                name: Some(format!("Ventana-1.bif #{}", i + 1)),
+                name: Some(format!("{file_name} #{}", i + 1)),
                 physical_size_x: physical,
                 physical_size_y: physical,
                 channels: vec![OmeChannel {
@@ -2276,9 +2312,6 @@ impl VentanaReader {
         let tiles = self.tiles.clone();
         let areas = self.areas.clone();
         for tile in &tiles {
-            if tile.real_x < 0 || tile.real_y < 0 {
-                continue;
-            }
             // Tile placement rect in full-resolution stitched space.
             let mut box_x = tile.real_x;
             let mut box_y = tile.real_y;
@@ -2318,32 +2351,41 @@ impl VentanaReader {
                 continue;
             }
 
-            // Read the source tile from the current resolution's TIFF layout. The
-            // base tile origin is scaled into the current resolution so the inner
-            // reader pulls the matching sub-resolution pixels (Java getSamples,
-            // scale==1 vs sub-resolution branches collapse to one region read).
-            let src_x = self.scale_coordinate(tile.base_x, scale);
-            let src_y = self.scale_coordinate(tile.base_y, scale);
+            // Java reads a whole TIFF tile from sub-resolutions, aligned to the
+            // sub-resolution tile grid, then copies the scaled tile window out
+            // of that cache. Reading only this_tw/this_th at the scaled base
+            // position gives different JPEG crop pixels for Ventana pyramids.
+            let (src_x, src_y, src_w, src_h, src_off_x, src_off_y) = if scale == 1 {
+                (tile.base_x, tile.base_y, this_tw, this_th, 0usize, 0usize)
+            } else {
+                let mut res_x = self.scale_coordinate(tile.base_x, scale);
+                let off_x = res_x.rem_euclid(tw);
+                res_x -= off_x;
+                let mut res_y = self.scale_coordinate(tile.base_y, scale);
+                let off_y = res_y.rem_euclid(th);
+                res_y -= off_y;
+                (res_x, res_y, tw, th, off_x as usize, off_y as usize)
+            };
             let src = self.inner.open_bytes_region(
                 0,
                 src_x as u32,
                 src_y as u32,
-                this_tw as u32,
-                this_th as u32,
+                src_w as u32,
+                src_h as u32,
             )?;
             for row in iy0..iy1 {
                 // Source coordinates within the scaled tile (Java realRow / x-x).
-                let sy = (row - box_y) as usize;
-                let sx = (ix0 - box_x) as usize;
+                let sy = src_off_y + (row - box_y) as usize;
+                let sx = src_off_x + (ix0 - box_x) as usize;
                 let copy_pixels = (ix1 - ix0) as usize;
                 let copy_len = copy_pixels * bytes_per_sample;
                 let dst_y = (row - req_y0) as usize;
                 let dst_x = (ix0 - req_x0) as usize;
                 if planar_rgb {
-                    let src_plane = this_tw as usize * this_th as usize * bytes_per_sample;
+                    let src_plane = src_w as usize * src_h as usize * bytes_per_sample;
                     for c in 0..samples_per_pixel {
                         let s_off = c * src_plane
-                            + sy * this_tw as usize * bytes_per_sample
+                            + sy * src_w as usize * bytes_per_sample
                             + sx * bytes_per_sample;
                         let d_off = c * out_plane + dst_y * out_row + dst_x * bytes_per_sample;
                         if s_off + copy_len <= src.len() && d_off + copy_len <= out.len() {
@@ -2352,7 +2394,7 @@ impl VentanaReader {
                         }
                     }
                 } else {
-                    let chunky_src_row = this_tw as usize * samples_per_pixel * bytes_per_sample;
+                    let chunky_src_row = src_w as usize * samples_per_pixel * bytes_per_sample;
                     let chunky_out_row = w as usize * samples_per_pixel * bytes_per_sample;
                     let s_off = sy * chunky_src_row + sx * samples_per_pixel * bytes_per_sample;
                     let d_off =
@@ -2389,6 +2431,7 @@ impl FormatReader for VentanaReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.file_name = path.file_name().map(|n| n.to_string_lossy().into_owned());
         self.inner.set_id(path)?;
         self.enrich_metadata();
         Ok(())
@@ -2401,6 +2444,7 @@ impl FormatReader for VentanaReader {
         self.stitched_resolution_sizes.clear();
         self.metadata_override = None;
         self.ome_images.clear();
+        self.file_name = None;
         self.inner.close()
     }
     fn series_count(&self) -> usize {
@@ -8328,6 +8372,9 @@ pub struct MolecularDevicesTiffReader {
     current_series: usize,
     /// Whether `inner` currently holds a loaded companion TIFF (plate mode).
     plate_tiff_loaded: bool,
+    /// OME metadata from the first real companion TIFF, used as the Java
+    /// MetaXpress plate template for physical sizes and detector metadata.
+    plate_ome_template: Option<crate::common::ome_metadata::OmeMetadata>,
 }
 
 /// Parsed `.htd` plate grid plus the assembled per-well/field/wavelength TIFF
@@ -8341,6 +8388,7 @@ struct MetaxpressPlate {
     selected_wells: Vec<(usize, usize)>,
     field_count: usize,
     channels: usize,
+    wavelengths: Vec<Option<String>>,
     z_steps: u32,
     /// Java changes `getFile` indexing after falling back to the
     /// `TimePoint_<t>/ZStep_<z>` directory layout.
@@ -8355,6 +8403,7 @@ impl MolecularDevicesTiffReader {
             plate_series: Vec::new(),
             current_series: 0,
             plate_tiff_loaded: false,
+            plate_ome_template: None,
         }
     }
 
@@ -8532,6 +8581,7 @@ impl MolecularDevicesTiffReader {
             selected_wells,
             field_count,
             channels,
+            wavelengths: info.wavelengths.clone(),
             z_steps: info.z_steps,
             subdirectories,
         };
@@ -8565,13 +8615,13 @@ impl MolecularDevicesTiffReader {
         })?;
 
         self.inner.set_id(&probe)?;
+        let plate_ome_template = self.inner.ome_metadata();
         let tm = self.inner.metadata();
         let size_x = tm.size_x;
         let size_y = tm.size_y;
         let pixel_type = tm.pixel_type;
         let bits = tm.bits_per_pixel;
         let little_endian = tm.is_little_endian;
-        let interleaved = tm.is_interleaved;
         let _ = self.inner.close();
 
         // Build one CoreMetadata per series (field x well), mirroring the
@@ -8609,7 +8659,7 @@ impl MolecularDevicesTiffReader {
                 image_count,
                 dimension_order: crate::common::metadata::DimensionOrder::XYCZT,
                 is_rgb: false,
-                is_interleaved: interleaved,
+                is_interleaved: false,
                 is_indexed: false,
                 is_little_endian: little_endian,
                 resolution_count: 1,
@@ -8626,6 +8676,7 @@ impl MolecularDevicesTiffReader {
         self.plate_series = plate_series;
         self.current_series = 0;
         self.plate_tiff_loaded = false;
+        self.plate_ome_template = plate_ome_template;
         Ok(())
     }
 
@@ -9867,6 +9918,7 @@ impl FormatReader for MolecularDevicesTiffReader {
         self.plate_series.clear();
         self.current_series = 0;
         self.plate_tiff_loaded = false;
+        self.plate_ome_template = None;
         self.inner.close()
     }
     fn series_count(&self) -> usize {
@@ -9930,6 +9982,121 @@ impl FormatReader for MolecularDevicesTiffReader {
             return self.open_plate_bytes(p);
         }
         self.inner.open_thumb_bytes(p)
+    }
+    fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
+        let Some(plate) = self.plate.as_ref() else {
+            return self.inner.ome_metadata();
+        };
+        if self.plate_series.is_empty() {
+            return None;
+        }
+
+        let template_image = self
+            .plate_ome_template
+            .as_ref()
+            .and_then(|ome| ome.images.first());
+        let mut ome = crate::common::ome_metadata::OmeMetadata::default();
+
+        for (series_index, meta) in self.plate_series.iter().enumerate() {
+            let mut image_ome = crate::common::ome_metadata::OmeMetadata::from_image_metadata(meta);
+            let field = series_index % plate.field_count;
+            let well_index = series_index / plate.field_count;
+            let (row, col) = plate.selected_wells[well_index];
+            if let Some(image) = image_ome.images.get_mut(0) {
+                image.name = Some(format!(
+                    "Well {} Field #{}",
+                    metaxpress_well_name(row, col),
+                    field + 1
+                ));
+                if let Some(template) = template_image {
+                    image.physical_size_x = template.physical_size_x;
+                    image.physical_size_y = template.physical_size_y;
+                    image.physical_size_z = template.physical_size_z;
+                    image.time_increment = template.time_increment;
+                }
+                if image.physical_size_x.is_none() {
+                    image.physical_size_x = Some(1.6125);
+                }
+                if image.physical_size_y.is_none() {
+                    image.physical_size_y = Some(1.6125);
+                }
+                for (channel_index, channel) in image.channels.iter_mut().enumerate() {
+                    if let Some(Some(name)) = plate.wavelengths.get(channel_index) {
+                        channel.name = Some(name.clone());
+                    }
+                }
+                image.instrument_ref = Some(0);
+                if image.planes.is_empty() {
+                    for t in 0..meta.size_t {
+                        for z in 0..meta.size_z {
+                            for c in 0..meta.size_c {
+                                image.planes.push(crate::common::ome_metadata::OmePlane {
+                                    the_z: z,
+                                    the_c: c,
+                                    the_t: t,
+                                    ..Default::default()
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            ome.images.extend(image_ome.images);
+        }
+
+        if let Some(template) = &self.plate_ome_template {
+            ome.instruments = template.instruments.clone();
+        }
+        if ome.instruments.is_empty() {
+            ome.instruments
+                .push(crate::common::ome_metadata::OmeInstrument {
+                    id: Some(crate::common::ome_metadata::create_lsid("Instrument", &[0])),
+                    detectors: vec![crate::common::ome_metadata::OmeDetector {
+                        id: Some(crate::common::ome_metadata::create_lsid(
+                            "Detector",
+                            &[0, 0],
+                        )),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                });
+        }
+
+        let mut wells = Vec::with_capacity(plate.selected_wells.len());
+        for (well_index, &(row, col)) in plate.selected_wells.iter().enumerate() {
+            let mut well_samples = Vec::with_capacity(plate.field_count);
+            for field in 0..plate.field_count {
+                let image_index = well_index * plate.field_count + field;
+                well_samples.push(crate::common::ome_metadata::OmeWellSample {
+                    id: Some(crate::common::ome_metadata::create_lsid(
+                        "WellSample",
+                        &[0, well_index, field],
+                    )),
+                    index: field as u32,
+                    image_ref: Some(image_index),
+                    position_x: None,
+                    position_y: None,
+                });
+            }
+            wells.push(crate::common::ome_metadata::OmeWell {
+                id: Some(crate::common::ome_metadata::create_lsid(
+                    "Well",
+                    &[0, well_index],
+                )),
+                row: row as u32,
+                column: col as u32,
+                well_samples,
+            });
+        }
+        ome.plates.push(crate::common::ome_metadata::OmePlate {
+            id: Some(crate::common::ome_metadata::create_lsid("Plate", &[0])),
+            name: None,
+            rows: 0,
+            columns: 0,
+            wells,
+        });
+
+        Some(ome)
     }
     fn resolution_count(&self) -> usize {
         if self.plate.is_some() {

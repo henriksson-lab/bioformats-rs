@@ -1282,9 +1282,9 @@ impl OmeMetadata {
                     let psz_u = xml_attr(pt, "PhysicalSizeZUnit").unwrap_or_else(|| "µm".into());
                     let ti_u = xml_attr(pt, "TimeIncrementUnit").unwrap_or_else(|| "s".into());
                     (
-                        psx.map(|v| to_microns(v, &psx_u)),
-                        psy.map(|v| to_microns(v, &psy_u)),
-                        psz.map(|v| to_microns(v, &psz_u)),
+                        psx.filter(|v| *v > 0.0).map(|v| to_microns(v, &psx_u)),
+                        psy.filter(|v| *v > 0.0).map(|v| to_microns(v, &psy_u)),
+                        psz.filter(|v| *v > 0.0).map(|v| to_microns(v, &psz_u)),
                         ti.map(|v| to_seconds(v, &ti_u)),
                     )
                 } else {
@@ -1304,7 +1304,14 @@ impl OmeMetadata {
                 .unwrap_or(img_xml.len());
             let pixels_xml = pixels_pos.map(|p| &img_xml[p..pixels_end]);
 
-            let channels = pixels_xml.map(parse_channels).unwrap_or_default();
+            let mut channels = pixels_xml.map(parse_channels).unwrap_or_default();
+            if channels.is_empty() {
+                let logical_channels = all_tag_positions(img_xml, "LogicalChannel").len();
+                channels.resize_with(logical_channels, || OmeChannel {
+                    samples_per_pixel: 1,
+                    ..Default::default()
+                });
+            }
             let planes = pixels_xml.map(parse_planes).unwrap_or_default();
             let modulo_z = parse_modulo(xml, img_xml, "Z");
             let modulo_c = parse_modulo(xml, img_xml, "C");

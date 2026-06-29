@@ -1913,6 +1913,7 @@ impl FormatReader for HitachiReader {
 pub struct LeoReader {
     inner: crate::tiff::TiffReader,
     meta: Option<ImageMetadata>,
+    path: Option<PathBuf>,
 }
 
 impl LeoReader {
@@ -1922,6 +1923,7 @@ impl LeoReader {
         LeoReader {
             inner: crate::tiff::TiffReader::new(),
             meta: None,
+            path: None,
         }
     }
 
@@ -1944,6 +1946,51 @@ impl LeoReader {
             }
             Some((before.trim_end(), after.trim_start()))
         }
+    }
+
+    fn parse_length_um(value: &str) -> Option<f64> {
+        let trimmed = value.trim();
+        let mut end = 0usize;
+        for (idx, ch) in trimmed.char_indices() {
+            if ch.is_ascii_digit() || matches!(ch, '.' | '+' | '-' | 'e' | 'E') {
+                end = idx + ch.len_utf8();
+            } else if end > 0 {
+                break;
+            }
+        }
+        let number: f64 = trimmed.get(..end)?.trim().parse().ok()?;
+        if !number.is_finite() || number <= 0.0 {
+            return None;
+        }
+        let unit = trimmed[end..].trim().to_ascii_lowercase();
+        let scale = if unit.starts_with("mm") {
+            1000.0
+        } else if unit.starts_with("nm") {
+            0.001
+        } else if unit == "m" || unit.starts_with("meter") || unit.starts_with("metre") {
+            1_000_000.0
+        } else {
+            1.0
+        };
+        Some(number * scale)
+    }
+
+    fn parse_length_number(value: &str) -> Option<f64> {
+        let trimmed = value.trim();
+        let mut end = 0usize;
+        for (idx, ch) in trimmed.char_indices() {
+            if ch.is_ascii_digit() || matches!(ch, '.' | '+' | '-' | 'e' | 'E') {
+                end = idx + ch.len_utf8();
+            } else if end > 0 {
+                break;
+            }
+        }
+        trimmed
+            .get(..end)?
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|value| value.is_finite() && *value > 0.0)
     }
 }
 
@@ -1985,6 +2032,11 @@ impl FormatReader for LeoReader {
         }
 
         let mut meta = self.inner.metadata().clone();
+        meta.is_interleaved = false;
+        if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+            meta.series_metadata
+                .insert("image_name".into(), MetadataValue::String(name.to_string()));
+        }
         meta.series_metadata
             .insert("format".into(), MetadataValue::String("LEO".into()));
 
@@ -1992,6 +2044,18 @@ impl FormatReader for LeoReader {
         // value lives on the following line (Java initStandardMetadata()).
         if let Some(tag_text) = first.get_str(Self::LEO_TAG) {
             let lines: Vec<&str> = tag_text.split('\n').collect();
+            if let Some(legacy_size) = lines.get(3).and_then(|line| {
+                line.trim()
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|value| value.is_finite() && *value > 0.0)
+                    .map(|value| value * 1_000_000.0)
+            }) {
+                meta.series_metadata
+                    .insert("PhysicalSizeX".into(), MetadataValue::Float(legacy_size));
+                meta.series_metadata
+                    .insert("PhysicalSizeY".into(), MetadataValue::Float(legacy_size));
+            }
             let mut i = 36usize;
             while i < lines.len() {
                 let t = lines[i].trim_end_matches('\r');
@@ -2012,12 +2076,52 @@ impl FormatReader for LeoReader {
             }
         }
 
+        if let Some(MetadataValue::String(pixel_size)) =
+            meta.series_metadata.get("Image Pixel Size")
+        {
+            if let Some(size) = Self::parse_length_number(pixel_size) {
+                meta.series_metadata
+                    .insert("PhysicalSizeX".into(), MetadataValue::Float(size));
+                meta.series_metadata
+                    .insert("PhysicalSizeY".into(), MetadataValue::Float(size));
+            }
+        } else if let Some(MetadataValue::String(pixel_size)) =
+            meta.series_metadata.get("Pixel Size")
+        {
+            if !meta.series_metadata.contains_key("PhysicalSizeX") {
+                if let Some(size_um) = Self::parse_length_um(pixel_size) {
+                    meta.series_metadata
+                        .insert("PhysicalSizeX".into(), MetadataValue::Float(size_um));
+                    meta.series_metadata
+                        .insert("PhysicalSizeY".into(), MetadataValue::Float(size_um));
+                }
+            }
+        }
+        meta.series_metadata.insert(
+            "objective.immersion".into(),
+            MetadataValue::String("Other".into()),
+        );
+        meta.series_metadata.insert(
+            "objective.correction".into(),
+            MetadataValue::String("Other".into()),
+        );
+        if let Some(MetadataValue::String(working_distance)) = meta.series_metadata.get("WD") {
+            if let Some(wd_um) = Self::parse_length_um(working_distance) {
+                meta.series_metadata.insert(
+                    "objective.working_distance".into(),
+                    MetadataValue::Float(wd_um),
+                );
+            }
+        }
+
+        self.path = Some(path.to_path_buf());
         self.meta = Some(meta);
         Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
         self.meta = None;
+        self.path = None;
         self.inner.close()
     }
 
@@ -2071,6 +2175,69 @@ impl FormatReader for LeoReader {
 
     fn set_resolution(&mut self, level: usize) -> Result<()> {
         self.inner.set_resolution(level)
+    }
+
+    fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
+        let meta = self.meta.as_ref()?;
+        let mut ome = crate::common::ome_metadata::OmeMetadata::from_image_metadata(meta);
+        if let Some(image) = ome.images.get_mut(0) {
+            if image.name.is_none() {
+                image.name = self
+                    .path
+                    .as_ref()
+                    .and_then(|path| path.file_name())
+                    .and_then(|name| name.to_str())
+                    .map(|name| name.to_string());
+            }
+            if let Some(MetadataValue::Float(size_um)) = meta.series_metadata.get("PhysicalSizeX") {
+                image.physical_size_x = Some(*size_um);
+            }
+            if let Some(MetadataValue::Float(size_um)) = meta.series_metadata.get("PhysicalSizeY") {
+                image.physical_size_y = Some(*size_um);
+            }
+            if image.physical_size_x.is_none() || image.physical_size_y.is_none() {
+                if let Some(MetadataValue::String(pixel_size)) =
+                    meta.series_metadata.get("Image Pixel Size")
+                {
+                    if let Some(size) = Self::parse_length_number(pixel_size) {
+                        image.physical_size_x.get_or_insert(size);
+                        image.physical_size_y.get_or_insert(size);
+                    }
+                } else if let Some(MetadataValue::String(pixel_size)) =
+                    meta.series_metadata.get("Pixel Size")
+                {
+                    if let Some(size) = Self::parse_length_um(pixel_size) {
+                        image.physical_size_x.get_or_insert(size);
+                        image.physical_size_y.get_or_insert(size);
+                    }
+                }
+            }
+            image.instrument_ref = Some(0);
+            image.objective_ref = Some(0);
+        }
+        if ome.instruments.is_empty() {
+            let mut instrument = crate::common::ome_metadata::OmeInstrument {
+                id: Some(crate::common::ome_metadata::create_lsid("Instrument", &[0])),
+                ..Default::default()
+            };
+            instrument
+                .objectives
+                .push(crate::common::ome_metadata::OmeObjective {
+                    id: Some(crate::common::ome_metadata::create_lsid(
+                        "Objective",
+                        &[0, 0],
+                    )),
+                    immersion: Some("Other".into()),
+                    correction: Some("Other".into()),
+                    working_distance: match meta.series_metadata.get("objective.working_distance") {
+                        Some(MetadataValue::Float(value)) => Some(*value),
+                        _ => None,
+                    },
+                    ..Default::default()
+                });
+            ome.instruments.push(instrument);
+        }
+        Some(ome)
     }
 }
 

@@ -108,6 +108,15 @@ pub(crate) fn open_reader(path: &Path) -> Result<Box<dyn FormatReader>> {
         return Ok(r);
     }
 
+    // KLB has no magic bytes and Java marks its `.klb` suffix as sufficient.
+    // Dispatch it before the Java-order suffix fallback so FilePatternReader
+    // cannot claim Keller Lab Block filenames as filename patterns first.
+    if has_klb_extension(path) {
+        let mut r = boxed_reader(crate::formats::misc4::KlbReader::new());
+        r.set_id(path)?;
+        return Ok(r);
+    }
+
     let header = peek_header(path, DETECTION_HEADER_BYTES)?;
     let mut best_error = None;
 
@@ -268,6 +277,13 @@ fn has_pattern_extension(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+fn has_klb_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.eq_ignore_ascii_case("klb"))
+        .unwrap_or(false)
+}
+
 fn has_zvi_extension(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
@@ -347,6 +363,10 @@ pub(crate) fn detect_reader_without_set_id(path: &Path) -> Result<Box<dyn Format
 
     if has_pattern_extension(path) {
         return Ok(boxed_reader(crate::formats::misc4::FilePatternReader::new()));
+    }
+
+    if has_klb_extension(path) {
+        return Ok(boxed_reader(crate::formats::misc4::KlbReader::new()));
     }
 
     let header = peek_header(path, DETECTION_HEADER_BYTES)?;
@@ -512,6 +532,10 @@ fn tiff_wrapper_readers_for_extension(path: &Path, header: &[u8]) -> Vec<Box<dyn
             let software = tiff_software_tag(path);
 
             let mut readers = Vec::new();
+            let micromanager = crate::formats::micromanager::MicromanagerReader::new();
+            if micromanager.is_this_type_by_name(path) {
+                readers.push(boxed_reader(micromanager));
+            }
             // Java readers.txt probes OMETiffReader before every other slow
             // TIFF wrapper. Rust's TiffReader is the OME-TIFF implementation,
             // so give valid-looking OME-XML comments the same early slot before
@@ -579,9 +603,10 @@ fn tiff_wrapper_readers_for_extension(path: &Path, header: &[u8]) -> Vec<Box<dyn
                     crate::formats::metamorph::MetamorphReader::new(),
                 ));
             }
-            let micromanager = crate::formats::micromanager::MicromanagerReader::new();
-            if micromanager.is_this_type_by_name(path) {
-                readers.push(boxed_reader(micromanager));
+            if has_metamorph_nd_sibling(path) {
+                readers.push(boxed_reader(
+                    crate::formats::metamorph::MetamorphReader::new(),
+                ));
             }
             if let Some(description) = description.as_deref() {
                 if description.contains("Improvision") {
@@ -617,6 +642,9 @@ fn tiff_wrapper_readers_for_extension(path: &Path, header: &[u8]) -> Vec<Box<dyn
                 readers.push(boxed_reader(
                     crate::formats::tiff_wrappers::FeiTiffReader::new(),
                 ));
+            }
+            if tiff_first_ifd_has_any_tag(path, &[34118]) {
+                readers.push(boxed_reader(crate::formats::sem::LeoReader::new()));
             }
             if let Some(description) = description.as_deref() {
                 readers.extend(simplepci_tiff_wrappers_for_description(description));
@@ -661,6 +689,33 @@ fn tiff_wrapper_readers_for_extension(path: &Path, header: &[u8]) -> Vec<Box<dyn
         }
         _ => Vec::new(),
     }
+}
+
+fn has_metamorph_nd_sibling(path: &Path) -> bool {
+    let Some(dir) = path.parent() else {
+        return false;
+    };
+    let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+        return false;
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries.filter_map(|entry| entry.ok()).any(|entry| {
+        let p = entry.path();
+        let Some(ext) = p.extension().and_then(|ext| ext.to_str()) else {
+            return false;
+        };
+        if !ext.eq_ignore_ascii_case("nd") && !ext.eq_ignore_ascii_case("scan") {
+            return false;
+        }
+        let Some(nd_stem) = p.file_stem().and_then(|name| name.to_str()) else {
+            return false;
+        };
+        stem.strip_prefix(nd_stem)
+            .map(|suffix| suffix.starts_with('_'))
+            .unwrap_or(false)
+    })
 }
 
 fn generic_tiff_name_wrappers(path: &Path, _header: &[u8]) -> Vec<Box<dyn FormatReader>> {

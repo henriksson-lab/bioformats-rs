@@ -10970,6 +10970,28 @@ fn parse_oir_native(path: &Path) -> Result<OirNative> {
         // Fall back to channel ids discovered in the pixel block UIDs.
         channel_ids = oir_channel_ids_from_uids(&pixel_blocks);
     }
+    let used_channel_ids = oir_channel_ids_from_uids(&pixel_blocks);
+    if !used_channel_ids.is_empty() {
+        channel_ids.retain(|id| used_channel_ids.contains(id));
+        if channel_ids.is_empty() {
+            channel_ids = used_channel_ids;
+        }
+    }
+    for (channel_index, channel_id) in channel_ids.iter().enumerate() {
+        if let Some(name) = oir_channel_name_for_id(&xml_blocks, channel_id) {
+            meta.series_metadata.insert(
+                format!("channel.{channel_index}.name"),
+                MetadataValue::String(name),
+            );
+        }
+    }
+    meta.is_indexed = xml_blocks.iter().any(|xml| xml.contains("<lut:LUT"));
+    if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+        meta.series_metadata.insert(
+            "image_name".to_string(),
+            MetadataValue::String(name.to_string()),
+        );
+    }
     let channel_count = channel_ids.len().max(1) as u32;
 
     // sizeC starts at 1 (or LAMBDA size) and is multiplied by channel count,
@@ -11122,9 +11144,66 @@ fn oir_apply_xml(xml_blocks: &[String], meta: &mut ImageMetadata, channel_ids: &
                 }
             }
             oir_apply_axes(xml, meta);
+            oir_apply_physical_sizes(xml, meta);
             oir_apply_channels(xml, channel_ids);
         }
     }
+}
+
+fn oir_apply_physical_sizes(xml: &str, meta: &mut ImageMetadata) {
+    let Some(length_start) = xml.find("<commonphase:length") else {
+        return;
+    };
+    let length_block = &xml[length_start..];
+    let length_block = length_block
+        .find("</commonphase:length>")
+        .map(|end| &length_block[..end])
+        .unwrap_or(length_block);
+    for (axis, key) in [
+        ("x", "PhysicalSizeX"),
+        ("y", "PhysicalSizeY"),
+        ("z", "PhysicalSizeZ"),
+    ] {
+        if let Some(value) = oir_xml_text_fragment(length_block, &format!("commonparam:{axis}"))
+            .and_then(|value| value.trim().parse::<f64>().ok())
+            .filter(|value| value.is_finite() && *value > 0.0)
+        {
+            meta.series_metadata
+                .entry(key.to_string())
+                .or_insert(MetadataValue::Float(value));
+        }
+    }
+}
+
+fn oir_xml_text_fragment(xml: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = xml.find(&open)? + open.len();
+    let end = xml[start..].find(&close)? + start;
+    Some(xml[start..end].trim().to_string())
+}
+
+fn oir_channel_name_for_id(xml_blocks: &[String], channel_id: &str) -> Option<String> {
+    let needle = format!("id=\"{channel_id}\"");
+    for xml in xml_blocks {
+        let Some(id_pos) = xml.find(&needle) else {
+            continue;
+        };
+        let after = &xml[id_pos..];
+        let end = after.find("</commonphase:channel>").unwrap_or(after.len());
+        let channel_block = &after[..end];
+        if let Some(name) = oir_xml_text_fragment(channel_block, "commonphase:name") {
+            if !name.is_empty() {
+                return Some(name);
+            }
+        }
+        if let Some(name) = oir_xml_text_fragment(channel_block, "commonimage:name") {
+            if !name.is_empty() {
+                return Some(name);
+            }
+        }
+    }
+    None
 }
 
 /// Parse `commonparam:axis` / `commonimage:axis` entries (ZSTACK/TIMELAPSE/
@@ -11631,6 +11710,76 @@ impl FormatReader for OirReader {
         let tx = (sx - tw) / 2;
         let ty = (sy - th) / 2;
         self.open_bytes_region(plane_index, tx, ty, tw, th)
+    }
+
+    fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
+        let meta = self.metadata();
+        if std::ptr::eq(meta, crate::common::reader::uninitialized_metadata()) {
+            return None;
+        }
+        let mut ome = crate::common::ome_metadata::OmeMetadata::from_image_metadata(meta);
+        if let Some(image) = ome.images.get_mut(0) {
+            if let Some(MetadataValue::Float(value)) = meta.series_metadata.get("PhysicalSizeX") {
+                image.physical_size_x = Some(*value);
+            }
+            if let Some(MetadataValue::Float(value)) = meta.series_metadata.get("PhysicalSizeY") {
+                image.physical_size_y = Some(*value);
+            }
+            if let Some(MetadataValue::Float(value)) = meta.series_metadata.get("PhysicalSizeZ") {
+                image.physical_size_z = Some(*value);
+            }
+            image.instrument_ref = Some(0);
+            image.objective_ref = Some(0);
+            if image.planes.is_empty() {
+                for plane in 0..meta.image_count {
+                    let (z, c, t) = oir_zct_coords(meta, plane);
+                    image.planes.push(crate::common::ome_metadata::OmePlane {
+                        the_z: z,
+                        the_c: c,
+                        the_t: t,
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+        if ome.instruments.is_empty() {
+            let mut instrument = crate::common::ome_metadata::OmeInstrument {
+                id: Some(crate::common::ome_metadata::create_lsid("Instrument", &[0])),
+                ..Default::default()
+            };
+            instrument
+                .objectives
+                .push(crate::common::ome_metadata::OmeObjective {
+                    id: Some(crate::common::ome_metadata::create_lsid(
+                        "Objective",
+                        &[0, 0],
+                    )),
+                    ..Default::default()
+                });
+            for detector_index in 0..4 {
+                instrument
+                    .detectors
+                    .push(crate::common::ome_metadata::OmeDetector {
+                        id: Some(crate::common::ome_metadata::create_lsid(
+                            "Detector",
+                            &[0, detector_index],
+                        )),
+                        ..Default::default()
+                    });
+            }
+            instrument
+                .light_sources
+                .push(crate::common::ome_metadata::OmeLightSource {
+                    id: Some(crate::common::ome_metadata::create_lsid(
+                        "LightSource",
+                        &[0, 0],
+                    )),
+                    light_source_type: Some("Laser".to_string()),
+                    ..Default::default()
+                });
+            ome.instruments.push(instrument);
+        }
+        Some(ome)
     }
 }
 
@@ -15913,6 +16062,12 @@ impl SpcReader {
         m.is_little_endian = true;
         m.image_count = m.size_z * m.size_c * m.size_t;
         m.is_indexed = false;
+        if let Some(name) = spc_name.file_name().and_then(|name| name.to_str()) {
+            m.series_metadata.insert(
+                "image_name".to_string(),
+                MetadataValue::String(name.to_string()),
+            );
+        }
 
         // moduloT: lifetime sub-dimension within T.
         let step = if self.n_timebins != 0 {

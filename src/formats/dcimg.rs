@@ -756,7 +756,11 @@ impl FormatReader for DcimgReader {
     fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
         let meta = self.meta.as_ref()?;
         let mut ome = crate::common::ome_metadata::OmeMetadata::from_image_metadata(meta);
-        let _ = ome.add_original_metadata_annotations(meta, 0);
+        if let (Some(image), Some(path)) = (ome.images.get_mut(0), self.path.as_ref()) {
+            image.name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned());
+        }
         Some(ome)
     }
 }

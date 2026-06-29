@@ -4745,18 +4745,29 @@ struct KlbLayout {
     blocks_per_plane: usize,
 }
 
+#[derive(Clone)]
+struct KlbSeriesFiles {
+    files: Vec<Vec<Option<PathBuf>>>,
+}
+
 pub struct KlbReader {
     path: Option<PathBuf>,
-    meta: Option<ImageMetadata>,
-    layout: Option<KlbLayout>,
+    metas: Vec<ImageMetadata>,
+    layouts: Vec<KlbLayout>,
+    series_files: Vec<KlbSeriesFiles>,
+    layout_cache: HashMap<PathBuf, KlbLayout>,
+    current_series: usize,
 }
 
 impl KlbReader {
     pub fn new() -> Self {
         KlbReader {
             path: None,
-            meta: None,
-            layout: None,
+            metas: Vec::new(),
+            layouts: Vec::new(),
+            series_files: Vec::new(),
+            layout_cache: HashMap::new(),
+            current_series: 0,
         }
     }
 
@@ -4794,35 +4805,25 @@ impl KlbReader {
             _ => None,
         }
     }
-}
 
-impl Default for KlbReader {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl FormatReader for KlbReader {
-    fn is_this_type_by_name(&self, path: &Path) -> bool {
-        // Java sets suffixSufficient=true: KLB is recognised by its extension.
-        let ext = path
-            .extension()
+    fn klb_extension(path: &Path) -> bool {
+        path.extension()
             .and_then(|e| e.to_str())
-            .map(|e| e.to_ascii_lowercase());
-        matches!(ext.as_deref(), Some("klb"))
+            .map(|e| e.eq_ignore_ascii_case("klb"))
+            .unwrap_or(false)
     }
 
-    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
-        // KLB has no magic-byte signature (the file starts with a version byte);
-        // upstream relies on the suffix.
-        false
+    fn read_u32_from(f: &mut std::fs::File, buf32: &mut [u8; 4]) -> Result<u32> {
+        f.read_exact(buf32).map_err(BioFormatsError::Io)?;
+        Ok(u32::from_le_bytes(*buf32))
     }
 
-    fn set_id(&mut self, path: &Path) -> Result<()> {
-        self.path = None;
-        self.meta = None;
-        self.layout = None;
-
+    fn read_header_for(
+        path: &Path,
+        size_c_override: Option<u32>,
+        size_t_override: Option<u32>,
+        image_name: Option<String>,
+    ) -> Result<(ImageMetadata, KlbLayout)> {
         let mut f = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
 
         // -- readHeader --
@@ -4830,21 +4831,16 @@ impl FormatReader for KlbReader {
         f.read_exact(&mut byte).map_err(BioFormatsError::Io)?; // headerVersion
 
         let mut buf32 = [0u8; 4];
-        let mut read_u32 = |f: &mut std::fs::File| -> Result<u32> {
-            f.read_exact(&mut buf32).map_err(BioFormatsError::Io)?;
-            Ok(u32::from_le_bytes(buf32))
-        };
         let mut dims_xyzct = [0u32; KLB_DATA_DIMS];
         for d in dims_xyzct.iter_mut() {
-            *d = read_u32(&mut f)?;
+            *d = Self::read_u32_from(&mut f, &mut buf32)?;
         }
 
         let size_x = dims_xyzct[0];
         let size_y = dims_xyzct[1];
         let size_z = dims_xyzct[2];
-        // Single-file case: Java forces sizeC = sizeT = 1.
-        let size_c = 1u32;
-        let size_t = 1u32;
+        let size_c = size_c_override.unwrap_or(dims_xyzct[3].max(1));
+        let size_t = size_t_override.unwrap_or(dims_xyzct[4].max(1));
         if size_x == 0 || size_y == 0 || size_z == 0 {
             return Err(BioFormatsError::Format(
                 "KLB header has zero image dimensions".to_string(),
@@ -4878,7 +4874,7 @@ impl FormatReader for KlbReader {
 
         let mut block_size = [0u32; KLB_DATA_DIMS];
         for b in block_size.iter_mut() {
-            *b = read_u32(&mut f)?;
+            *b = Self::read_u32_from(&mut f, &mut buf32)?;
         }
         if block_size.iter().any(|&b| b == 0) {
             return Err(BioFormatsError::Format(
@@ -4912,7 +4908,6 @@ impl FormatReader for KlbReader {
             )));
         }
 
-        // The cumulative block end-offsets follow immediately (offsetFilePointer).
         let mut offset_bytes = vec![0u8; num_blocks_usize * 8];
         f.read_exact(&mut offset_bytes)
             .map_err(BioFormatsError::Io)?;
@@ -4950,6 +4945,9 @@ impl FormatReader for KlbReader {
                 );
             }
         }
+        if let Some(name) = image_name {
+            series_metadata.insert("image_name".to_string(), MetadataValue::String(name));
+        }
         if dims_pixel_size[0].is_finite() && dims_pixel_size[0] > 0.0 {
             series_metadata.insert(
                 "PhysicalSizeX".to_string(),
@@ -4969,8 +4967,7 @@ impl FormatReader for KlbReader {
             );
         }
 
-        self.path = Some(path.to_path_buf());
-        self.meta = Some(ImageMetadata {
+        let meta = ImageMetadata {
             size_x,
             size_y,
             size_z,
@@ -4983,32 +4980,254 @@ impl FormatReader for KlbReader {
             is_little_endian: true,
             series_metadata,
             ..ImageMetadata::default()
-        });
-        self.layout = Some(KlbLayout {
+        };
+        let layout = KlbLayout {
             block_size,
             compression_type,
             header_size,
             block_offsets,
             blocks_per_plane,
-        });
+        };
+        Ok((meta, layout))
+    }
+
+    fn parse_channel(name: &str) -> Option<i32> {
+        let start = name.find("_CHN")? + 4;
+        let rest = &name[start..];
+        let end = rest.find('.')?;
+        rest[..end].parse().ok()
+    }
+
+    fn parse_timepoint(name: &str) -> Option<usize> {
+        let start = name.find(".TM")? + 3;
+        let end = name[start..].find("_timeFused_blending")? + start;
+        name[start..end].parse().ok()
+    }
+
+    fn projection_name(name: &str) -> Option<&'static str> {
+        if name.contains(".fusedStack_xyProjection") {
+            Some("xy")
+        } else if name.contains(".fusedStack_xzProjection") {
+            Some("xz")
+        } else if name.contains(".fusedStack_yzProjection") {
+            Some("yz")
+        } else {
+            None
+        }
+    }
+
+    fn build_grouped_files(path: &Path) -> Option<Vec<(String, KlbSeriesFiles)>> {
+        let file_name = path.file_name()?.to_str()?;
+        if !file_name.contains("_CHN") {
+            return None;
+        }
+        let channel_pos = file_name.find("_CHN")?;
+        let base_file_prefix = &file_name[..channel_pos];
+        let parent = path.parent()?;
+        let mut channels = Vec::<i32>::new();
+        for entry in std::fs::read_dir(parent).ok()?.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.contains(base_file_prefix) {
+                if let Some(channel) = Self::parse_channel(&name) {
+                    if !channels.contains(&channel) {
+                        channels.push(channel);
+                    }
+                }
+            }
+        }
+        if channels.is_empty() {
+            return None;
+        }
+        channels.sort_unstable();
+
+        let top = parent.parent()?;
+        let parent_name = parent.file_name()?.to_str()?;
+        let base_folder_prefix = parent_name.rsplit_once('.')?.0.to_string();
+        let mut folders = Vec::new();
+        for entry in std::fs::read_dir(top).ok()?.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy().into_owned();
+            if !name.starts_with(&base_folder_prefix) {
+                continue;
+            }
+            if let Some(timepoint) = Self::parse_timepoint(&name) {
+                if entry.file_type().ok()?.is_dir() {
+                    folders.push((timepoint, entry.path()));
+                }
+            }
+        }
+        if folders.is_empty() {
+            return None;
+        }
+        folders.sort_by_key(|(timepoint, _)| *timepoint);
+        let size_t = folders.len();
+        let size_c = channels.len();
+
+        let mut series = vec![
+            (
+                "Default".to_string(),
+                KlbSeriesFiles {
+                    files: vec![vec![None; size_c]; size_t],
+                },
+            ),
+            (
+                "xy".to_string(),
+                KlbSeriesFiles {
+                    files: vec![vec![None; size_c]; size_t],
+                },
+            ),
+            (
+                "xz".to_string(),
+                KlbSeriesFiles {
+                    files: vec![vec![None; size_c]; size_t],
+                },
+            ),
+            (
+                "yz".to_string(),
+                KlbSeriesFiles {
+                    files: vec![vec![None; size_c]; size_t],
+                },
+            ),
+        ];
+
+        for (t_index, (_, folder)) in folders.iter().enumerate() {
+            let mut entries: Vec<_> = std::fs::read_dir(folder).ok()?.flatten().collect();
+            entries.sort_by_key(|entry| entry.file_name());
+            for entry in entries {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if !Self::klb_extension(&entry.path()) {
+                    continue;
+                }
+                let channel = match Self::parse_channel(&name) {
+                    Some(channel) => channel,
+                    None => continue,
+                };
+                let c_index = match channels.iter().position(|c| *c == channel) {
+                    Some(index) => index,
+                    None => continue,
+                };
+                let series_index = match Self::projection_name(&name) {
+                    Some("xy") => 1,
+                    Some("xz") => 2,
+                    Some("yz") => 3,
+                    Some(_) => continue,
+                    None => 0,
+                };
+                series[series_index].1.files[t_index][c_index] = Some(entry.path());
+            }
+        }
+
+        if series[0].1.files[0][0].is_none() {
+            return None;
+        }
+        Some(series)
+    }
+
+    fn zct_coords(meta: &ImageMetadata, plane_index: u32) -> (u32, u32, u32) {
+        let z = plane_index % meta.size_z;
+        let c = (plane_index / meta.size_z) % meta.size_c;
+        let t = plane_index / meta.size_z / meta.size_c;
+        (z, c, t)
+    }
+}
+
+impl Default for KlbReader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FormatReader for KlbReader {
+    fn is_this_type_by_name(&self, path: &Path) -> bool {
+        // Java sets suffixSufficient=true: KLB is recognised by its extension.
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        matches!(ext.as_deref(), Some("klb"))
+    }
+
+    fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {
+        // KLB has no magic-byte signature (the file starts with a version byte);
+        // upstream relies on the suffix.
+        false
+    }
+
+    fn set_id(&mut self, path: &Path) -> Result<()> {
+        self.path = None;
+        self.metas.clear();
+        self.layouts.clear();
+        self.series_files.clear();
+        self.layout_cache.clear();
+        self.current_series = 0;
+
+        if let Some(grouped) = Self::build_grouped_files(path) {
+            let size_t = grouped[0].1.files.len() as u32;
+            let size_c = grouped[0].1.files[0].len() as u32;
+            let opened_name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("image.klb")
+                .to_string();
+            for (series_index, (series_name, files)) in grouped.into_iter().enumerate() {
+                let representative = files.files[0][0].as_ref().ok_or_else(|| {
+                    BioFormatsError::Format(format!(
+                        "KLB grouped series {series_name} is missing t0/c0"
+                    ))
+                })?;
+                let image_name = Some(format!("{opened_name} #{}", series_index + 1));
+                let (mut meta, layout) =
+                    Self::read_header_for(representative, Some(size_c), Some(size_t), image_name)?;
+                if series_index > 0 {
+                    meta.series_metadata.remove("PhysicalSizeX");
+                    meta.series_metadata.remove("PhysicalSizeY");
+                    meta.series_metadata.remove("PhysicalSizeZ");
+                }
+                self.layout_cache
+                    .insert(representative.to_path_buf(), layout.clone());
+                self.metas.push(meta);
+                self.layouts.push(layout);
+                self.series_files.push(files);
+            }
+        } else {
+            let image_name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.to_string());
+            let (meta, layout) = Self::read_header_for(path, Some(1), Some(1), image_name)?;
+            self.layout_cache.insert(path.to_path_buf(), layout.clone());
+            self.metas.push(meta);
+            self.layouts.push(layout);
+            self.series_files.push(KlbSeriesFiles {
+                files: vec![vec![Some(path.to_path_buf())]],
+            });
+        }
+
+        self.path = Some(path.to_path_buf());
         Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
         self.path = None;
-        self.meta = None;
-        self.layout = None;
+        self.metas.clear();
+        self.layouts.clear();
+        self.series_files.clear();
+        self.layout_cache.clear();
+        self.current_series = 0;
         Ok(())
     }
 
     fn series_count(&self) -> usize {
-        usize::from(self.meta.is_some())
+        self.metas.len()
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
-        if self.meta.is_none() {
+        if self.metas.is_empty() {
             Err(BioFormatsError::NotInitialized)
-        } else if s == 0 {
+        } else if s < self.metas.len() {
+            self.current_series = s;
             Ok(())
         } else {
             Err(BioFormatsError::SeriesOutOfRange(s))
@@ -5016,25 +5235,46 @@ impl FormatReader for KlbReader {
     }
 
     fn series(&self) -> usize {
-        0
+        self.current_series
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        self.meta
-            .as_ref()
+        self.metas
+            .get(self.current_series)
             .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let meta = self
+            .metas
+            .get(self.current_series)
+            .ok_or(BioFormatsError::NotInitialized)?;
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
+        let (z, c, t) = Self::zct_coords(meta, plane_index);
+        let path = self
+            .series_files
+            .get(self.current_series)
+            .and_then(|series| series.files.get(t as usize))
+            .and_then(|channels| channels.get(c as usize))
+            .and_then(|path| path.as_ref())
+            .ok_or_else(|| {
+                BioFormatsError::Format(format!(
+                    "KLB grouped file missing for series {}, t={}, c={}",
+                    self.current_series, t, c
+                ))
+            })?
+            .clone();
+        if !self.layout_cache.contains_key(&path) {
+            let (_, layout) = Self::read_header_for(&path, None, None, None)?;
+            self.layout_cache.insert(path.clone(), layout);
+        }
         let layout = self
-            .layout
-            .as_ref()
-            .ok_or(BioFormatsError::NotInitialized)?;
-        let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+            .layout_cache
+            .get(&path)
+            .ok_or(BioFormatsError::NotInitialized)?
+            .clone();
 
         let bpp = meta.pixel_type.bytes_per_sample();
         let size_x = meta.size_x as usize;
@@ -5044,8 +5284,6 @@ impl FormatReader for KlbReader {
         let bs1 = layout.block_size[1] as usize;
         let bs2 = layout.block_size[2];
 
-        // Single-file: c = t = 0, so the plane index is the z coordinate.
-        let z = plane_index;
         if z >= size_z {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
@@ -5061,7 +5299,7 @@ impl FormatReader for KlbReader {
             .and_then(|px| px.checked_mul(bpp))
             .ok_or_else(|| BioFormatsError::Format("KLB plane is too large".to_string()))?;
         let mut out = vec![0u8; out_len];
-        let mut f = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
+        let mut f = std::fs::File::open(&path).map_err(BioFormatsError::Io)?;
 
         for by in 0..blocks_per_col {
             for bx in 0..blocks_per_row {
@@ -5153,14 +5391,20 @@ impl FormatReader for KlbReader {
         w: u32,
         h: u32,
     ) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let meta = self
+            .metas
+            .get(self.current_series)
+            .ok_or(BioFormatsError::NotInitialized)?;
         let meta = meta.clone();
         let plane = self.open_bytes(plane_index)?;
         crop_plane(&plane, &meta, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let meta = self
+            .metas
+            .get(self.current_series)
+            .ok_or(BioFormatsError::NotInitialized)?;
         let tw = meta.size_x.min(256);
         let th = meta.size_y.min(256);
         let tx = (meta.size_x - tw) / 2;
@@ -5169,12 +5413,18 @@ impl FormatReader for KlbReader {
     }
 
     fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
-        let meta = self.meta.as_ref()?;
-        let mut ome = crate::common::ome_metadata::OmeMetadata::from_image_metadata(meta);
-        if let Some(image) = ome.images.get_mut(0) {
-            image.physical_size_x = Self::metadata_positive_f64(meta, "PhysicalSizeX");
-            image.physical_size_y = Self::metadata_positive_f64(meta, "PhysicalSizeY");
-            image.physical_size_z = Self::metadata_positive_f64(meta, "PhysicalSizeZ");
+        if self.metas.is_empty() {
+            return None;
+        }
+        let mut ome = crate::common::ome_metadata::OmeMetadata::default();
+        for meta in &self.metas {
+            let one = crate::common::ome_metadata::OmeMetadata::from_image_metadata(meta);
+            if let Some(mut image) = one.images.into_iter().next() {
+                image.physical_size_x = Self::metadata_positive_f64(meta, "PhysicalSizeX");
+                image.physical_size_y = Self::metadata_positive_f64(meta, "PhysicalSizeY");
+                image.physical_size_z = Self::metadata_positive_f64(meta, "PhysicalSizeZ");
+                ome.images.push(image);
+            }
         }
         Some(ome)
     }

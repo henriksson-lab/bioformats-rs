@@ -683,7 +683,7 @@ impl TiffReader {
                     image_count,
                     dimension_order: crate::common::metadata::DimensionOrder::XYCZT,
                     is_rgb,
-                    is_interleaved: is_interleaved_rgb(info),
+                    is_interleaved: is_rgb && is_interleaved_rgb(info),
                     is_indexed,
                     is_little_endian: little_endian,
                     resolution_count: 1,
@@ -694,6 +694,24 @@ impl TiffReader {
                     modulo_c: None,
                     modulo_t: None,
                 };
+                if let Some(value) = tiff_physical_size(
+                    ifds.get(ifd_indices[0]),
+                    crate::tiff::ifd::tag::X_RESOLUTION,
+                ) {
+                    meta.series_metadata.insert(
+                        "PhysicalSizeX".to_string(),
+                        crate::common::metadata::MetadataValue::Float(value),
+                    );
+                }
+                if let Some(value) = tiff_physical_size(
+                    ifds.get(ifd_indices[0]),
+                    crate::tiff::ifd::tag::Y_RESOLUTION,
+                ) {
+                    meta.series_metadata.insert(
+                        "PhysicalSizeY".to_string(),
+                        crate::common::metadata::MetadataValue::Float(value),
+                    );
+                }
 
                 // Store image description in metadata
                 if let Some(desc) = &info.image_description {
@@ -851,6 +869,8 @@ impl TiffReader {
                 Some(info) => (
                     samples_per_pixel > 1 || info.photometric == Photometric::Rgb,
                     if samples_per_pixel > 1 {
+                        false
+                    } else if image.samples_per_pixel <= 1 {
                         false
                     } else {
                         is_interleaved_rgb(info)
@@ -2670,6 +2690,13 @@ fn is_interleaved_rgb(info: &IfdInfo) -> bool {
     info.samples_per_pixel <= 1
 }
 
+fn tiff_physical_size(ifd: Option<&Ifd>, tag: u16) -> Option<f64> {
+    ifd.and_then(|ifd| ifd.get(tag))
+        .and_then(|value| value.as_vec_f64().first().copied())
+        .filter(|value| *value > 0.0)
+        .map(|value| 1.0 / value)
+}
+
 fn should_planarize_chunky_rgb(info: &IfdInfo, _path: Option<&Path>) -> bool {
     if info.planar_config != 1 || info.samples_per_pixel <= 1 {
         return false;
@@ -4286,6 +4313,14 @@ impl crate::common::reader::FormatReader for TiffReader {
                 "TIFF file contains no readable image series".into(),
             ));
         }
+        if let Some(file_name) = path.file_name().and_then(|name| name.to_str()) {
+            for series in &mut self.series {
+                series.metadata.series_metadata.insert(
+                    "image_name".to_string(),
+                    crate::common::metadata::MetadataValue::String(file_name.to_string()),
+                );
+            }
+        }
         // Detect OME-TIFF: OME-XML is stored in the first IFD's ImageDescription.
         self.ome_xml = self
             .series
@@ -4469,9 +4504,27 @@ impl crate::common::reader::FormatReader for TiffReader {
     }
 
     fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
-        self.ome_xml
-            .as_deref()
-            .map(crate::common::ome_metadata::OmeMetadata::from_ome_xml)
+        if let Some(xml) = self.ome_xml.as_deref() {
+            return Some(crate::common::ome_metadata::OmeMetadata::from_ome_xml(xml));
+        }
+        let meta = self.metadata();
+        if std::ptr::eq(meta, crate::common::reader::uninitialized_metadata()) {
+            return None;
+        }
+        let mut ome = crate::common::ome_metadata::OmeMetadata::from_image_metadata(meta);
+        if let Some(image) = ome.images.get_mut(0) {
+            if let Some(crate::common::metadata::MetadataValue::Float(value)) =
+                meta.series_metadata.get("PhysicalSizeX")
+            {
+                image.physical_size_x = Some(*value);
+            }
+            if let Some(crate::common::metadata::MetadataValue::Float(value)) =
+                meta.series_metadata.get("PhysicalSizeY")
+            {
+                image.physical_size_y = Some(*value);
+            }
+        }
+        Some(ome)
     }
 }
 

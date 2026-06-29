@@ -737,6 +737,8 @@ fn parse_ome_xml_series_with_base(
         let size_t = attr_required_nonzero_u32(pixels_tag, "SizeT")?;
         let type_str = xml_attr(pixels_tag, "Type")
             .or_else(|| xml_attr(pixels_tag, "type"))
+            .or_else(|| xml_attr(pixels_tag, "PixelType"))
+            .or_else(|| xml_attr(pixels_tag, "pixeltype"))
             .ok_or_else(|| BioFormatsError::Format("OME-XML missing Type".into()))?;
         let (pixel_type, bpp) = pixel_type_from_attr(&type_str)?;
         let dim_order_str = xml_attr(pixels_tag, "DimensionOrder")

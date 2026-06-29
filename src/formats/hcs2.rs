@@ -1794,7 +1794,7 @@ pub struct TrestleReader {
     /// from the first IFD comment's `OverlapsXY` entry. Indexed by core (=
     /// resolution) index, mirroring Java's `overlaps[getCoreIndex()*2 + …]`.
     overlaps: Vec<i64>,
-    /// IFD index backing each resolution level, in level order (Java
+    /// IFD index backing each flattened Trestle series, in series order (Java
     /// `ifds.get(getCoreIndex())`). Empty when the regroup did not run (single
     /// IFD), in which case pixel reads delegate straight to the inner reader.
     level_ifd: Vec<usize>,
@@ -1875,17 +1875,15 @@ impl TrestleReader {
         }
 
         // Mirror the core-metadata rebuild in `TrestleReader.initStandardMetadata`:
-        // every main IFD becomes one resolution level of a single pyramid series.
-        // SizeX/SizeY are reduced by the per-tile overlaps; everything past the
-        // first IFD is flagged as a (thumbnail) sub-resolution.
+        // every main IFD becomes a separate series. SizeX/SizeY are reduced by
+        // the per-tile overlaps.
         self.regroup_resolutions(overlaps.as_deref());
     }
 
     /// Faithful port of the core-metadata loop in
     /// `TrestleReader.initStandardMetadata`. Each main IFD is one resolution
-    /// level; `overlaps[index*2 + {0,1}]` are the per-tile X/Y overlaps used to
-    /// shrink each level's `SizeX`/`SizeY`. The result is a single
-    /// multi-resolution series (`resolutionCount = #IFDs`).
+    /// series; `overlaps[index*2 + {0,1}]` are the per-tile X/Y overlaps used to
+    /// shrink each level's `SizeX`/`SizeY`.
     fn regroup_resolutions(&mut self, overlaps: Option<&[i64]>) {
         let ifd_count = self.inner.ifd_count();
         if ifd_count <= 1 {
@@ -1898,6 +1896,8 @@ impl TrestleReader {
             size_y: u32,
             size_c: u32,
             is_rgb: bool,
+            physical_size_x: Option<f64>,
+            physical_size_y: Option<f64>,
         }
         let mut levels: Vec<Level> = Vec::with_capacity(ifd_count);
         for index in 0..ifd_count {
@@ -1928,21 +1928,23 @@ impl TrestleReader {
                 .unwrap_or(0);
             let size_x = (image_width as i64 - num_tile_cols * overlap_x).max(0) as u32;
             let size_y = (image_length as i64 - num_tile_rows * overlap_y).max(0) as u32;
+            let physical = |tag: u16| {
+                ifd.get(tag)
+                    .and_then(|v| v.as_vec_f64().first().copied())
+                    .filter(|&r| r > 0.0)
+                    .map(|r| 1.0 / r)
+            };
             levels.push(Level {
                 size_x,
                 size_y,
                 size_c: if is_rgb { samples } else { 1 },
                 is_rgb,
+                physical_size_x: physical(crate::tiff::ifd::tag::X_RESOLUTION),
+                physical_size_y: physical(crate::tiff::ifd::tag::Y_RESOLUTION),
             });
         }
 
-        // Build a single pyramid series. Level 0 is the main resolution; the
-        // remaining IFDs are sub-resolutions (and thumbnails).
         let series = self.inner.series_list();
-        let Some(template) = series.first().cloned() else {
-            return;
-        };
-        let mut main = template;
         // Each existing series maps to one IFD in order.
         let ifd_for_series: Vec<usize> = series
             .iter()
@@ -1953,26 +1955,52 @@ impl TrestleReader {
             return;
         }
 
-        let l0 = &levels[0];
-        main.ifd_indices = vec![ifd_for_series[0]];
-        main.metadata.size_x = l0.size_x;
-        main.metadata.size_y = l0.size_y;
-        main.metadata.size_z = 1;
-        main.metadata.size_t = 1;
-        main.metadata.size_c = l0.size_c;
-        main.metadata.is_rgb = l0.is_rgb;
-        main.metadata.image_count = 1;
-        main.metadata.is_interleaved = false;
-        main.metadata.dimension_order = DimensionOrder::XYCZT;
-        main.metadata.resolution_count = ifd_count as u32;
-        main.sub_resolutions = ifd_for_series[1..].iter().map(|&i| vec![i]).collect();
+        let mut flattened = Vec::with_capacity(ifd_count);
+        for (index, source) in series.iter().cloned().enumerate() {
+            let Some(level) = levels.get(index) else {
+                return;
+            };
+            let mut s = source;
+            s.ifd_indices = vec![ifd_for_series[index]];
+            s.plane_ifd_indices = Vec::new();
+            s.sub_resolutions = Vec::new();
+            s.metadata.size_x = level.size_x;
+            s.metadata.size_y = level.size_y;
+            s.metadata.size_z = 1;
+            s.metadata.size_t = 1;
+            s.metadata.size_c = level.size_c;
+            s.metadata.is_rgb = level.is_rgb;
+            s.metadata.image_count = 1;
+            s.metadata.is_interleaved = false;
+            s.metadata.dimension_order = DimensionOrder::XYCZT;
+            s.metadata.resolution_count = 1;
+            s.metadata.series_metadata.insert(
+                "image_name".to_string(),
+                MetadataValue::String(format!("Series {}", index + 1)),
+            );
+            if index == 0 {
+                if let Some(value) = level.physical_size_x {
+                    s.metadata
+                        .series_metadata
+                        .insert("PhysicalSizeX".to_string(), MetadataValue::Float(value));
+                }
+            }
+            if index == 0 {
+                if let Some(value) = level.physical_size_y {
+                    s.metadata
+                        .series_metadata
+                        .insert("PhysicalSizeY".to_string(), MetadataValue::Float(value));
+                }
+            }
+            flattened.push(s);
+        }
 
-        // Record the per-level IFD mapping and the (per-core-index) overlaps so
+        // Record the per-series IFD mapping and the (per-core-index) overlaps so
         // `openBytes` can replicate Java's overlap-aware `tiffParser.getSamples`.
         self.level_ifd = ifd_for_series.clone();
         self.overlaps = overlaps.map(|o| o.to_vec()).unwrap_or_default();
 
-        self.inner.replace_series(vec![main]);
+        self.inner.replace_series(flattened);
     }
 }
 
@@ -2058,7 +2086,11 @@ impl FormatReader for TrestleReader {
         if self.level_ifd.is_empty() {
             return self.inner.open_bytes_region(p, x, y, w, h);
         }
-        let core_index = self.inner.resolution();
+        let core_index = if self.inner.resolution_count() > 1 {
+            self.inner.resolution()
+        } else {
+            self.inner.series()
+        };
         let ifd_index = match self.level_ifd.get(core_index) {
             Some(&i) => i,
             None => return self.inner.open_bytes_region(p, x, y, w, h),
@@ -2101,15 +2133,12 @@ impl FormatReader for TrestleReader {
             (raw_w, raw_h, tile_w, tile_h, bps.max(1), eff_channels)
         };
 
-        // Decode the full stored plane once (interleaved samples, stored dims).
-        let plane = self
-            .inner
-            .read_physical_ifd_region(ifd_index, 0, 0, raw_w, raw_h)?;
-
-        let pixel = (bytes_per_sample * eff_channels) as i64;
+        let pixel = bytes_per_sample as i64;
+        let channels = eff_channels as i64;
         let out_w = w as i64;
         let out_h = h as i64;
-        let mut buf = vec![0u8; (out_w * out_h * pixel).max(0) as usize];
+        let out_plane = out_w * out_h * pixel;
+        let mut buf = vec![0u8; (out_plane * channels).max(0) as usize];
 
         let tile_w = tile_w as i64;
         let tile_h = tile_h as i64;
@@ -2123,8 +2152,6 @@ impl FormatReader for TrestleReader {
         let y = y as i64;
         let end_x = x + out_w;
         let end_y = y + out_h;
-        // src plane stride in bytes (interleaved samples across the row).
-        let src_row_len = raw_w_i * pixel;
         let out_row_len = out_w * pixel;
 
         // Java iterates numTileRows x numTileCols (= ceil(raw/tile)).
@@ -2132,10 +2159,12 @@ impl FormatReader for TrestleReader {
         let num_tile_cols = (raw_w_i + tile_w - 1) / tile_w;
 
         for row in 0..num_tile_rows {
-            // first row is shortened by overlapY (Java tileBounds.height).
-            let tb_h = if row == 0 { tile_h - overlap_y } else { tile_h };
+            // Java mutates a single tileBounds object: once row/column 0 shrink
+            // width/height for overlap, later rows/columns keep that shrunken
+            // size instead of resetting to the raw tile size.
+            let tb_h = tile_h - overlap_y;
             for col in 0..num_tile_cols {
-                let tb_w = if col == 0 { tile_w - overlap_x } else { tile_w };
+                let tb_w = tile_w - overlap_x;
                 let tb_x = col * step_x;
                 let tb_y = row * step_y;
 
@@ -2161,32 +2190,48 @@ impl FormatReader for TrestleReader {
                     theight = (end_y - tile_y).max(tile_h - real_y);
                 }
 
-                let copy = pixel * twidth;
                 // Source within the stored plane: the tile's pixel (real_x,real_y)
                 // lives at stored column (col*tileW + real_x), stored row
                 // (row*tileH + real_y).
                 let src_col = col * tile_w + real_x;
                 let src_row0 = row * tile_h + real_y;
-                let mut dest = pixel * (tile_x - x) + out_row_len * (tile_y - y);
+                let read_h = theight.min(raw_h_i.saturating_sub(src_row0));
+                if src_col < 0 || src_row0 < 0 || src_col >= raw_w_i || read_h <= 0 {
+                    continue;
+                }
+                let read_w = twidth.min(raw_w_i.saturating_sub(src_col));
+                if read_w <= 0 {
+                    continue;
+                }
+                let tile_region = self.inner.read_physical_ifd_region(
+                    ifd_index,
+                    src_col as u32,
+                    src_row0 as u32,
+                    read_w as u32,
+                    read_h as u32,
+                )?;
+                let copy = pixel * read_w;
+                let tile_plane = read_w * read_h * pixel;
+                let tile_row_len = copy;
 
-                for tr in 0..theight {
-                    let src_row = src_row0 + tr;
-                    if src_row >= raw_h_i {
-                        break;
-                    }
-                    let src = src_row * src_row_len + src_col * pixel;
-                    let (s, d) = (src, dest);
-                    if s >= 0 && d >= 0 {
-                        let (s, d, c) = (s as usize, d as usize, copy.max(0) as usize);
-                        // clamp the copy length to both buffers and the row.
-                        let max_src = plane.len().saturating_sub(s);
-                        let max_dst = buf.len().saturating_sub(d);
-                        let n = c.min(max_src).min(max_dst);
-                        if n > 0 {
-                            buf[d..d + n].copy_from_slice(&plane[s..s + n]);
+                for q in 0..channels {
+                    let mut dest =
+                        q * out_plane + pixel * (tile_x - x) + out_row_len * (tile_y - y);
+                    for tr in 0..read_h {
+                        let src = q * tile_plane + tr * tile_row_len;
+                        let (s, d) = (src, dest);
+                        if s >= 0 && d >= 0 {
+                            let (s, d, c) = (s as usize, d as usize, copy.max(0) as usize);
+                            // clamp the copy length to both buffers and the row.
+                            let max_src = tile_region.len().saturating_sub(s);
+                            let max_dst = buf.len().saturating_sub(d);
+                            let n = c.min(max_src).min(max_dst);
+                            if n > 0 {
+                                buf[d..d + n].copy_from_slice(&tile_region[s..s + n]);
+                            }
                         }
+                        dest += out_row_len;
                     }
-                    dest += out_row_len;
                 }
             }
         }
@@ -2195,6 +2240,30 @@ impl FormatReader for TrestleReader {
 
     fn open_thumb_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
         self.inner.open_thumb_bytes(p)
+    }
+
+    fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
+        if self.inner.series_count() == 0 {
+            return None;
+        }
+        let mut ome = crate::common::ome_metadata::OmeMetadata::default();
+        for (index, series) in self.inner.series_list().iter().enumerate() {
+            let _ = ome.populate_pixels(&series.metadata, index);
+            if let Some(image) = ome.images.get_mut(index) {
+                image.name = Some(format!("Series {}", index + 1));
+                if let Some(MetadataValue::Float(value)) =
+                    series.metadata.series_metadata.get("PhysicalSizeX")
+                {
+                    image.physical_size_x = Some(*value);
+                }
+                if let Some(MetadataValue::Float(value)) =
+                    series.metadata.series_metadata.get("PhysicalSizeY")
+                {
+                    image.physical_size_y = Some(*value);
+                }
+            }
+        }
+        Some(ome)
     }
 
     fn resolution_count(&self) -> usize {
@@ -4621,6 +4690,12 @@ impl FormatReader for InCell3000Reader {
             "format".to_string(),
             MetadataValue::String("InCell 3000".to_string()),
         );
+        if let Some(file_name) = path.file_name().and_then(|name| name.to_str()) {
+            meta_map.insert(
+                "image.name".to_string(),
+                MetadataValue::String(file_name.to_string()),
+            );
+        }
         self.meta = Some(ImageMetadata {
             size_x: size_x as u32,
             size_y: size_y as u32,

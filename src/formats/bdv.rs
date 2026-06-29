@@ -742,8 +742,6 @@ impl FormatReader for BdvReader {
                 channels,
                 ..Default::default()
             });
-            let image_index = ome.images.len() - 1;
-            let _ = ome.add_original_metadata_annotations(&si.meta, image_index);
         }
         Some(ome)
     }

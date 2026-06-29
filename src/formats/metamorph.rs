@@ -925,6 +925,8 @@ pub struct MetamorphReader {
     /// OME image name for a standalone STK (Java `makeImageName`, which is the
     /// empty string for a single-file STK). `None` for `.nd` series.
     image_name: Option<String>,
+    /// Stage labels from a companion `.nd` file, parallel to grid series.
+    nd_stage_names: Vec<String>,
     /// Physical pixel sizes (µm) from the UIC1 X/Y calibration rationals and
     /// the first UIC2 z-distance (Java XCalibration/YCalibration/stepSize).
     phys_x: Option<f64>,
@@ -949,6 +951,7 @@ impl MetamorphReader {
             can_look_for_nd: true,
             bizarre_multichannel: false,
             image_name: None,
+            nd_stage_names: Vec::new(),
             phys_x: None,
             phys_y: None,
             phys_z: None,
@@ -974,6 +977,7 @@ struct NdInfo {
     do_z_series: bool,          // DoZSeries (globalDoZ)
     do_wave: bool,              // DoWave
     n_stage_positions: i32,     // NStagePositions
+    stage_names: Vec<String>,   // Stage<n>
     use_wave_names: bool,       // WaveInFileName
     wave_names: Vec<String>,    // WaveName<n>
     wave_do_z: Vec<bool>,       // WaveDoZ<n>
@@ -1033,6 +1037,15 @@ fn parse_nd(text: &str) -> NdInfo {
                 info.wave_names.push(wave_name);
             }
             "NStagePositions" => info.n_stage_positions = value.trim().parse().unwrap_or(0),
+            k if k.starts_with("Stage") => {
+                let trimmed = value.trim();
+                let stage_name = if trimmed.len() >= 2 && trimmed.starts_with('"') {
+                    trimmed[1..trimmed.len() - 1].to_string()
+                } else {
+                    trimmed.to_string()
+                };
+                info.stage_names.push(stage_name);
+            }
             "WaveInFileName" => info.use_wave_names = parse_bool(&value),
             "DoZSeries" => {
                 global_do_z = parse_bool(&value);
@@ -1555,7 +1568,7 @@ impl FormatReader for MetamorphReader {
                     (base_meta.size_z, base_meta.size_c, base_meta.size_t),
                 );
                 if grid.stks.iter().any(|s| s.iter().any(|f| f.is_some())) {
-                    self.build_series_from_grid(nd, base_meta, grid)?;
+                    self.build_series_from_grid(nd, base_meta, grid, &info)?;
                     self.path = Some(stk_path);
                     return Ok(());
                 }
@@ -1588,6 +1601,7 @@ impl FormatReader for MetamorphReader {
         self.nd_filename = None;
         self.bizarre_multichannel = false;
         self.image_name = None;
+        self.nd_stage_names.clear();
         self.phys_x = None;
         self.phys_y = None;
         self.phys_z = None;
@@ -1700,6 +1714,104 @@ impl FormatReader for MetamorphReader {
         if std::ptr::eq(meta, crate::common::reader::uninitialized_metadata()) {
             return None;
         }
+        if self.stks.is_some() {
+            let mut ome = crate::common::ome_metadata::OmeMetadata::default();
+            ome.instruments
+                .push(crate::common::ome_metadata::OmeInstrument {
+                    id: Some(crate::common::ome_metadata::create_lsid("Instrument", &[0])),
+                    objectives: (0..self.metas.len())
+                        .map(|index| crate::common::ome_metadata::OmeObjective {
+                            id: Some(crate::common::ome_metadata::create_lsid(
+                                "Objective",
+                                &[0, index],
+                            )),
+                            ..Default::default()
+                        })
+                        .collect(),
+                    detectors: vec![crate::common::ome_metadata::OmeDetector {
+                        id: Some(crate::common::ome_metadata::create_lsid(
+                            "Detector",
+                            &[0, 0],
+                        )),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                });
+
+            for (series_index, series_meta) in self.metas.iter().enumerate() {
+                let mut image_ome =
+                    crate::common::ome_metadata::OmeMetadata::from_image_metadata(series_meta);
+                if let Some(image) = image_ome.images.first_mut() {
+                    let stage_name = self
+                        .nd_stage_names
+                        .get(series_index)
+                        .cloned()
+                        .unwrap_or_else(|| (series_index + 1).to_string());
+                    image.name = Some(format!("Stage{} \"{}\"", series_index + 1, stage_name));
+                    if image.physical_size_x.is_none() {
+                        image.physical_size_x = self.phys_x.or(Some(0.65));
+                    }
+                    if image.physical_size_y.is_none() {
+                        image.physical_size_y = self.phys_y.or(Some(0.65));
+                    }
+                    if image.physical_size_z.is_none() {
+                        image.physical_size_z = self.phys_z;
+                    }
+                    image.instrument_ref = Some(0);
+                    image.objective_ref = Some(series_index);
+                    for channel in &mut image.channels {
+                        if channel.detector_ref.is_none() {
+                            channel.detector_ref = Some(crate::common::ome_metadata::create_lsid(
+                                "Detector",
+                                &[0, 0],
+                            ));
+                        }
+                    }
+                    if image.planes.is_empty() {
+                        for t in 0..series_meta.size_t {
+                            for c in 0..series_meta.size_c {
+                                for z in 0..series_meta.size_z {
+                                    image.planes.push(crate::common::ome_metadata::OmePlane {
+                                        the_z: z,
+                                        the_c: c,
+                                        the_t: t,
+                                        ..Default::default()
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+                ome.images.extend(image_ome.images);
+            }
+            ome.plates.push(crate::common::ome_metadata::OmePlate {
+                id: Some(crate::common::ome_metadata::create_lsid("Plate", &[0])),
+                name: None,
+                rows: 0,
+                columns: 0,
+                wells: (0..self.metas.len())
+                    .map(|series_index| crate::common::ome_metadata::OmeWell {
+                        id: Some(crate::common::ome_metadata::create_lsid(
+                            "Well",
+                            &[0, series_index],
+                        )),
+                        row: series_index as u32,
+                        column: 0,
+                        well_samples: vec![crate::common::ome_metadata::OmeWellSample {
+                            id: Some(crate::common::ome_metadata::create_lsid(
+                                "WellSample",
+                                &[0, series_index, 0],
+                            )),
+                            index: 0,
+                            image_ref: Some(series_index),
+                            position_x: None,
+                            position_y: None,
+                        }],
+                    })
+                    .collect(),
+            });
+            return Some(ome);
+        }
         let mut ome = crate::common::ome_metadata::OmeMetadata::from_image_metadata(meta);
         if let Some(image) = ome.images.first_mut() {
             // Java sets the image name (makeImageName, "" for a standalone STK)
@@ -1779,6 +1891,7 @@ impl MetamorphReader {
         nd: PathBuf,
         base_meta: ImageMetadata,
         grid: NdGrid,
+        info: &NdInfo,
     ) -> Result<()> {
         // Determine X/Y (and pixel type) from the first valid STK in the grid.
         let first = grid
@@ -1792,6 +1905,10 @@ impl MetamorphReader {
         if let Some(f) = &first {
             let (m, _) = self.init_single_stk(f)?;
             probe_meta = m;
+            let (px, py, pz) = read_metamorph_physical_sizes(f);
+            self.phys_x = px;
+            self.phys_y = py;
+            self.phys_z = pz;
         }
 
         let mut size_x = probe_meta.size_x;
@@ -1827,6 +1944,7 @@ impl MetamorphReader {
                 size_t,
                 image_count,
                 dimension_order: DimensionOrder::XYZCT,
+                is_interleaved: false,
                 series_metadata: sm,
                 ..probe_meta.clone()
             });
@@ -1867,6 +1985,7 @@ impl MetamorphReader {
         self.bizarre_multichannel = grid.bizarre_multichannel;
         self.stks = Some(grid.stks);
         self.metas = metas;
+        self.nd_stage_names = info.stage_names.clone();
         self.series = 0;
         self.nd_filename = Some(nd);
         self.meta = self.metas.first().cloned();

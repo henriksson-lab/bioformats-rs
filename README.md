@@ -8,6 +8,7 @@ The internal Metakit table reader used for Volocity is translated from
 [`ome/ome-metakit`](https://github.com/ome/ome-metakit) at commit
 `b8b3a629a6dd9bf422949f6b175b9e310ba6e252`.
 
+* 2026-06-29: Audit on real data for remaining formats
 * 2026-06-24: Further real data audits
 * 2026-06-21: Tracked translation audit complete. Every component has passed two clean audits without remarks. Not all readers have been tested on real files though
 * 2026-06-20: Close to all files audited. some left
@@ -308,16 +309,6 @@ so they are not rated here — see
 Various no-Java-reference camera/SPM readers remain best-effort extensions; when
 native layout is unknown they return `UnsupportedFormat` instead of guessed
 metadata.
-
-> **Note.** Several formats previously listed here are now implemented as faithful
-> translations of their Java readers: OBF, Olympus OIR, CellWorX/MetaXpress, I2I,
-> JDCE, SimplePCI, Volocity clipping, KLB, Olympus APL, HRD-GDF, Hamamatsu NAF,
-> Burleigh, Leica LOF with bounded channel metadata projection, MNG, 3i SlideBook, Openlab LIFF with bounded OME original-metadata annotations, IMOD, and Bruker MRI
-> (ParaVision). Conversely, four fabricated readers for formats Bio-Formats has no
-> reader for (Bruker OPUS, ISS Vista FLIM) or that duplicated real readers
-> (Lambert FLIM → LI-FLIM, Volocity Library → Volocity; plus a `Sedat`/`Woolz`
-> invention) were **removed** — this project is a translation of Bio-Formats, not
-> a superset.
 
 ### Added (non-upstream) readers
 

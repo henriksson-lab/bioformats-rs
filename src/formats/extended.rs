@@ -15,7 +15,7 @@ use crate::common::metadata::{
 };
 use crate::common::ome_metadata::{
     create_lsid, OmeChannel, OmeDetector, OmeImage, OmeInstrument, OmeMetadata, OmeObjective,
-    OmePlate, OmeROI, OmeShape, OmeWell, OmeWellSample,
+    OmePlane, OmePlate, OmeROI, OmeShape, OmeWell, OmeWellSample,
 };
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
@@ -765,6 +765,8 @@ pub struct VectraReader {
     inner: crate::tiff::TiffReader,
     meta: Option<ImageMetadata>,
     current_resolution: usize,
+    plane_ifds: Vec<Vec<usize>>,
+    pyramid_depth: usize,
 }
 
 impl VectraReader {
@@ -773,21 +775,134 @@ impl VectraReader {
             inner: crate::tiff::TiffReader::new(),
             meta: None,
             current_resolution: 0,
+            plane_ifds: Vec::new(),
+            pyramid_depth: 1,
         }
     }
 
     fn current_ifd_indices(&self) -> Vec<usize> {
-        let Some(series) = self.inner.series_list().get(self.inner.series()) else {
-            return Vec::new();
+        self.plane_ifds
+            .get(self.inner.series())
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn regroup_series(&mut self) {
+        let ifd_count = self.inner.ifd_count();
+        if ifd_count == 0 {
+            return;
+        }
+        let Some(first) = self.inner.ifd(0) else {
+            return;
         };
-        if self.current_resolution == 0 {
-            series.ifd_indices.clone()
-        } else {
-            series
-                .sub_resolutions
-                .get(self.current_resolution - 1)
-                .cloned()
-                .unwrap_or_default()
+        let first_bits = first.bits_per_sample().first().copied().unwrap_or(8) as u8;
+        let mut size_c = 1usize;
+        if first.samples_per_pixel() == 1 {
+            let width = first.image_width().unwrap_or(0);
+            let height = first.image_length().unwrap_or(0);
+            while size_c < ifd_count {
+                let Some(ifd) = self.inner.ifd(size_c) else {
+                    break;
+                };
+                if ifd.image_width().unwrap_or(0) != width
+                    || ifd.image_length().unwrap_or(0) != height
+                {
+                    break;
+                }
+                size_c += 1;
+            }
+        }
+
+        let mut pyramid_depth = 1usize;
+        let mut start = size_c + 1;
+        while start < ifd_count {
+            let Some(ifd) = self.inner.ifd(start) else {
+                break;
+            };
+            if ifd
+                .get_u32(crate::tiff::ifd::tag::NEW_SUBFILE_TYPE)
+                .unwrap_or(0)
+                == 1
+            {
+                pyramid_depth += 1;
+                start += size_c;
+            } else {
+                break;
+            }
+        }
+        self.pyramid_depth = pyramid_depth;
+
+        let core_size = ifd_count.saturating_sub(pyramid_depth * size_c.saturating_sub(1));
+        let Some(template) = self.inner.series_list().first().cloned() else {
+            return;
+        };
+        let mut series = Vec::with_capacity(core_size);
+        let mut all_plane_ifds = Vec::with_capacity(core_size);
+        for core_index in 0..core_size {
+            let plane_ifds = qptiff_plane_ifds(core_index, size_c, pyramid_depth, ifd_count);
+            let Some(&first_ifd_index) = plane_ifds.first() else {
+                continue;
+            };
+            let Some(ifd) = self.inner.ifd(first_ifd_index) else {
+                continue;
+            };
+            let samples = ifd.samples_per_pixel().max(1) as u32;
+            let is_rgb =
+                samples > 1 || matches!(ifd.photometric(), crate::tiff::ifd::Photometric::Rgb);
+            let mut meta = template.metadata.clone();
+            meta.size_x = ifd.image_width().unwrap_or(0);
+            meta.size_y = ifd.image_length().unwrap_or(0);
+            meta.size_z = 1;
+            meta.size_t = 1;
+            meta.size_c = if is_rgb {
+                samples
+            } else {
+                size_c.max(1) as u32
+            };
+            meta.image_count = if is_rgb {
+                (meta.size_c / samples).max(1)
+            } else {
+                meta.size_c
+            };
+            meta.pixel_type = qptiff_pixel_type(ifd);
+            meta.bits_per_pixel = first_bits;
+            meta.is_rgb = is_rgb;
+            meta.is_interleaved = false;
+            meta.is_little_endian = true;
+            meta.dimension_order = DimensionOrder::XYCZT;
+            meta.resolution_count = 1;
+            meta.series_metadata.insert(
+                "image_name".to_string(),
+                MetadataValue::String(qptiff_image_name(core_index, pyramid_depth, ifd_count)),
+            );
+            if let Some(value) = qptiff_physical_size(ifd, crate::tiff::ifd::tag::X_RESOLUTION) {
+                meta.series_metadata
+                    .insert("PhysicalSizeX".to_string(), MetadataValue::Float(value));
+            }
+            if let Some(value) = qptiff_physical_size(ifd, crate::tiff::ifd::tag::Y_RESOLUTION) {
+                meta.series_metadata
+                    .insert("PhysicalSizeY".to_string(), MetadataValue::Float(value));
+            }
+            for (channel, &channel_ifd) in plane_ifds.iter().enumerate() {
+                if let Some(name) = self.inner.ifd(channel_ifd).and_then(qptiff_channel_name) {
+                    meta.series_metadata.insert(
+                        format!("channel.{channel}.name"),
+                        MetadataValue::String(name),
+                    );
+                }
+            }
+
+            let mut s = template.clone();
+            s.ifd_indices = plane_ifds.clone();
+            s.plane_ifd_indices = plane_ifds.iter().copied().map(Some).collect();
+            s.sub_resolutions = Vec::new();
+            s.metadata = meta;
+            series.push(s);
+            all_plane_ifds.push(plane_ifds);
+        }
+        if !series.is_empty() {
+            self.inner.replace_series(series);
+            self.plane_ifds = all_plane_ifds;
         }
     }
 
@@ -805,6 +920,87 @@ impl Default for VectraReader {
 }
 
 const QPTIFF_SOFTWARE_CHECK: &str = "PerkinElmer-QPI";
+
+fn qptiff_pixel_type(ifd: &crate::tiff::ifd::Ifd) -> PixelType {
+    let bps = ifd.bits_per_sample().first().copied().unwrap_or(8);
+    let sample_format = ifd
+        .get_u16(crate::tiff::ifd::tag::SAMPLE_FORMAT)
+        .unwrap_or(1);
+    match (bps, sample_format) {
+        (1, _) => PixelType::Bit,
+        (8, 2) => PixelType::Int8,
+        (8, _) => PixelType::Uint8,
+        (16, 2) => PixelType::Int16,
+        (16, _) => PixelType::Uint16,
+        (32, 2) => PixelType::Int32,
+        (32, 3) => PixelType::Float32,
+        (32, _) => PixelType::Uint32,
+        (64, 3) => PixelType::Float64,
+        _ => PixelType::Uint8,
+    }
+}
+
+fn qptiff_physical_size(ifd: &crate::tiff::ifd::Ifd, tag: u16) -> Option<f64> {
+    ifd.get(tag)
+        .and_then(|value| value.as_vec_f64().first().copied())
+        .filter(|value| *value > 0.0)
+        .map(|value| 10_000.0 / value)
+}
+
+fn qptiff_xml_text(xml: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = xml.find(&open)? + open.len();
+    let end = xml[start..].find(&close)? + start;
+    let text = xml[start..end].trim();
+    (!text.is_empty()).then(|| text.to_string())
+}
+
+fn qptiff_channel_name(ifd: &crate::tiff::ifd::Ifd) -> Option<String> {
+    ifd.get(crate::tiff::ifd::tag::IMAGE_DESCRIPTION)
+        .and_then(|value| value.as_str())
+        .and_then(|xml| qptiff_xml_text(xml, "Name"))
+}
+
+fn qptiff_plane_ifds(
+    core_index: usize,
+    size_c: usize,
+    pyramid_depth: usize,
+    ifd_count: usize,
+) -> Vec<usize> {
+    let image_count = size_c.max(1);
+    if core_index == 0 {
+        return (0..image_count.min(ifd_count)).collect();
+    }
+    if core_index < pyramid_depth {
+        let start = image_count * core_index + 1;
+        return (0..image_count)
+            .map(|plane| start + plane)
+            .filter(|&ifd| ifd < ifd_count)
+            .collect();
+    }
+    if core_index == pyramid_depth {
+        return (image_count < ifd_count)
+            .then_some(image_count)
+            .into_iter()
+            .collect();
+    }
+    let core_size = ifd_count.saturating_sub(pyramid_depth * size_c.saturating_sub(1));
+    let idx = ifd_count.saturating_sub(core_size.saturating_sub(core_index));
+    (idx < ifd_count).then_some(idx).into_iter().collect()
+}
+
+fn qptiff_image_name(core_index: usize, pyramid_depth: usize, ifd_count: usize) -> String {
+    if core_index < pyramid_depth {
+        format!("resolution #{}", core_index + 1)
+    } else if core_index == pyramid_depth {
+        "thumbnail".to_string()
+    } else if core_index + 1 == ifd_count {
+        "label".to_string()
+    } else {
+        "macro".to_string()
+    }
+}
 
 fn qptiff_ifd_value_summary(value: &crate::tiff::ifd::IfdValue) -> Option<MetadataValue> {
     use crate::tiff::ifd::IfdValue;
@@ -1306,6 +1502,7 @@ impl FormatReader for VectraReader {
                 "QPTIFF TIFF is missing PerkinElmer-QPI Software tag".into(),
             ));
         }
+        self.regroup_series();
         self.current_resolution = 0;
         self.refresh_metadata();
         Ok(())
@@ -1314,6 +1511,8 @@ impl FormatReader for VectraReader {
     fn close(&mut self) -> Result<()> {
         self.meta = None;
         self.current_resolution = 0;
+        self.plane_ifds.clear();
+        self.pyramid_depth = 1;
         self.inner.close()
     }
 
@@ -1362,12 +1561,62 @@ impl FormatReader for VectraReader {
     }
 
     fn ome_metadata(&self) -> Option<OmeMetadata> {
-        let meta = self.meta.as_ref()?;
-        let mut ome = self
-            .inner
-            .ome_metadata()
-            .unwrap_or_else(|| OmeMetadata::from_image_metadata(meta));
-        let _ = ome.add_original_metadata_annotations(meta, 0);
+        if self.inner.series_count() == 0 {
+            return None;
+        }
+        let mut ome = OmeMetadata::default();
+        ome.instruments.push(OmeInstrument {
+            id: Some(create_lsid("Instrument", &[0])),
+            detectors: vec![OmeDetector {
+                id: Some(create_lsid("Detector", &[0, 0])),
+                ..Default::default()
+            }],
+            objectives: vec![OmeObjective {
+                id: Some(create_lsid("Objective", &[0, 0])),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+
+        for (image_index, series) in self.inner.series_list().iter().enumerate() {
+            let meta = &series.metadata;
+            let _ = ome.populate_pixels(meta, image_index);
+            if let Some(image) = ome.images.get_mut(image_index) {
+                image.name = match meta.series_metadata.get("image_name") {
+                    Some(MetadataValue::String(name)) => Some(name.clone()),
+                    _ => Some(format!("resolution #{}", image_index + 1)),
+                };
+                if let Some(MetadataValue::Float(value)) = meta.series_metadata.get("PhysicalSizeX")
+                {
+                    image.physical_size_x = Some(*value);
+                }
+                if let Some(MetadataValue::Float(value)) = meta.series_metadata.get("PhysicalSizeY")
+                {
+                    image.physical_size_y = Some(*value);
+                }
+                image.instrument_ref = Some(0);
+                image.objective_ref = Some(0);
+                for (channel_index, channel) in image.channels.iter_mut().enumerate() {
+                    if let Some(MetadataValue::String(name)) = meta
+                        .series_metadata
+                        .get(&format!("channel.{channel_index}.name"))
+                    {
+                        channel.name = Some(name.clone());
+                    }
+                    channel.detector_ref = Some(create_lsid("Detector", &[0, 0]));
+                }
+                if image.planes.is_empty() {
+                    for c in 0..meta.image_count {
+                        image.planes.push(OmePlane {
+                            the_z: 0,
+                            the_c: c,
+                            the_t: 0,
+                            ..Default::default()
+                        });
+                    }
+                }
+            }
+        }
         Some(ome)
     }
 }
@@ -5828,12 +6077,12 @@ fn hamamatsu_vms_parse_optional_index(path: &Path) -> Result<HashMap<String, Str
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
         Err(err) => return Err(BioFormatsError::Io(err)),
     };
-    let text = std::str::from_utf8(&bytes).map_err(|_| {
-        BioFormatsError::UnsupportedFormat(format!(
-            "Hamamatsu VMS optimisation file is not UTF-8 text: {}",
-            path.display()
-        ))
-    })?;
+    let Ok(text) = std::str::from_utf8(&bytes) else {
+        // OpenSlide testdata uses binary `.opt` optimization sidecars. Java
+        // does not require them to open the VMS index, so treat non-text
+        // optimization files as optional metadata rather than format failure.
+        return Ok(HashMap::new());
+    };
     let mut values = HashMap::new();
     for line in text.lines() {
         let line = line.trim();
@@ -6418,7 +6667,7 @@ impl FormatReader for HamamatsuVmsReader {
                 is_rgb: true,
                 is_interleaved: size_x > HAMAMATSU_VMS_MAX_SIZE && size_y > HAMAMATSU_VMS_MAX_SIZE,
                 is_indexed: false,
-                is_little_endian: true,
+                is_little_endian: false,
                 resolution_count: pyramid_sizes.len() as u32,
                 thumbnail: false,
                 series_metadata: metadata,
@@ -6455,7 +6704,7 @@ impl FormatReader for HamamatsuVmsReader {
         }
         series.push(HamamatsuVmsSeries {
             metadata: pyramid_metadata,
-            pixels: HamamatsuVmsPixels::TilePyramid(pyramid_tiles),
+            pixels: HamamatsuVmsPixels::TilePyramid(pyramid_tiles.clone()),
         });
 
         let mut associated_kinds = Vec::new();
@@ -6518,31 +6767,45 @@ impl FormatReader for HamamatsuVmsReader {
                     MetadataValue::Float(physical_height / size_y as f64),
                 );
             }
+            let metadata = ImageMetadata {
+                size_x,
+                size_y,
+                size_z: 1,
+                size_c: 3,
+                size_t: 1,
+                pixel_type: PixelType::Uint8,
+                bits_per_pixel: 8,
+                image_count: 1,
+                dimension_order: DimensionOrder::XYCZT,
+                is_rgb: true,
+                is_interleaved: size_x > HAMAMATSU_VMS_MAX_SIZE && size_y > HAMAMATSU_VMS_MAX_SIZE,
+                is_indexed: false,
+                is_little_endian: false,
+                resolution_count: 1,
+                thumbnail: true,
+                series_metadata,
+                lookup_table: None,
+                modulo_z: None,
+                modulo_c: None,
+                modulo_t: None,
+            };
+            let pixels = if kind == "map"
+                && metadata.size_x > HAMAMATSU_VMS_MAX_SIZE
+                && metadata.size_y > HAMAMATSU_VMS_MAX_SIZE
+            {
+                // Java HamamatsuVMSReader.openBytes only uses mapFile through
+                // the small-image JPEGReader shortcut. For large map series it
+                // falls through to the tiled path and indexes tileFiles[no],
+                // where no is the plane index (0), so pixels come from the
+                // full-resolution tile grid even though dimensions come from
+                // MapFile.
+                HamamatsuVmsPixels::TilePyramid(pyramid_tiles.clone())
+            } else {
+                HamamatsuVmsPixels::Jpeg(image_path)
+            };
             series.push(HamamatsuVmsSeries {
-                metadata: vec![ImageMetadata {
-                    size_x,
-                    size_y,
-                    size_z: 1,
-                    size_c: 3,
-                    size_t: 1,
-                    pixel_type: PixelType::Uint8,
-                    bits_per_pixel: 8,
-                    image_count: 1,
-                    dimension_order: DimensionOrder::XYCZT,
-                    is_rgb: true,
-                    is_interleaved: size_x > HAMAMATSU_VMS_MAX_SIZE
-                        && size_y > HAMAMATSU_VMS_MAX_SIZE,
-                    is_indexed: false,
-                    is_little_endian: true,
-                    resolution_count: 1,
-                    thumbnail: true,
-                    series_metadata,
-                    lookup_table: None,
-                    modulo_z: None,
-                    modulo_c: None,
-                    modulo_t: None,
-                }],
-                pixels: HamamatsuVmsPixels::Jpeg(image_path),
+                metadata: vec![metadata],
+                pixels,
             });
         }
 
@@ -6594,12 +6857,9 @@ impl FormatReader for HamamatsuVmsReader {
     }
 
     fn ome_metadata(&self) -> Option<OmeMetadata> {
-        let meta = self.metadata();
-        if std::ptr::eq(meta, crate::common::reader::uninitialized_metadata()) {
+        if self.series.is_empty() {
             return None;
         }
-
-        let mut ome = OmeMetadata::from_image_metadata(meta);
 
         // Java initFile sets the image name from the index file's base name plus a
         // suffix that depends on the series kind ("full resolution"/"macro"/"map").
@@ -6608,21 +6868,28 @@ impl FormatReader for HamamatsuVmsReader {
             .as_ref()
             .and_then(|p| p.file_name())
             .map(|n| n.to_string_lossy().into_owned());
-        let kind = match meta.series_metadata.get("VMS series kind") {
-            Some(MetadataValue::String(kind)) => kind.as_str(),
-            _ => "full resolution",
-        };
-        if let (Some(base_name), Some(image)) = (base_name.as_ref(), ome.images.get_mut(0)) {
-            image.name = Some(format!("{base_name} {kind}"));
-        }
+        let mut ome = OmeMetadata::default();
 
-        // Java guards physical sizes, instrument and objective behind a
-        // non-MINIMUM metadata level. Physical sizes apply to the full resolution
-        // (series 0) and macro (series 1); the instrument/objective applies to
-        // series 0 only.
-        if self.metadata_level != MetadataLevel::Minimal {
-            if kind == "full resolution" || kind == "macro" {
-                if let Some(image) = ome.images.get_mut(0) {
+        for (image_index, series) in self.series.iter().enumerate() {
+            let Some(meta) = series.metadata.first() else {
+                continue;
+            };
+            let mut image_ome = OmeMetadata::from_image_metadata(meta);
+            let kind = match meta.series_metadata.get("VMS series kind") {
+                Some(MetadataValue::String(kind)) => kind.as_str(),
+                _ => "full resolution",
+            };
+            if let Some(image) = image_ome.images.get_mut(0) {
+                if let Some(base_name) = base_name.as_ref() {
+                    image.name = Some(format!("{base_name} {kind}"));
+                }
+
+                // Java guards physical sizes behind a non-MINIMUM metadata
+                // level. Physical sizes apply to the full resolution and macro
+                // associated image, but not the map image.
+                if self.metadata_level != MetadataLevel::Minimal
+                    && (kind == "full resolution" || kind == "macro")
+                {
                     if let Some(MetadataValue::Float(size_x)) =
                         meta.series_metadata.get("VMS physical_size_x")
                     {
@@ -6639,7 +6906,10 @@ impl FormatReader for HamamatsuVmsReader {
                     }
                 }
             }
-            if kind == "full resolution" {
+
+            // Java guards instrument/objective behind non-MINIMUM metadata and
+            // attaches them to the first/full-resolution series only.
+            if self.metadata_level != MetadataLevel::Minimal && image_index == 0 {
                 let magnification = match meta.series_metadata.get("VMS source_lens_magnification")
                 {
                     Some(MetadataValue::Float(value)) if value.is_finite() && *value > 0.0 => {
@@ -6647,7 +6917,7 @@ impl FormatReader for HamamatsuVmsReader {
                     }
                     _ => None,
                 };
-                ome.instruments.push(OmeInstrument {
+                image_ome.instruments.push(OmeInstrument {
                     id: Some(create_lsid("Instrument", &[0])),
                     objectives: vec![OmeObjective {
                         id: Some(create_lsid("Objective", &[0, 0])),
@@ -6656,14 +6926,18 @@ impl FormatReader for HamamatsuVmsReader {
                     }],
                     ..OmeInstrument::default()
                 });
-                if let Some(image) = ome.images.get_mut(0) {
+                if let Some(image) = image_ome.images.get_mut(0) {
                     image.instrument_ref = Some(0);
                     image.objective_ref = Some(0);
                 }
             }
+
+            if image_index == 0 {
+                ome.instruments.extend(image_ome.instruments);
+            }
+            ome.images.extend(image_ome.images);
         }
 
-        let _ = ome.add_original_metadata_annotations(meta, 0);
         Some(ome)
     }
 
@@ -6786,10 +7060,26 @@ impl FormatReader for HamamatsuVmsReader {
                 let src_stride = decoded.width as usize * 3;
                 let src_x = x as usize;
                 let src_y = (y - decoded.y) as usize;
-                for row in 0..h as usize {
-                    let src = (src_y + row) * src_stride + src_x * 3;
-                    let dst = row * row_bytes;
-                    out[dst..dst + row_bytes].copy_from_slice(&decoded.rgb[src..src + row_bytes]);
+                if meta.is_interleaved {
+                    for row in 0..h as usize {
+                        let src = (src_y + row) * src_stride + src_x * 3;
+                        let dst = row * row_bytes;
+                        out[dst..dst + row_bytes]
+                            .copy_from_slice(&decoded.rgb[src..src + row_bytes]);
+                    }
+                } else {
+                    let plane_len = w as usize * h as usize;
+                    for row in 0..h as usize {
+                        let src = (src_y + row) * src_stride + src_x * 3;
+                        let dst_row = row * w as usize;
+                        for col in 0..w as usize {
+                            let px = src + col * 3;
+                            let dst = dst_row + col;
+                            out[dst] = decoded.rgb[px];
+                            out[plane_len + dst] = decoded.rgb[px + 1];
+                            out[plane_len * 2 + dst] = decoded.rgb[px + 2];
+                        }
+                    }
                 }
             }
         }

@@ -15,6 +15,9 @@ use std::path::{Path, PathBuf};
 
 use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata, LookupTable, MetadataValue};
+use crate::common::ome_metadata::{
+    create_lsid, OmeMetadata, OmePlate, OmeROI, OmeShape, OmeWell, OmeWellSample,
+};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
 use crate::common::region::crop_full_plane;
@@ -29,6 +32,10 @@ struct CellH5Series {
     /// HDF5 path to the 5D `[c, t, z, y, x]` dataset for this series.
     dataset_path: String,
     meta: ImageMetadata,
+    image_name: String,
+    plate: String,
+    well: String,
+    site: String,
 }
 
 pub struct CellH5Reader {
@@ -298,6 +305,73 @@ fn dims_from_shape(shape: &[u64]) -> Result<(u32, u32, u32, u32, u32)> {
     }
 }
 
+fn cellh5_series_coord(ds_path: &str) -> Option<(String, String, String)> {
+    let parts: Vec<&str> = ds_path.split('/').collect();
+    let plate_i = parts.iter().position(|part| *part == "plate")?;
+    let experiment_i = parts.iter().position(|part| *part == "experiment")?;
+    let position_i = parts.iter().position(|part| *part == "position")?;
+    Some((
+        parts.get(plate_i + 1)?.to_string(),
+        parts.get(experiment_i + 1)?.to_string(),
+        parts.get(position_i + 1)?.to_string(),
+    ))
+}
+
+fn cellh5_well_row_column(well: &str) -> (u32, u32) {
+    let mut chars = well.chars();
+    let Some(row_char) = chars.next() else {
+        return (0, 0);
+    };
+    let row = "ABCDEFGHIJKLMNOP"
+        .chars()
+        .position(|ch| ch == row_char.to_ascii_uppercase());
+    let column =
+        chars.as_str().parse::<u32>().ok().and_then(
+            |value| {
+                if value > 0 {
+                    Some(value - 1)
+                } else {
+                    None
+                }
+            },
+        );
+    match (row, column) {
+        (Some(row), Some(column)) => (row as u32, column),
+        _ => (0, 0),
+    }
+}
+
+fn cellh5_roi_count(
+    file: &hdf5_pure_rust::File,
+    first_dataset_path: &str,
+    series_count: usize,
+) -> usize {
+    if series_count > 2 {
+        return 0;
+    }
+    let Some(position_path) = first_dataset_path
+        .strip_suffix("/image/channel")
+        .or_else(|| first_dataset_path.strip_suffix("/image/region"))
+    else {
+        return 0;
+    };
+    let feature_path = format!("{position_path}/feature");
+    let feature_group = match file.group(&feature_path) {
+        Ok(group) => group,
+        Err(_) => return 0,
+    };
+    let mut count = 0usize;
+    for object_name in hdf5_group_members(&feature_group).unwrap_or_default() {
+        let bbox_path = format!("{feature_path}/{object_name}/bounding_box");
+        if let Ok(dataset) = file.dataset(&bbox_path) {
+            if let Some(rows) = dataset.shape().unwrap_or_default().first() {
+                count = count.saturating_add(*rows as usize);
+            }
+        }
+    }
+    count
+}
+
 fn parse_cellh5(path: &Path) -> Result<Vec<CellH5Series>> {
     let file = hdf5_pure_rust::File::open(path)
         .map_err(|e| BioFormatsError::Format(format!("HDF5 open error: {e}")))?;
@@ -315,9 +389,23 @@ fn parse_cellh5(path: &Path) -> Result<Vec<CellH5Series>> {
             "CellH5: no image datasets found in supported sample/plate channel layouts".into(),
         ));
     }
+    let roi_count = cellh5_roi_count(&file, &dataset_paths[0], dataset_paths.len());
 
     let mut series_list = Vec::with_capacity(dataset_paths.len());
     for ds_path in dataset_paths {
+        let (plate, well, site) = cellh5_series_coord(&ds_path).unwrap_or_else(|| {
+            (
+                "PLATE_00".to_string(),
+                "WELL_00".to_string(),
+                "0".to_string(),
+            )
+        });
+        let is_segmentation = ds_path.ends_with("/image/region");
+        let image_name = if is_segmentation {
+            format!("P_{plate}, W_{well}_{site} label image")
+        } else {
+            format!("P_{plate}, W_{well}_{site}")
+        };
         let ds = file
             .dataset(&ds_path)
             .map_err(|e| BioFormatsError::Format(format!("dataset {ds_path}: {e}")))?;
@@ -356,6 +444,10 @@ fn parse_cellh5(path: &Path) -> Result<Vec<CellH5Series>> {
             "cellh5_series_path".into(),
             MetadataValue::String(ds_path.clone()),
         );
+        sm.insert(
+            "cellh5_roi_count".into(),
+            MetadataValue::Int(roi_count as i64),
+        );
 
         let meta = ImageMetadata {
             size_x,
@@ -390,6 +482,10 @@ fn parse_cellh5(path: &Path) -> Result<Vec<CellH5Series>> {
         series_list.push(CellH5Series {
             dataset_path: ds_path,
             meta,
+            image_name,
+            plate,
+            well,
+            site,
         });
     }
 
@@ -980,6 +1076,66 @@ impl FormatReader for CellH5Reader {
         let tx = (meta.size_x - tw) / 2;
         let ty = (meta.size_y - th) / 2;
         self.open_bytes_region(plane_index, tx, ty, tw, th)
+    }
+
+    fn ome_metadata(&self) -> Option<OmeMetadata> {
+        if self.series.is_empty() {
+            return None;
+        }
+
+        let mut ome = OmeMetadata::default();
+        for series in &self.series {
+            let mut image_ome = OmeMetadata::from_image_metadata(&series.meta);
+            if let Some(image) = image_ome.images.get_mut(0) {
+                image.name = Some(series.image_name.clone());
+            }
+            ome.images.extend(image_ome.images);
+        }
+
+        let first = &self.series[0];
+        let (row, column) = cellh5_well_row_column(&first.well);
+        let site_index = first.site.parse::<u32>().unwrap_or(0);
+        ome.plates.push(OmePlate {
+            id: Some(create_lsid("Plate", &[0])),
+            name: Some(first.plate.clone()),
+            rows: 0,
+            columns: 0,
+            wells: vec![OmeWell {
+                id: Some(create_lsid("Well", &[0])),
+                row,
+                column,
+                well_samples: vec![OmeWellSample {
+                    id: Some(create_lsid("WellSample", &[0])),
+                    index: site_index,
+                    image_ref: Some(0),
+                    position_x: None,
+                    position_y: None,
+                }],
+            }],
+        });
+
+        let roi_count = match first.meta.series_metadata.get("cellh5_roi_count") {
+            Some(MetadataValue::Int(count)) if *count > 0 => *count as usize,
+            _ => 0,
+        };
+        ome.rois.reserve(roi_count);
+        for index in 0..roi_count {
+            ome.rois.push(OmeROI {
+                id: Some(create_lsid("ROI", &[index])),
+                name: None,
+                shapes: vec![OmeShape::Rectangle {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 0.0,
+                    height: 0.0,
+                    the_z: Some(0),
+                    the_t: Some(0),
+                    the_c: Some(0),
+                }],
+            });
+        }
+
+        Some(ome)
     }
 
     /// Java CellH5Reader.get8BitLookupTable() returns a synthetic colour ramp
