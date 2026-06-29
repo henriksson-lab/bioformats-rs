@@ -535,15 +535,20 @@ BIOFORMATS_RS_OME_IMAGES_WARMUP=0 BIOFORMATS_RS_OME_IMAGES_MEASURE=1 BIOFORMATS_
 
 The full sweep output is `bench/target/ome-images-subset.csv`. The ICS rows
 below use the post-fix focused rerun in `bench/target/ics-after-region.csv`.
+The HDF5-backed BDV, CellH5, and Imaris-IMS rows use the focused benchmark
+outputs in `bench/target/bdv-flex-lif-after.md`,
+`bench/target/cellh5-after.md`, and `bench/target/imaris-after.md`; the
+vendored HDF5 dependency is currently `hdf5-pure-rust` 0.3.7 with the local
+standalone LZ4 filter-32004 hook retained.
 `Worst speedup J/R` and `Worst RSS J/R` are Java divided by Rust, so values
 below `1.0x` mean Rust was slower or used more RSS for that comparable row.
 
 | Device / folder | Files | Comparable | Java ms max | Rust ms max | Worst speedup J/R | Java RSS max KiB | Rust RSS max KiB | Worst RSS J/R | Status / next action |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---|
 | AmiraMesh | 2 | 2 | 511.4 | 10.5 | 33.66x | 120516 | 16640 | 5.29x | OK in screening pass |
-| BDV | 2 | 2 | 31002.3 | 641.5 | 2.32x | 214728 | 151876 | 0.93x | Fixed: `.h5` sidecar dispatch now routes BDV HDF5 directly to `BdvReader`; remaining XML RSS delta is small and sits in the HDF5 hyperslab/chunk path. |
+| BDV | 2 | 2 | 31002.3 | 641.5 | 2.32x | 214728 | 151876 | 0.93x | Recorded HDF5 parity/speed/RSS row: `.h5` sidecar dispatch routes BDV HDF5 directly to `BdvReader`; the direct `.h5` row is much faster and lower RSS than Java, while the XML entry still has a small Rust RSS delta in the HDF5 hyperslab/chunk path. |
 | CV7000 | 2 | 1 | 683.5 | 109.1 | 6.26x | 180664 | 10560 | 17.11x | One XML sidecar rejected by both; TIFF comparable row OK. |
-| CellH5 | 2 | 2 | 6609.7 | 2016.6 | 3.28x | 195192 | 344960 | 0.57x | Local region reads now request only the selected HDF5 slab; RSS remains high on `samples/full/0013.ch5`, pointing at the vendored HDF5 metadata/chunk path rather than CellH5 plane buffering. |
+| CellH5 | 2 | 2 | 6609.7 | 2016.6 | 3.28x | 195192 | 344960 | 0.57x | Recorded HDF5 parity/speed/RSS row: region reads request only the selected HDF5 slab; RSS remains high on `samples/full/0013.ch5`, pointing at the HDF5 metadata/chunk path rather than CellH5 plane buffering. |
 | CellSens | 2 | 2 | 2209.9 | 1517.0 | 1.42x | 327452 | 123864 | 1.94x | OK in screening pass |
 | DCIMG | 2 | 2 | 473.7 | 5.8 | 71.02x | 116152 | 13520 | 8.57x | OK in screening pass |
 | DICOM | 2 | 2 | 726.1 | 12.3 | 44.78x | 146424 | 9920 | 14.36x | OK in screening pass |
@@ -553,8 +558,8 @@ below `1.0x` mean Rust was slower or used more RSS for that comparable row.
 | HCS | 2 | 2 | 705.4 | 420.0 | 1.68x | 183028 | 25280 | 7.16x | OK in screening pass |
 | Hamamatsu-NDPI | 2 | 2 | 7059.3 | 4672.4 | 1.51x | 624488 | 150256 | 4.16x | Fixed: JPEG-XR-compressed YCbCr NDPI tiles now decode through the codec RGB path instead of the manual non-JPEG YCbCr guard. |
 | Hamamatsu-VMS | 2 | 2 | 10689.9 | 1257.8 | 4.25x | 710084 | 636776 | 1.10x | OK in screening pass |
-| ICS | 2 | 2 | 434.8 | 2.5 | 165.73x | 122840 | 8320 | 12.31x | Fixed: uncompressed ICS region reads now seek row windows directly, and `.ids` companions dispatch to `IcsReader` before byte sniffing. |
-| Imaris-IMS | 2 | 2 | 1301.8 | 121.1 | 5.67x | 149684 | 12160 | 12.31x | Fixed: HDF5 v2 custom-filter parsing and filter 32004 LZ4 decode now read the 2 sampled `.ims` fixtures. |
+| ICS | 2 | 2 | 434.8 | 2.5 | 165.73x | 122840 | 8320 | 12.31x | Audited: speedup is from direct uncompressed row-window reads; bytes/planes match Java for `.ics` and `.ids`, and `.ids` companions dispatch to `IcsReader` before byte sniffing. |
+| Imaris-IMS | 2 | 2 | 1301.8 | 121.1 | 5.67x | 149684 | 12160 | 12.31x | Recorded HDF5 parity/speed/RSS row: HDF5 v2 custom-filter parsing and standalone filter 32004 LZ4 decode read the 2 sampled `.ims` fixtures; Rust is faster and lower RSS than Java on both rows. |
 | InCell2000 | 2 | 2 | 600.0 | 84.9 | 7.04x | 183680 | 25600 | 7.12x | OK in screening pass |
 | InCell3000 | 2 | 2 | 437.7 | 11.0 | 39.84x | 105356 | 14476 | 7.28x | OK in screening pass |
 | KLB | 2 | 2 | 440.7 | 311.8 | 1.24x | 123712 | 19364 | 5.34x | OK in screening pass |
@@ -566,12 +571,12 @@ below `1.0x` mean Rust was slower or used more RSS for that comparable row.
 | Metamorph | 2 | 2 | 2257.7 | 178.2 | 12.67x | 193800 | 17268 | 8.18x | OK in screening pass |
 | Micro-Manager | 1 | 1 | 2952.3 | 138.7 | 21.28x | 190492 | 21752 | 8.76x | OK in screening pass |
 | ND2 | 2 | 2 | 9279.1 | 4596.8 | 2.02x | 1045252 | 784492 | 1.17x | OK in screening pass |
-| NIfTI | 2 | 1 | 375.2 | 3.1 | 119.61x | 107852 | 12480 | 8.64x | One XML sidecar rejected by both; NIfTI row OK. |
+| NIfTI | 2 | 1 | 375.2 | 3.1 | 119.61x | 107852 | 12480 | 8.64x | Audited: one XML sidecar rejected by both; the `.nii` row seeks directly to the requested plane and matches Java bytes/planes. |
 | OME-TIFF | 2 | 2 | 1009.8 | 14.1 | 67.35x | 173852 | 9600 | 14.41x | OK in screening pass |
-| OME-XML | 2 | 2 | 1026.7 | 2.4 | 425.37x | 155684 | 11200 | 13.26x | OK in screening pass |
+| OME-XML | 2 | 2 | 1026.7 | 2.4 | 425.37x | 155684 | 11200 | 13.26x | Audited: sampled files are tiny inline BinData planes; parser covers legacy pixel metadata, external TiffData/UUID companions, split RGB BinData, and metadata-only blank-plane semantics. |
 | Olympus-FluoView | 1 | 1 | 985.3 | 333.7 | 2.95x | 183212 | 36480 | 5.02x | OK in screening pass |
 | Olympus-OIR | 2 | 2 | 882.6 | 230.9 | 3.70x | 202244 | 47120 | 3.73x | OK in screening pass |
-| PNG | 2 | 2 | 394.2 | 4.4 | 85.99x | 86436 | 11520 | 7.47x | OK in screening pass |
+| PNG | 2 | 2 | 394.2 | 4.4 | 85.99x | 86436 | 11520 | 7.47x | Audited: still PNG decodes complete planes, APNG is routed separately, and sampled rows match Java bytes/planes; speedup is not from skipped pixel reads. |
 | PerkinElmer-Columbus | 1 | 1 | 40318.5 | 17335.4 | 2.33x | 1509724 | 34080 | 44.30x | Fixed: Columbus TIFF leaves with a sibling `MeasurementIndex.ColumbusIDX.xml` route to `ColumbusReader`; benchmark uses the XML index and matches Java at 3696 planes. |
 | PerkinElmer-Operetta | 2 | 2 | 616.1 | 28.9 | 16.80x | 94724 | 17172 | 5.49x | OK in screening pass |
 | SDT | 1 | 1 | 8751.9 | 465.3 | 18.81x | 670068 | 40336 | 16.61x | OK in screening pass |
