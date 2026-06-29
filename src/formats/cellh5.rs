@@ -20,7 +20,6 @@ use crate::common::ome_metadata::{
 };
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
-use crate::common::region::crop_full_plane;
 
 use hdf5_pure_rust::format::messages::datatype::DatatypeClass;
 use hdf5_pure_rust::{HyperslabDim, Selection};
@@ -52,6 +51,130 @@ impl CellH5Reader {
             path: None,
             series: Vec::new(),
             current_series: 0,
+        }
+    }
+
+    fn read_region(&self, plane_index: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
+        let series = self
+            .series
+            .get(self.current_series)
+            .ok_or(BioFormatsError::NotInitialized)?;
+        let meta = &series.meta;
+        if plane_index >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        let x_end = x
+            .checked_add(w)
+            .ok_or_else(|| BioFormatsError::Format("CellH5 region X overflows".into()))?;
+        let y_end = y
+            .checked_add(h)
+            .ok_or_else(|| BioFormatsError::Format("CellH5 region Y overflows".into()))?;
+        if x_end > meta.size_x || y_end > meta.size_y {
+            return Err(BioFormatsError::Format(
+                "CellH5 region is outside image bounds".into(),
+            ));
+        }
+
+        let bytes_per_sample = (meta.bits_per_pixel / 8) as usize;
+        let region_pixels = w as usize * h as usize;
+        let region_bytes = region_pixels
+            .checked_mul(bytes_per_sample)
+            .ok_or_else(|| BioFormatsError::Format("CellH5 region byte count overflows".into()))?;
+
+        // dimension_order XYZTC: z varies fastest, then t, then c.
+        let sz = meta.size_z as usize;
+        let st = meta.size_t as usize;
+        let z = (plane_index as usize) % sz;
+        let t = (plane_index as usize / sz) % st;
+        let c = (plane_index as usize) / (sz * st);
+
+        // Single dataset `[c, t, z, y, x]`; lower-rank datasets drop leading
+        // dimensions in the same order dims_from_shape() assumes.
+        let ds_path = series.dataset_path.clone();
+        let path = self
+            .path
+            .as_ref()
+            .ok_or(BioFormatsError::NotInitialized)?
+            .clone();
+        let file = hdf5_pure_rust::File::open(&path)
+            .map_err(|e| BioFormatsError::Format(format!("HDF5: {e}")))?;
+        let ds = file
+            .dataset(&ds_path)
+            .map_err(|e| BioFormatsError::Format(format!("dataset {ds_path}: {e}")))?;
+
+        let shape = ds.shape().unwrap_or_default();
+        let y0 = y as u64;
+        let x0 = x as u64;
+        let yh = h as u64;
+        let xw = w as u64;
+        let dims: Vec<HyperslabDim> = match shape.len() {
+            5 => vec![
+                HyperslabDim::new(c as u64, 1, 1, 1),
+                HyperslabDim::new(t as u64, 1, 1, 1),
+                HyperslabDim::new(z as u64, 1, 1, 1),
+                HyperslabDim::new(y0, 1, yh, 1),
+                HyperslabDim::new(x0, 1, xw, 1),
+            ],
+            4 => vec![
+                HyperslabDim::new(c as u64, 1, 1, 1),
+                HyperslabDim::new(t as u64, 1, 1, 1),
+                HyperslabDim::new(y0, 1, yh, 1),
+                HyperslabDim::new(x0, 1, xw, 1),
+            ],
+            3 => vec![
+                HyperslabDim::new(t as u64, 1, 1, 1),
+                HyperslabDim::new(y0, 1, yh, 1),
+                HyperslabDim::new(x0, 1, xw, 1),
+            ],
+            2 => vec![
+                HyperslabDim::new(y0, 1, yh, 1),
+                HyperslabDim::new(x0, 1, xw, 1),
+            ],
+            other => {
+                return Err(BioFormatsError::Format(format!(
+                    "CellH5: dataset {ds_path} has unsupported rank {other}"
+                )));
+            }
+        };
+        let selection = Selection::Hyperslab(dims);
+
+        let raw: Vec<u8> = match bytes_per_sample {
+            1 => ds
+                .read_slice::<u8, _>(selection)
+                .map_err(|e| BioFormatsError::Format(format!("HDF5 read: {e}")))?,
+            2 => {
+                let words: Vec<u16> = ds
+                    .read_slice::<u16, _>(selection)
+                    .map_err(|e| BioFormatsError::Format(format!("HDF5 read: {e}")))?;
+                let mut out = Vec::with_capacity(words.len() * 2);
+                for word in words {
+                    out.extend_from_slice(&word.to_le_bytes());
+                }
+                out
+            }
+            4 => {
+                let dwords: Vec<i32> = ds
+                    .read_slice::<i32, _>(selection)
+                    .map_err(|e| BioFormatsError::Format(format!("HDF5 read: {e}")))?;
+                let mut out = Vec::with_capacity(dwords.len() * 4);
+                for dword in dwords {
+                    out.extend_from_slice(&dword.to_le_bytes());
+                }
+                out
+            }
+            _ => ds
+                .read_slice::<u8, _>(selection)
+                .map_err(|e| BioFormatsError::Format(format!("HDF5 read: {e}")))?,
+        };
+
+        if raw.len() == region_bytes {
+            Ok(raw)
+        } else if raw.len() > region_bytes {
+            Ok(raw[..region_bytes].to_vec())
+        } else {
+            Err(BioFormatsError::Format(format!(
+                "CellH5: dataset {ds_path} is too short for plane {plane_index}"
+            )))
         }
     }
 }
@@ -942,110 +1065,15 @@ impl FormatReader for CellH5Reader {
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let series = self
-            .series
-            .get(self.current_series)
-            .ok_or(BioFormatsError::NotInitialized)?;
-        let meta = &series.meta;
-        if plane_index >= meta.image_count {
-            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
-        }
-
-        let plane_pixels = meta.size_x as usize * meta.size_y as usize;
-        let bytes_per_sample = (meta.bits_per_pixel / 8) as usize;
-        let plane_bytes = plane_pixels * bytes_per_sample;
-
-        // dimension_order XYZTC: z varies fastest, then t, then c.
-        let sz = meta.size_z as usize;
-        let st = meta.size_t as usize;
-        let z = (plane_index as usize) % sz;
-        let t = (plane_index as usize / sz) % st;
-        let c = (plane_index as usize) / (sz * st);
-
-        // Single 5D dataset `[c, t, z, y, x]` for this series/well/position.
-        let ds_path = series.dataset_path.clone();
-        let path = self
-            .path
-            .as_ref()
-            .ok_or(BioFormatsError::NotInitialized)?
-            .clone();
-        let file = hdf5_pure_rust::File::open(&path)
-            .map_err(|e| BioFormatsError::Format(format!("HDF5: {e}")))?;
-        let ds = file
-            .dataset(&ds_path)
-            .map_err(|e| BioFormatsError::Format(format!("dataset {ds_path}: {e}")))?;
-
-        // Per-plane partial read via a hyperslab selection: fix the leading
-        // dims (c, t, z) to the requested indices and select all of y,x.
-        // Storage is `[c, t, z, y, x]` for 5D; lower-rank datasets drop the
-        // leading dims in the same order dims_from_shape() assumes.
-        let shape = ds.shape().unwrap_or_default();
-        let y = meta.size_y as u64;
-        let xw = meta.size_x as u64;
-        let dims: Vec<HyperslabDim> = match shape.len() {
-            5 => vec![
-                HyperslabDim::new(c as u64, 1, 1, 1),
-                HyperslabDim::new(t as u64, 1, 1, 1),
-                HyperslabDim::new(z as u64, 1, 1, 1),
-                HyperslabDim::new(0, 1, y, 1),
-                HyperslabDim::new(0, 1, xw, 1),
-            ],
-            4 => vec![
-                HyperslabDim::new(c as u64, 1, 1, 1),
-                HyperslabDim::new(t as u64, 1, 1, 1),
-                HyperslabDim::new(0, 1, y, 1),
-                HyperslabDim::new(0, 1, xw, 1),
-            ],
-            3 => vec![
-                HyperslabDim::new(t as u64, 1, 1, 1),
-                HyperslabDim::new(0, 1, y, 1),
-                HyperslabDim::new(0, 1, xw, 1),
-            ],
-            2 => vec![
-                HyperslabDim::new(0, 1, y, 1),
-                HyperslabDim::new(0, 1, xw, 1),
-            ],
-            other => {
-                return Err(BioFormatsError::Format(format!(
-                    "CellH5: dataset {ds_path} has unsupported rank {other}"
-                )));
-            }
+        let (size_x, size_y) = {
+            let meta = &self
+                .series
+                .get(self.current_series)
+                .ok_or(BioFormatsError::NotInitialized)?
+                .meta;
+            (meta.size_x, meta.size_y)
         };
-        let selection = Selection::Hyperslab(dims);
-
-        // After read_slice the returned vec IS this plane; index from 0.
-        let raw: Vec<u8> = match bytes_per_sample {
-            1 => ds
-                .read_slice::<u8, _>(selection)
-                .map_err(|e| BioFormatsError::Format(format!("HDF5 read: {e}")))?,
-            2 => {
-                let words: Vec<u16> = ds
-                    .read_slice::<u16, _>(selection)
-                    .map_err(|e| BioFormatsError::Format(format!("HDF5 read: {e}")))?;
-                words.iter().flat_map(|w| w.to_le_bytes()).collect()
-            }
-            4 => {
-                let dwords: Vec<i32> = ds
-                    .read_slice::<i32, _>(selection)
-                    .map_err(|e| BioFormatsError::Format(format!("HDF5 read: {e}")))?;
-                dwords.iter().flat_map(|d| d.to_le_bytes()).collect()
-            }
-            _ => ds
-                .read_slice::<u8, _>(selection)
-                .map_err(|e| BioFormatsError::Format(format!("HDF5 read: {e}")))?,
-        };
-
-        // The hyperslab read already isolates the requested plane, so the
-        // buffer should be exactly one plane long; index from offset 0.
-        let offset = 0usize;
-
-        if offset + plane_bytes <= raw.len() {
-            Ok(raw[offset..offset + plane_bytes].to_vec())
-        } else {
-            Err(BioFormatsError::Format(format!(
-                "CellH5: dataset {ds_path} is too short for plane {plane_index}"
-            )))
-        }
+        self.read_region(plane_index, 0, 0, size_x, size_y)
     }
 
     fn open_bytes_region(
@@ -1056,13 +1084,7 @@ impl FormatReader for CellH5Reader {
         w: u32,
         h: u32,
     ) -> Result<Vec<u8>> {
-        let full = self.open_bytes(plane_index)?;
-        let meta = &self
-            .series
-            .get(self.current_series)
-            .ok_or(BioFormatsError::NotInitialized)?
-            .meta;
-        crop_full_plane("CellH5", &full, meta, 1, x, y, w, h)
+        self.read_region(plane_index, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {

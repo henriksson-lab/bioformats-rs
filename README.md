@@ -8,7 +8,7 @@ The internal Metakit table reader used for Volocity is translated from
 [`ome/ome-metakit`](https://github.com/ome/ome-metakit) at commit
 `b8b3a629a6dd9bf422949f6b175b9e310ba6e252`.
 
-* 2026-06-29: Audit on real data for remaining formats
+* 2026-06-29: Audit on real data for remaining formats. Benchmarks and speed improvements
 * 2026-06-24: Further real data audits
 * 2026-06-21: Tracked translation audit complete. Every component has passed two clean audits without remarks. Not all readers have been tested on real files though
 * 2026-06-20: Close to all files audited. some left
@@ -541,9 +541,9 @@ below `1.0x` mean Rust was slower or used more RSS for that comparable row.
 | Device / folder | Files | Comparable | Java ms max | Rust ms max | Worst speedup J/R | Java RSS max KiB | Rust RSS max KiB | Worst RSS J/R | Status / next action |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---|
 | AmiraMesh | 2 | 2 | 511.4 | 10.5 | 33.66x | 120516 | 16640 | 5.29x | OK in screening pass |
-| BDV | 2 | 2 | 31002.3 | 641.5 | 2.32x | 214728 | 151876 | 0.93x | Fixed: `.h5` sidecar dispatch now routes BDV HDF5 directly to `BdvReader`; both sampled `.h5`/`.xml` rows are comparable. |
+| BDV | 2 | 2 | 31002.3 | 641.5 | 2.32x | 214728 | 151876 | 0.93x | Fixed: `.h5` sidecar dispatch now routes BDV HDF5 directly to `BdvReader`; remaining XML RSS delta is small and sits in the HDF5 hyperslab/chunk path. |
 | CV7000 | 2 | 1 | 683.5 | 109.1 | 6.26x | 180664 | 10560 | 17.11x | One XML sidecar rejected by both; TIFF comparable row OK. |
-| CellH5 | 2 | 2 | 8090.4 | 1865.7 | 4.34x | 198000 | 345920 | 0.57x | OK in screening pass; Rust RSS higher on one row but below alert threshold. |
+| CellH5 | 2 | 2 | 6609.7 | 2016.6 | 3.28x | 195192 | 344960 | 0.57x | Local region reads now request only the selected HDF5 slab; RSS remains high on `samples/full/0013.ch5`, pointing at the vendored HDF5 metadata/chunk path rather than CellH5 plane buffering. |
 | CellSens | 2 | 2 | 2209.9 | 1517.0 | 1.42x | 327452 | 123864 | 1.94x | OK in screening pass |
 | DCIMG | 2 | 2 | 473.7 | 5.8 | 71.02x | 116152 | 13520 | 8.57x | OK in screening pass |
 | DICOM | 2 | 2 | 726.1 | 12.3 | 44.78x | 146424 | 9920 | 14.36x | OK in screening pass |
@@ -561,7 +561,7 @@ below `1.0x` mean Rust was slower or used more RSS for that comparable row.
 | LEO | 2 | 2 | 490.7 | 181.5 | 2.66x | 126304 | 25776 | 4.90x | OK in screening pass |
 | Leica-LIF | 2 | 2 | 1421.1 | 128.1 | 11.09x | 259828 | 49024 | 5.30x | Fixed: uncompressed LIF metadata is parsed by streaming block descriptors, and region reads coalesce row spans instead of reloading the whole file. |
 | Leica-SCN | 2 | 2 | 5015.1 | 115.4 | 14.48x | 237488 | 12356 | 17.25x | OK in screening pass |
-| Leica-XLEF | 2 | 0 | - | - | - | - | - | - | Both selected files rejected by Java and Rust; need Java-readable candidates. |
+| Leica-XLEF | 3 | 3 | 3909.0 | 1321.0 | 2.72x | 569516 | 144960 | 3.93x | Fixed: Java-readable `.xlef` benchmark projects now open; case-insensitive component path resolution and missing nested metadata/provenance references are handled. |
 | MetaXpress | 2 | 1 | 13189.6 | 4298.8 | 3.07x | 452448 | 16640 | 27.19x | One missing-companion plate rejected by both; comparable row OK. |
 | Metamorph | 2 | 2 | 2257.7 | 178.2 | 12.67x | 193800 | 17268 | 8.18x | OK in screening pass |
 | Micro-Manager | 1 | 1 | 2952.3 | 138.7 | 21.28x | 190492 | 21752 | 8.76x | OK in screening pass |
@@ -572,12 +572,12 @@ below `1.0x` mean Rust was slower or used more RSS for that comparable row.
 | Olympus-FluoView | 1 | 1 | 985.3 | 333.7 | 2.95x | 183212 | 36480 | 5.02x | OK in screening pass |
 | Olympus-OIR | 2 | 2 | 882.6 | 230.9 | 3.70x | 202244 | 47120 | 3.73x | OK in screening pass |
 | PNG | 2 | 2 | 394.2 | 4.4 | 85.99x | 86436 | 11520 | 7.47x | OK in screening pass |
-| PerkinElmer-Columbus | 2 | 0 | - | - | - | - | - | - | Java rejected selected flat TIFFs; not speed-comparable. |
+| PerkinElmer-Columbus | 1 | 1 | 40318.5 | 17335.4 | 2.33x | 1509724 | 34080 | 44.30x | Fixed: Columbus TIFF leaves with a sibling `MeasurementIndex.ColumbusIDX.xml` route to `ColumbusReader`; benchmark uses the XML index and matches Java at 3696 planes. |
 | PerkinElmer-Operetta | 2 | 2 | 616.1 | 28.9 | 16.80x | 94724 | 17172 | 5.49x | OK in screening pass |
 | SDT | 1 | 1 | 8751.9 | 465.3 | 18.81x | 670068 | 40336 | 16.61x | OK in screening pass |
 | SPC-FIFO | 1 | 1 | 940.0 | 132.4 | 7.10x | 144976 | 43200 | 3.36x | OK in screening pass |
 | SVS | 2 | 2 | 2088.2 | 276.0 | 5.45x | 211200 | 13196 | 16.01x | Fixed: JPEG 2000 subsampled components are upsampled to the full grid, and SVS pyramid resolutions are flattened while the stripped LZW thumbnail is skipped like Java. |
-| ScanR | 1 | 0 | - | - | - | - | - | - | Selected descriptor rejected by both; need complete candidate with TIFF data. |
+| ScanR | 1 | 0 | - | - | - | - | - | - | Added `scanr-benchmark-smoke` fixture rows and `bench/manifests/scanr-benchmark-smoke.paths`; current `/big` mirror is still missing the `data/` TIFF planes needed to run Java locally. |
 | TIFF | 2 | 2 | 698.0 | 20.6 | 31.72x | 190516 | 10240 | 18.57x | OK in screening pass |
 | Trestle | 2 | 2 | 1261.7 | 71.0 | 16.64x | 216484 | 11520 | 18.10x | OK in screening pass |
 | Vectra-QPTIFF | 2 | 2 | 1047.8 | 63.0 | 15.73x | 177832 | 12000 | 14.78x | OK in screening pass |

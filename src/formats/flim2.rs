@@ -8130,6 +8130,7 @@ impl XlefReader {
                 xlef_format_paths(&unsupported)
             )));
         }
+        unsupported.retain(|path| !xlef_is_project_reference(path));
         if !unsupported.is_empty() {
             return Err(BioFormatsError::UnsupportedFormat(format!(
                 "Leica XLEF project mixes supported leaves with unsupported files {}; partial mixed-project opening is not implemented",
@@ -8817,15 +8818,10 @@ fn xlef_referenced_paths(xml: &str, xlef_path: &Path) -> Vec<PathBuf> {
         {
             continue;
         }
-        let cleaned = token.replace('\\', "/");
-        let candidate = Path::new(&cleaned);
-        let path = if candidate.is_absolute() {
-            candidate.to_path_buf()
-        } else {
-            parent.join(candidate)
-        };
-        if !refs.iter().any(|p| p == &path) {
-            refs.push(path);
+        if let Some(path) = xlef_reference_path(parent, token) {
+            if path.exists() && !refs.iter().any(|p| p == &path) {
+                refs.push(path);
+            }
         }
     }
     refs
@@ -8839,7 +8835,7 @@ fn xlef_is_reference_attribute(key: &str) -> bool {
 }
 
 fn xlef_reference_path(parent: &Path, value: &str) -> Option<PathBuf> {
-    let cleaned = value.trim().replace('\\', "/");
+    let cleaned = value.trim();
     if cleaned.is_empty() || cleaned.starts_with('#') {
         return None;
     }
@@ -8847,15 +8843,18 @@ fn xlef_reference_path(parent: &Path, value: &str) -> Option<PathBuf> {
     if lower.starts_with("http://") || lower.starts_with("https://") {
         return Some(PathBuf::from(cleaned));
     }
-    let candidate = Path::new(&cleaned);
+    // Project files frequently keep the original Windows acquisition path in
+    // attributes such as Experiment/@Path. Those are provenance strings, not
+    // local references, and Java does not require them to resolve.
+    if lower.len() >= 3 && lower.as_bytes().get(1) == Some(&b':') {
+        return None;
+    }
+    let path = crate::formats::leica_lms::parse_file_path(parent, cleaned);
+    let candidate = path.as_path();
     if candidate.extension().is_none() {
         return None;
     }
-    Some(if candidate.is_absolute() {
-        candidate.to_path_buf()
-    } else {
-        parent.join(candidate)
-    })
+    Some(crate::formats::leica_lms::file_exists(candidate).unwrap_or(path))
 }
 
 fn xlef_is_project_reference(path: &Path) -> bool {

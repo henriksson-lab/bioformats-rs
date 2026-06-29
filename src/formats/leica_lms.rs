@@ -262,16 +262,43 @@ pub fn file_exists(path: &Path) -> Option<PathBuf> {
     if path.exists() {
         return Some(path.to_path_buf());
     }
-    // Case-insensitive fallback: scan the parent directory for a name match.
-    let parent = path.parent()?;
-    let target = path.file_name()?.to_str()?.to_ascii_lowercase();
-    let entries = std::fs::read_dir(parent).ok()?;
-    for entry in entries.flatten() {
-        if entry.file_name().to_str().map(|n| n.to_ascii_lowercase()) == Some(target.clone()) {
-            return Some(entry.path());
+    case_insensitive_existing_path(path)
+}
+
+fn case_insensitive_existing_path(path: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+
+    let mut resolved = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(_)
+            | Component::RootDir
+            | Component::CurDir
+            | Component::ParentDir => {
+                resolved.push(component.as_os_str());
+            }
+            Component::Normal(part) => {
+                let candidate = resolved.join(part);
+                if candidate.exists() {
+                    resolved = candidate;
+                    continue;
+                }
+                let target = part.to_str()?.to_ascii_lowercase();
+                let entries = std::fs::read_dir(&resolved).ok()?;
+                let mut matched = None;
+                for entry in entries.flatten() {
+                    if entry.file_name().to_str().map(|n| n.to_ascii_lowercase())
+                        == Some(target.clone())
+                    {
+                        matched = Some(entry.path());
+                        break;
+                    }
+                }
+                resolved = matched?;
+            }
         }
     }
-    None
+    resolved.exists().then_some(resolved)
 }
 
 fn url_decode(value: &str) -> String {

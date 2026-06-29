@@ -151,6 +151,15 @@ pub(crate) fn open_reader(path: &Path) -> Result<Box<dyn FormatReader>> {
         return Ok(r);
     }
 
+    if has_tiff_extension(path)
+        && is_tiff_header(&header)
+        && has_columbus_measurement_index_sibling(path)
+    {
+        let mut r = boxed_reader(crate::formats::hcs2::ColumbusReader::new());
+        r.set_id(path)?;
+        return Ok(r);
+    }
+
     // ZVI is an OLE/CFB container whose magic bytes are shared with many other
     // formats. Java's ZeissZVIReader is extension-driven for this case; routing
     // `.zvi` directly avoids probing unrelated OLE readers that may parse large
@@ -622,6 +631,13 @@ fn tiff_wrapper_readers_for_extension(path: &Path, header: &[u8]) -> Vec<Box<dyn
             // mode/z/t naming), so ordinary .tif files still fall through.
             readers.extend(generic_tiff_name_wrappers(path, header));
 
+            // Columbus image planes are ordinary TIFF leaves, but Java opens a
+            // leaf through the sibling MeasurementIndex.ColumbusIDX.xml and
+            // exposes the whole grouped plate/timepoint structure.
+            if has_columbus_measurement_index_sibling(path) {
+                readers.push(boxed_reader(crate::formats::hcs2::ColumbusReader::new()));
+            }
+
             // Java readers.txt probes NikonReader before the other generic
             // `.tif` wrappers and before the final generic TIFF reader.
             if tiff_first_ifd_is_nikon_raw(path) {
@@ -779,6 +795,12 @@ fn has_metamorph_nd_sibling(path: &Path) -> bool {
             .map(|suffix| suffix.starts_with('_'))
             .unwrap_or(false)
     })
+}
+
+fn has_columbus_measurement_index_sibling(path: &Path) -> bool {
+    path.parent()
+        .map(|dir| dir.join("MeasurementIndex.ColumbusIDX.xml").is_file())
+        .unwrap_or(false)
 }
 
 fn generic_tiff_name_wrappers(path: &Path, _header: &[u8]) -> Vec<Box<dyn FormatReader>> {

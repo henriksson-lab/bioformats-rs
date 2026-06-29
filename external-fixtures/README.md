@@ -44,6 +44,7 @@ python3 external-fixtures/scripts/download_ome_samples.py --set nd2-smoke
 python3 external-fixtures/scripts/download_ome_samples.py --set nd2-zenodo-vpa002-smoke
 python3 external-fixtures/scripts/download_ome_samples.py --set nd2-modern-uicomp-feature
 python3 external-fixtures/scripts/download_ome_samples.py --set nd2-feature
+python3 external-fixtures/scripts/download_ome_samples.py --set scanr-benchmark-smoke
 ```
 
 Set names are tiered by intended use:
@@ -59,7 +60,8 @@ Prefer targeted readable sets for format smoke tests when they exist, for
 example `czi-openslide-zeiss5-smoke`, `czi-synthetic-tile-smoke`,
 `mrc-emdb-small`, `dcimg-pixel-smoke`, `cv7000-structured-smoke`,
 `hamamatsu-ndpi-image-smoke`, `perkinelmer-operetta-index-smoke`, and
-`scanr-image-smoke`.
+`scanr-image-smoke`. Use `scanr-benchmark-smoke` when the benchmark needs the
+ScanR descriptor plus a complete Java-readable image site.
 
 MRC sets include `mrc-smoke` for the public OME mirror sample,
 `mrc-emdb-small` for the bounded `EMD-3197.map` candidate,
