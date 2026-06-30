@@ -151,6 +151,12 @@ pub(crate) fn open_reader(path: &Path) -> Result<Box<dyn FormatReader>> {
         return Ok(r);
     }
 
+    if has_ch5_extension(path) && is_hdf5_header(&header) {
+        let mut r = boxed_reader(crate::formats::cellh5::CellH5Reader::new());
+        r.set_id(path)?;
+        return Ok(r);
+    }
+
     if has_tiff_extension(path)
         && is_tiff_header(&header)
         && has_columbus_measurement_index_sibling(path)
@@ -425,6 +431,10 @@ pub(crate) fn detect_reader_without_set_id(path: &Path) -> Result<Box<dyn Format
         ));
     }
 
+    if has_ch5_extension(path) && is_hdf5_header(&header) {
+        return Ok(boxed_reader(crate::formats::cellh5::CellH5Reader::new()));
+    }
+
     if has_zvi_extension(path) {
         return Ok(boxed_reader(
             crate::formats::zeiss_zvi::ZeissZviReader::new(),
@@ -493,6 +503,13 @@ fn has_h5_extension(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .map(|e| e.eq_ignore_ascii_case("h5"))
+        .unwrap_or(false)
+}
+
+fn has_ch5_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("ch5"))
         .unwrap_or(false)
 }
 

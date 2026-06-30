@@ -536,19 +536,17 @@ BIOFORMATS_RS_OME_IMAGES_WARMUP=0 BIOFORMATS_RS_OME_IMAGES_MEASURE=1 BIOFORMATS_
 The full sweep output is `bench/target/ome-images-subset.csv`. The ICS rows
 below use the post-fix focused rerun in `bench/target/ics-after-region.csv`.
 The HDF5-backed BDV, CellH5, and Imaris-IMS rows use the focused benchmark
-outputs in `bench/target/bdv-flex-lif-after.md`,
-`bench/target/cellh5-after.md`, and `bench/target/imaris-after.md`; the
-HDF5 dependency is currently crates.io `hdf5-pure-rust` 0.3 with its `lz4`
-feature enabled.
+output in `bench/target/hdf5-readers-0310.md`; the HDF5 dependency is crates.io
+`hdf5-pure-rust` 0.3.10 with its `lz4` feature enabled.
 `Worst speedup J/R` and `Worst RSS J/R` are Java divided by Rust, so values
 below `1.0x` mean Rust was slower or used more RSS for that comparable row.
 
 | Device / folder | Files | Comparable | Java ms max | Rust ms max | Worst speedup J/R | Java RSS max KiB | Rust RSS max KiB | Worst RSS J/R | Notes |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---|
 | AmiraMesh | 2 | 2 | 511.4 | 10.5 | 33.66x | 120516 | 16640 | 5.29x | - |
-| BDV | 2 | 2 | 31002.3 | 641.5 | 2.32x | 214728 | 151876 | 0.93x | XML entry still has a small Rust RSS delta in the HDF5 hyperslab/chunk path. |
+| BDV | 2 | 2 | 1304.3 | 202.6 | 5.76x | 218228 | 14720 | 9.61x | - |
 | CV7000 | 2 | 1 | 683.5 | 109.1 | 6.26x | 180664 | 10560 | 17.11x | One XML sidecar rejected by both. |
-| CellH5 | 2 | 2 | 6609.7 | 2016.6 | 3.28x | 195192 | 344960 | 0.57x | High RSS on `samples/full/0013.ch5` appears to be in the HDF5 metadata/chunk path. |
+| CellH5 | 2 | 2 | 1540.5 | 214.3 | 7.19x | 196192 | 9600 | 19.19x | - |
 | CellSens | 2 | 2 | 2209.9 | 1517.0 | 1.42x | 327452 | 123864 | 1.94x | - |
 | DCIMG | 2 | 2 | 473.7 | 5.8 | 71.02x | 116152 | 13520 | 8.57x | - |
 | DICOM | 2 | 2 | 726.1 | 12.3 | 44.78x | 146424 | 9920 | 14.36x | - |
@@ -559,7 +557,7 @@ below `1.0x` mean Rust was slower or used more RSS for that comparable row.
 | Hamamatsu-NDPI | 2 | 2 | 7059.3 | 4672.4 | 1.51x | 624488 | 150256 | 4.16x | - |
 | Hamamatsu-VMS | 2 | 2 | 10689.9 | 1257.8 | 4.25x | 710084 | 636776 | 1.10x | - |
 | ICS | 2 | 2 | 434.8 | 2.5 | 165.73x | 122840 | 8320 | 12.31x | Direct uncompressed row-window reads. |
-| Imaris-IMS | 2 | 2 | 1301.8 | 121.1 | 5.67x | 149684 | 12160 | 12.31x | Includes HDF5 filter-32004 LZ4 fixtures. |
+| Imaris-IMS | 2 | 2 | 583.3 | 104.3 | 5.40x | 145264 | 12480 | 11.64x | Java reports shorter byte counts on the LZ4 fixtures. |
 | InCell2000 | 2 | 2 | 600.0 | 84.9 | 7.04x | 183680 | 25600 | 7.12x | - |
 | InCell3000 | 2 | 2 | 437.7 | 11.0 | 39.84x | 105356 | 14476 | 7.28x | - |
 | KLB | 2 | 2 | 440.7 | 311.8 | 1.24x | 123712 | 19364 | 5.34x | - |

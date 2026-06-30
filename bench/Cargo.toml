@@ -17,6 +17,3 @@ path = "bench_profile_rust.rs"
 
 [dependencies]
 bioformats = { path = ".." }
-
-[patch.crates-io]
-hdf5-pure-rust = { path = "../vendor/hdf5-pure-rust" }
