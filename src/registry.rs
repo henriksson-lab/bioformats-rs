@@ -590,7 +590,18 @@ fn tiff_wrapper_readers_for_extension(path: &Path, header: &[u8]) -> Vec<Box<dyn
         )],
         Some("vsi") => vec![boxed_reader(crate::formats::flim2::CellSensReader::new())],
         Some("afi") => vec![boxed_reader(crate::formats::flim2::AfiReader::new())],
-        Some("dng") => vec![boxed_reader(crate::formats::extended::DngReader::new())],
+        Some("dng") => {
+            let mut readers = Vec::new();
+            // Java readers.txt probes NikonReader before DNGReader. Some
+            // TIFF-based Nikon RAW files are distributed with a .DNG suffix and
+            // must still route through NikonReader rather than the thumbnail
+            // IFD path in DNGReader.
+            if tiff_first_ifd_is_nikon_raw(path) {
+                readers.push(boxed_reader(crate::formats::camera2::NikonReader::new()));
+            }
+            readers.push(boxed_reader(crate::formats::extended::DngReader::new()));
+            readers
+        }
         Some("qptiff") => vec![boxed_reader(crate::formats::extended::VectraReader::new())],
         Some("gel") => vec![boxed_reader(crate::formats::extended::GelReader::new())],
         Some("flex") => vec![boxed_reader(crate::formats::flex::FlexReader::new())],
@@ -999,8 +1010,10 @@ fn tiff_first_ifd_is_nikon_raw(path: &Path) -> bool {
     let Some(ifd) = tiff_first_ifd(path) else {
         return false;
     };
+    if ifd.get(37398).is_some() {
+        return true;
+    }
     matches!(ifd.get_str(271), Some(make) if make.contains("Nikon"))
-        && (ifd.get(37398).is_some() || ifd.get(37500).is_some())
 }
 
 fn tiff_first_ifd_matches_dng(path: &Path) -> bool {
@@ -1835,6 +1848,23 @@ mod tests {
         );
 
         let reader = ImageReader::open(&path).expect("Nikon RAW TIFF dispatch failed");
+
+        assert!(matches!(
+            reader.metadata().series_metadata.get("format"),
+            Some(MetadataValue::String(value)) if value == "Nikon NEF"
+        ));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn nikon_raw_dng_dispatch_runs_before_dng_reader_like_java() {
+        let path = temp_path("eps_raw_make.dng");
+        write_minimal_tiff_with_extra_tags(
+            &path,
+            &[(271, 2, b"Canon\0"), (37398, 3, &1u16.to_le_bytes())],
+        );
+
+        let reader = ImageReader::open(&path).expect("Nikon RAW DNG dispatch failed");
 
         assert!(matches!(
             reader.metadata().series_metadata.get("format"),

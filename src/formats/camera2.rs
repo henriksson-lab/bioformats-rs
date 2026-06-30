@@ -3148,6 +3148,9 @@ pub struct NikonReader {
     inner: crate::tiff::TiffReader,
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
+    /// Mirrors Java `BaseTiffReader.ifds` after `NikonReader` sets
+    /// `mergeSubIFDs = true`: plane `no` is read from this active IFD list.
+    ifd_indices: Vec<usize>,
     /// Maker-note compression options (tag 150), if the file is compressed.
     compression_options: Option<crate::tiff::nikon::NikonCompressionOptions>,
     /// White-balance RGB coefficients (maker-note tag 12), if present.
@@ -3173,6 +3176,7 @@ impl NikonReader {
             inner: crate::tiff::TiffReader::new(),
             path: None,
             meta: None,
+            ifd_indices: Vec::new(),
             compression_options: None,
             white_balance: None,
             last_plane: None,
@@ -3287,9 +3291,14 @@ impl NikonReader {
         let size_y = meta.size_y as usize;
         let little = meta.is_little_endian;
 
+        let ifd_index = self
+            .ifd_indices
+            .get(no)
+            .copied()
+            .ok_or_else(|| BioFormatsError::PlaneOutOfRange(no as u32))?;
         let ifd = self
             .inner
-            .ifd(no)
+            .ifd(ifd_index)
             .ok_or_else(|| BioFormatsError::PlaneOutOfRange(no as u32))?;
         let bps = ifd.bits_per_sample();
         let mut data_size = *bps.first().unwrap_or(&16) as u16;
@@ -3307,7 +3316,9 @@ impl NikonReader {
         // If the data is already uncompressed full-size (or multi-sample),
         // Java defers to BaseTiffReader.openBytes (plain strip decode).
         if total_bytes as usize == plane_size || bps.len() > 1 {
-            return self.inner.open_bytes(no as u32);
+            if ifd_index == no {
+                return self.inner.open_bytes(no as u32);
+            }
         }
 
         let maybe_compressed = compression == crate::tiff::ifd::Compression::Nikon;
@@ -3424,9 +3435,21 @@ impl FormatReader for NikonReader {
         self.close()?;
         self.inner.set_id(path)?;
 
+        // Java NikonReader has `mergeSubIFDs = true`, so `ifds.get(0)` is the
+        // full-resolution data SubIFD when the first IFD is a thumbnail. The
+        // generic Rust TIFF reader keeps SubIFDs as resolution levels, so build
+        // NikonReader's equivalent active `ifds` list here.
+        let first_ifd_index = self
+            .inner
+            .series_list()
+            .first()
+            .and_then(|series| series.sub_resolutions.first())
+            .and_then(|level| level.first())
+            .copied()
+            .unwrap_or(0);
         let first = self
             .inner
-            .ifd(0)
+            .ifd(first_ifd_index)
             .ok_or_else(|| BioFormatsError::UnsupportedFormat("Nikon NEF: no IFD".into()))?;
         let bits = first.bits_per_sample();
         let bits_per_sample = bits.first().copied().unwrap_or(16);
@@ -3444,6 +3467,12 @@ impl FormatReader for NikonReader {
         let mut meta = self.inner.metadata().clone();
         meta.size_x = size_x;
         meta.size_y = size_y;
+        meta.pixel_type = if bits_per_sample <= 8 {
+            PixelType::Uint8
+        } else {
+            PixelType::Uint16
+        };
+        meta.bits_per_pixel = bits_per_sample as u8;
         meta.size_z = 1;
         meta.size_c = if is_rgb { samples as u32 } else { 1 };
         meta.is_rgb = is_rgb;
@@ -3471,6 +3500,7 @@ impl FormatReader for NikonReader {
 
         self.path = Some(path.to_path_buf());
         self.meta = Some(meta);
+        self.ifd_indices = vec![first_ifd_index];
         self.last_plane = None;
         Ok(())
     }
@@ -3478,6 +3508,7 @@ impl FormatReader for NikonReader {
     fn close(&mut self) -> Result<()> {
         self.path = None;
         self.meta = None;
+        self.ifd_indices.clear();
         self.compression_options = None;
         self.white_balance = None;
         self.last_plane = None;

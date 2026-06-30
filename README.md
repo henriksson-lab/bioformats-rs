@@ -8,6 +8,7 @@ The internal Metakit table reader used for Volocity is translated from
 [`ome/ome-metakit`](https://github.com/ome/ome-metakit) at commit
 `b8b3a629a6dd9bf422949f6b175b9e310ba6e252`.
 
+* 2026-06-30: Further fixes based on real data; faster tiff subregion reader
 * 2026-06-29: Audit on real data for remaining formats. Benchmarks and speed improvements
 * 2026-06-24: Further real data audits
 * 2026-06-21: Tracked translation audit complete. Every component has passed two clean audits without remarks. Not all readers have been tested on real files though
@@ -535,6 +536,8 @@ BIOFORMATS_RS_OME_IMAGES_WARMUP=0 BIOFORMATS_RS_OME_IMAGES_MEASURE=1 BIOFORMATS_
 
 The full sweep output is `bench/target/ome-images-subset.csv`. The ICS rows
 below use the post-fix focused rerun in `bench/target/ics-after-region.csv`.
+TIFF-region-fast-path follow-up rows use focused reruns under
+`bench/target/*-region-fastpath.{csv,md}`.
 The HDF5-backed BDV, CellH5, and Imaris-IMS rows use the focused benchmark
 output in `bench/target/hdf5-readers-0310.md`; the HDF5 dependency is crates.io
 `hdf5-pure-rust` 0.3.10 with its `lz4` feature enabled.
@@ -550,41 +553,44 @@ below `1.0x` mean Rust was slower or used more RSS for that comparable row.
 | CellSens | 2 | 2 | 2209.9 | 1517.0 | 1.42x | 327452 | 123864 | 1.94x | - |
 | DCIMG | 2 | 2 | 473.7 | 5.8 | 71.02x | 116152 | 13520 | 8.57x | - |
 | DICOM | 2 | 2 | 726.1 | 12.3 | 44.78x | 146424 | 9920 | 14.36x | - |
+| DNG | 1 | 1 | 770.0 | 183.3 | 4.20x | 185608 | 52080 | 3.56x | Focused region rerun using raw.pixls Canon PowerShot A410 DNG; Java routes it through NikonReader. |
 | DV | 2 | 2 | 407.8 | 6.9 | 58.38x | 98224 | 12160 | 8.03x | - |
-| Flex | 2 | 2 | 1957.4 | 937.8 | 2.06x | 232048 | 18124 | 12.80x | - |
+| Flex | 2 | 2 | 172124.4 | 90828.5 | 1.90x | 230432 | 12160 | 18.95x | Focused TIFF-region fast-path rerun; first file reads 96 planes. |
 | Gatan | 2 | 2 | 555.4 | 14.6 | 36.61x | 114572 | 11200 | 10.18x | - |
 | HCS | 2 | 2 | 705.4 | 420.0 | 1.68x | 183028 | 25280 | 7.16x | - |
 | Hamamatsu-NDPI | 2 | 2 | 7059.3 | 4672.4 | 1.51x | 624488 | 150256 | 4.16x | - |
 | Hamamatsu-VMS | 2 | 2 | 10689.9 | 1257.8 | 4.25x | 710084 | 636776 | 1.10x | - |
 | ICS | 2 | 2 | 434.8 | 2.5 | 165.73x | 122840 | 8320 | 12.31x | Direct uncompressed row-window reads. |
 | Imaris-IMS | 2 | 2 | 583.3 | 104.3 | 5.40x | 145264 | 12480 | 11.64x | Java reports shorter byte counts on the LZ4 fixtures. |
-| InCell2000 | 2 | 2 | 600.0 | 84.9 | 7.04x | 183680 | 25600 | 7.12x | - |
-| InCell3000 | 2 | 2 | 437.7 | 11.0 | 39.84x | 105356 | 14476 | 7.28x | - |
+| InCell2000 | 2 | 2 | 1247.6 | 21.2 | 42.55x | 180012 | 9600 | 18.75x | Focused TIFF-region fast-path rerun. |
+| InCell3000 | 2 | 2 | 565.0 | 5.7 | 99.97x | 88564 | 10560 | 8.37x | Focused BMP control rerun; not a TIFF-fast-path fixture. |
 | KLB | 2 | 2 | 440.7 | 311.8 | 1.24x | 123712 | 19364 | 5.34x | - |
-| LEO | 2 | 2 | 490.7 | 181.5 | 2.66x | 126304 | 25776 | 4.90x | - |
+| LEO | 2 | 2 | 2489.3 | 131.7 | 12.35x | 126044 | 11984 | 10.11x | Focused TIFF-region fast-path rerun. |
 | Leica-LIF | 2 | 2 | 1421.1 | 128.1 | 11.09x | 259828 | 49024 | 5.30x | - |
 | Leica-SCN | 2 | 2 | 5015.1 | 115.4 | 14.48x | 237488 | 12356 | 17.25x | - |
 | Leica-XLEF | 3 | 3 | 3909.0 | 1321.0 | 2.72x | 569516 | 144960 | 3.93x | - |
-| MetaXpress | 2 | 1 | 13189.6 | 4298.8 | 3.07x | 452448 | 16640 | 27.19x | One missing-companion plate rejected by both. |
-| Metamorph | 2 | 2 | 2257.7 | 178.2 | 12.67x | 193800 | 17268 | 8.18x | - |
-| Micro-Manager | 1 | 1 | 2952.3 | 138.7 | 21.28x | 190492 | 21752 | 8.76x | - |
+| MetaXpress | 1 | 1 | 93378.3 | 27581.2 | 3.39x | 458476 | 16640 | 27.55x | Focused TIFF-region fast-path rerun for idr0005; second HTD did not complete cleanly. |
+| Metamorph | 2 | 2 | 8400.3 | 340.3 | 13.09x | 193684 | 13444 | 13.34x | Focused TIFF-region fast-path rerun. |
+| Micro-Manager | 1 | 1 | 102265.1 | 2407.2 | 42.48x | 198000 | 12064 | 16.41x | Focused OME-TIFF region fast-path rerun. |
+| Molecular-Devices-TIFF | 1 | 1 | 955.2 | 15.9 | 60.18x | 175808 | 9600 | 18.31x | Focused TIFF-region fast-path rerun using public JDCE TIFF payload. |
 | ND2 | 2 | 2 | 9279.1 | 4596.8 | 2.02x | 1045252 | 784492 | 1.17x | - |
 | NIfTI | 2 | 1 | 375.2 | 3.1 | 119.61x | 107852 | 12480 | 8.64x | One XML sidecar rejected by both. |
-| OME-TIFF | 2 | 2 | 1009.8 | 14.1 | 67.35x | 173852 | 9600 | 14.41x | - |
+| OME-TIFF | 2 | 2 | 804.2 | 13.0 | 61.93x | 99860 | 11200 | 8.84x | Focused OME companion TIFF-region fast-path rerun. |
 | OME-XML | 2 | 2 | 1026.7 | 2.4 | 425.37x | 155684 | 11200 | 13.26x | Sampled files are tiny inline BinData planes. |
-| Olympus-FluoView | 1 | 1 | 985.3 | 333.7 | 2.95x | 183212 | 36480 | 5.02x | - |
-| Olympus-OIR | 2 | 2 | 882.6 | 230.9 | 3.70x | 202244 | 47120 | 3.73x | - |
+| Olympus-FluoView | 1 | 1 | 4940.8 | 335.0 | 14.75x | 176368 | 36160 | 4.88x | Focused TIFF-region fast-path rerun. |
+| Olympus-OIR | 2 | 2 | 4988.0 | 845.5 | 2.55x | 200940 | 46792 | 3.92x | Focused TIFF-region fast-path rerun; worst speedup is the companion OME-TIFF row. |
 | PNG | 2 | 2 | 394.2 | 4.4 | 85.99x | 86436 | 11520 | 7.47x | Complete-plane decodes; APNG is routed separately. |
 | PerkinElmer-Columbus | 1 | 1 | 40318.5 | 17335.4 | 2.33x | 1509724 | 34080 | 44.30x | XML-index benchmark with 3696 planes. |
 | PerkinElmer-Operetta | 2 | 2 | 616.1 | 28.9 | 16.80x | 94724 | 17172 | 5.49x | - |
 | SDT | 1 | 1 | 8751.9 | 465.3 | 18.81x | 670068 | 40336 | 16.61x | - |
 | SPC-FIFO | 1 | 1 | 940.0 | 132.4 | 7.10x | 144976 | 43200 | 3.36x | - |
 | SVS | 2 | 2 | 2088.2 | 276.0 | 5.45x | 211200 | 13196 | 16.01x | - |
-| ScanR | 1 | 0 | - | - | - | - | - | - | Missing `data/` TIFF planes in the local mirror, so Java benchmark cannot run. |
-| TIFF | 2 | 2 | 698.0 | 20.6 | 31.72x | 190516 | 10240 | 18.57x | - |
+| ScanR | 1 | 1 | 1229.9 | 503.9 | 2.44x | 188808 | 14720 | 12.83x | Focused smoke run in `bench/target/scanr-benchmark-smoke.md`; Java and Rust both read 357 planes. |
+| TIFF | 2 | 2 | 5920.4 | 29.3 | 201.81x | 193596 | 9280 | 19.93x | Focused TIFF-region fast-path rerun. |
 | Trestle | 2 | 2 | 1261.7 | 71.0 | 16.64x | 216484 | 11520 | 18.10x | - |
 | Vectra-QPTIFF | 2 | 2 | 1047.8 | 63.0 | 15.73x | 177832 | 12000 | 14.78x | - |
 | Zeiss-CZI | 2 | 2 | 793.8 | 14.2 | 54.51x | 134988 | 13784 | 9.77x | - |
+| Zeiss-LSM | 1 | 1 | 519.2 | 34.4 | 15.11x | 116740 | 9920 | 11.77x | Focused TIFF-region fast-path rerun on `testdata/lsm/colocsample1b.lsm`. |
 | gateway_tests | 2 | 2 | 697.8 | 17.2 | 40.48x | 196864 | 11840 | 8.00x | - |
 
 

@@ -416,7 +416,7 @@ impl FormatReader for ZeissLsmReader {
         // PREDICTOR=2 tag on IFDs whose compression is NOT LZW; the predictor
         // must only be honoured for LZW data. Force PREDICTOR=1 on every IFD
         // that is not LZW-compressed, after the inner reader has parsed the
-        // IFDs and before any pixel read (read_plane_bytes re-derives the
+        // IFDs and before any pixel read (get_samples re-derives the
         // predictor from the live IFD, so this mutation takes effect).
         let ifd_count = self.inner.ifd_count();
         for i in 0..ifd_count {

@@ -3974,6 +3974,7 @@ struct HcsAssembly {
     current_series: usize,
     tiff_reader: crate::tiff::TiffReader,
     tiff_loaded_path: Option<PathBuf>,
+    mask_12bit_pixels: bool,
 }
 
 impl HcsAssembly {
@@ -3984,6 +3985,7 @@ impl HcsAssembly {
             current_series: 0,
             tiff_reader: crate::tiff::TiffReader::new(),
             tiff_loaded_path: None,
+            mask_12bit_pixels: false,
         }
     }
 
@@ -4053,11 +4055,42 @@ impl HcsAssembly {
                     return Ok(vec![0u8; nbytes]);
                 };
                 if buf.len() == nbytes {
-                    return Ok(buf);
+                    let mut out = buf;
+                    if self.mask_12bit_pixels && bps == 2 {
+                        for px in out.chunks_exact_mut(2) {
+                            let value = if meta.is_little_endian {
+                                u16::from_le_bytes([px[0], px[1]]) & 0x0fff
+                            } else {
+                                u16::from_be_bytes([px[0], px[1]]) & 0x0fff
+                            };
+                            let bytes = if meta.is_little_endian {
+                                value.to_le_bytes()
+                            } else {
+                                value.to_be_bytes()
+                            };
+                            px.copy_from_slice(&bytes);
+                        }
+                    }
+                    return Ok(out);
                 }
                 let mut out = vec![0u8; nbytes];
                 let n = buf.len().min(nbytes);
                 out[..n].copy_from_slice(&buf[..n]);
+                if self.mask_12bit_pixels && bps == 2 {
+                    for px in out.chunks_exact_mut(2) {
+                        let value = if meta.is_little_endian {
+                            u16::from_le_bytes([px[0], px[1]]) & 0x0fff
+                        } else {
+                            u16::from_be_bytes([px[0], px[1]]) & 0x0fff
+                        };
+                        let bytes = if meta.is_little_endian {
+                            value.to_le_bytes()
+                        } else {
+                            value.to_be_bytes()
+                        };
+                        px.copy_from_slice(&bytes);
+                    }
+                }
                 return Ok(out);
             }
         }
@@ -4109,6 +4142,21 @@ impl HcsAssembly {
                 out[d..d + src_row].copy_from_slice(&region[s..s + src_row]);
             }
         }
+        if self.mask_12bit_pixels && bps == 2 {
+            for px in out.chunks_exact_mut(2) {
+                let value = if meta.is_little_endian {
+                    u16::from_le_bytes([px[0], px[1]]) & 0x0fff
+                } else {
+                    u16::from_be_bytes([px[0], px[1]]) & 0x0fff
+                };
+                let bytes = if meta.is_little_endian {
+                    value.to_le_bytes()
+                } else {
+                    value.to_be_bytes()
+                };
+                px.copy_from_slice(&bytes);
+            }
+        }
         Ok(out)
     }
 
@@ -4120,9 +4168,60 @@ impl HcsAssembly {
         w: u32,
         h: u32,
     ) -> Result<Vec<u8>> {
+        let meta = self.meta()?.clone();
+        if plane_index >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        let plane = self
+            .planes
+            .get(self.current_series)
+            .and_then(|p| p.get(plane_index as usize))
+            .cloned()
+            .unwrap_or_default();
+        let bps = meta.pixel_type.bytes_per_sample();
+        if plane.tiles.len() == 1 {
+            let t = &plane.tiles[0];
+            if t.dst_x == 0
+                && t.dst_y == 0
+                && t.src_x == 0
+                && t.src_y == 0
+                && t.src_w == 0
+                && t.src_h == 0
+            {
+                let region_bytes = w as usize * h as usize * bps;
+                if self.ensure_loaded(&t.filename).is_err() {
+                    return Ok(vec![0u8; region_bytes]);
+                }
+                let Ok(mut buf) = self.tiff_reader.open_bytes_region(t.file_index, x, y, w, h)
+                else {
+                    return Ok(vec![0u8; region_bytes]);
+                };
+                if buf.len() != region_bytes {
+                    let mut out = vec![0u8; region_bytes];
+                    let n = buf.len().min(region_bytes);
+                    out[..n].copy_from_slice(&buf[..n]);
+                    buf = out;
+                }
+                if self.mask_12bit_pixels && bps == 2 {
+                    for px in buf.chunks_exact_mut(2) {
+                        let value = if meta.is_little_endian {
+                            u16::from_le_bytes([px[0], px[1]]) & 0x0fff
+                        } else {
+                            u16::from_be_bytes([px[0], px[1]]) & 0x0fff
+                        };
+                        let bytes = if meta.is_little_endian {
+                            value.to_le_bytes()
+                        } else {
+                            value.to_be_bytes()
+                        };
+                        px.copy_from_slice(&bytes);
+                    }
+                }
+                return Ok(buf);
+            }
+        }
         let full = self.open_bytes(plane_index)?;
-        let meta = self.meta()?;
-        crop_full_plane("BD Pathway", &full, meta, 1, x, y, w, h)
+        crop_full_plane("BD Pathway", &full, &meta, 1, x, y, w, h)
     }
 
     fn validate(&self, format_name: &str) -> Result<()> {
@@ -7373,6 +7472,7 @@ mod scanr {
         let mut asm = HcsAssembly::new();
         asm.series = series;
         asm.planes = asm_planes;
+        asm.mask_12bit_pixels = true;
         Ok(asm)
     }
 
@@ -8578,6 +8678,37 @@ mod tests {
         bytes.push(pixel);
 
         std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn scanr_assembly_region_reads_tiff_crop_and_masks_12bit_pixels() {
+        let path = temp_path("scanr_masked_region.tif");
+        let meta = make_series_meta(
+            2,
+            1,
+            1,
+            1,
+            1,
+            PixelType::Uint16,
+            16,
+            true,
+            DimensionOrder::XYCTZ,
+            "ScanR mask fixture",
+        );
+        let mut pixels = Vec::new();
+        pixels.extend_from_slice(&0x1abcu16.to_le_bytes());
+        pixels.extend_from_slice(&0x1fedu16.to_le_bytes());
+        write_tiff(&path, &meta, &pixels);
+
+        let mut asm = assembly_with_plane(meta, PlaneRef::whole(path.clone(), 0));
+        asm.mask_12bit_pixels = true;
+
+        assert_eq!(
+            asm.open_bytes_region(0, 1, 0, 1, 1).unwrap(),
+            0x0fedu16.to_le_bytes()
+        );
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

@@ -1393,7 +1393,7 @@ impl TiffReader {
         w: u32,
         h: u32,
     ) -> Result<Vec<u8>> {
-        self.read_plane_bytes(ifd_index, x, y, w, h)
+        self.get_samples(ifd_index, x, y, w, h)
     }
 
     fn resolution_metadata(&self, level: usize) -> Result<Option<ImageMetadata>> {
@@ -1424,14 +1424,7 @@ impl TiffReader {
     }
 
     /// Read raw bytes for one plane from the file.
-    fn read_plane_bytes(
-        &mut self,
-        ifd_index: usize,
-        x: u32,
-        y: u32,
-        w: u32,
-        h: u32,
-    ) -> Result<Vec<u8>> {
+    fn get_samples(&mut self, ifd_index: usize, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
         let file = self.file.as_mut().ok_or(BioFormatsError::NotInitialized)?;
         let ifd = file
             .ifds
@@ -1449,13 +1442,13 @@ impl TiffReader {
         validate_region(&info, x, y, w, h)?;
 
         if info.is_tiled {
-            self.read_tiled_plane(&info, x, y, w, h, 0)
+            self.get_tiled_samples(&info, x, y, w, h, 0)
         } else {
-            self.read_stripped_plane(&info, x, y, w, h, 0)
+            self.get_stripped_samples(&info, x, y, w, h, 0)
         }
     }
 
-    fn read_stripped_plane(
+    fn get_stripped_samples(
         &mut self,
         info: &IfdInfo,
         x: u32,
@@ -1465,7 +1458,7 @@ impl TiffReader {
         _plane_byte_len: usize,
     ) -> Result<Vec<u8>> {
         if info.planar_config == 2 && info.samples_per_pixel > 1 {
-            return self.read_planar_stripped_plane(info, x, y, w, h);
+            return self.get_planar_stripped_samples(info, x, y, w, h);
         }
         let planarize_rgb = should_planarize_chunky_rgb(info, self.path.as_deref());
 
@@ -1509,6 +1502,185 @@ impl TiffReader {
             && (!info.rows_per_strip_present
                 || rows_per_strip == 0
                 || info.height % rows_per_strip != 0);
+
+        let file_len = file
+            .parser
+            .reader
+            .seek(SeekFrom::End(0))
+            .map_err(BioFormatsError::Io)?;
+        let mut contiguous_strips = info.width > 0 && info.planar_config == 1;
+        if contiguous_strips {
+            for i in 1..info.strip_offsets.len() {
+                let prev_end = info.strip_offsets[i - 1]
+                    .checked_add(info.strip_byte_counts[i - 1])
+                    .unwrap_or(u64::MAX);
+                if info.strip_offsets[i] != prev_end
+                    || info.strip_offsets[i]
+                        .checked_add(info.strip_byte_counts[i])
+                        .is_none_or(|end| end > file_len)
+                {
+                    contiguous_strips = false;
+                    break;
+                }
+            }
+        }
+
+        if (effective_spp == 1 || info.planar_config == 1)
+            && info.bits_per_sample % 8 == 0
+            && info.photometric != Photometric::MinIsWhite
+            && info.photometric != Photometric::Cmyk
+            && info.photometric != Photometric::YCbCr
+            && info.compression == Compression::None
+            && info.fill_order != 2
+            && !info.strip_offsets.is_empty()
+            && !info.strip_byte_counts.is_empty()
+            && info.strip_offsets[0]
+                .checked_add(info.strip_byte_counts[0])
+                .is_some_and(|end| end <= file_len)
+            && (info.strip_offsets.len() == 1 || contiguous_strips)
+        {
+            let mut strip_offsets = info.strip_offsets.as_slice();
+            let mut strip_byte_counts = info.strip_byte_counts.as_slice();
+            let single_offset;
+            let single_count;
+            let mut tile_length = rows_per_strip as u64;
+            if contiguous_strips {
+                single_offset = [info.strip_offsets[0]];
+                single_count = [info.strip_byte_counts[0]
+                    .checked_mul(info.strip_byte_counts.len() as u64)
+                    .ok_or_else(|| {
+                        BioFormatsError::Format("TIFF contiguous strip byte count overflows".into())
+                    })?];
+                strip_offsets = &single_offset;
+                strip_byte_counts = &single_count;
+                tile_length = info.height as u64;
+            }
+
+            let tile_width = info.width as u64;
+            let column = (x as u64) / tile_width;
+            let first_tile = ((y as u64) / tile_length)
+                .checked_add(column)
+                .and_then(|v| usize::try_from(v).ok())
+                .ok_or_else(|| {
+                    BioFormatsError::Format("TIFF first strip index overflows".into())
+                })?;
+            let mut last_tile = ((y as u64 + h as u64) / tile_length)
+                .checked_add(column)
+                .and_then(|v| usize::try_from(v).ok())
+                .ok_or_else(|| BioFormatsError::Format("TIFF last strip index overflows".into()))?;
+            last_tile = last_tile.min(strip_offsets.len() - 1);
+
+            let bytes = (info.bits_per_sample / 8) as usize;
+            let bpp =
+                checked_mul_usize(bytes, effective_spp as usize, "TIFF direct bytes per pixel")?;
+            let out_len = checked_mul_usize(
+                h as usize,
+                checked_mul_usize(w as usize, bpp, "TIFF direct output row")?,
+                "TIFF direct output",
+            )?;
+            let mut out = checked_vec_with_capacity(out_len, "TIFF direct output")?;
+            out.resize(out_len, 0);
+            let mut offset = 0usize;
+
+            for tile in first_tile..=last_tile {
+                let mut byte_count = *strip_byte_counts.get(tile).ok_or_else(|| {
+                    BioFormatsError::Format("TIFF direct strip byte count is missing".into())
+                })?;
+                if byte_count == (w as u64).saturating_mul(h as u64) && bytes_per_sample > 1 {
+                    byte_count = byte_count.saturating_mul(bytes_per_sample as u64);
+                }
+                let Some(&strip_offset) = strip_offsets.get(tile) else {
+                    continue;
+                };
+                if strip_offset >= file_len {
+                    continue;
+                }
+
+                if w as u64 == tile_width && h == info.height {
+                    let len = (out.len() - offset).min(byte_count as usize);
+                    file.parser
+                        .reader
+                        .seek(SeekFrom::Start(strip_offset))
+                        .map_err(BioFormatsError::Io)?;
+                    file.parser
+                        .reader
+                        .read_exact(&mut out[offset..offset + len])
+                        .map_err(BioFormatsError::Io)?;
+                    offset += len;
+                } else {
+                    let row_skip = (y as u64)
+                        .checked_mul(bpp as u64)
+                        .and_then(|v| v.checked_mul(tile_width))
+                        .ok_or_else(|| {
+                            BioFormatsError::Format("TIFF direct row skip overflows".into())
+                        })?;
+                    file.parser
+                        .reader
+                        .seek(SeekFrom::Start(strip_offset.saturating_add(row_skip)))
+                        .map_err(BioFormatsError::Io)?;
+                    for _ in 0..h {
+                        let x_skip = (x as u64).checked_mul(bpp as u64).ok_or_else(|| {
+                            BioFormatsError::Format("TIFF direct x skip overflows".into())
+                        })?;
+                        file.parser
+                            .reader
+                            .seek(SeekFrom::Current(i64::try_from(x_skip).map_err(|_| {
+                                BioFormatsError::Format("TIFF direct x skip overflows i64".into())
+                            })?))
+                            .map_err(BioFormatsError::Io)?;
+                        let row_len = (out.len() - offset).min(checked_mul_usize(
+                            w as usize,
+                            bpp,
+                            "TIFF direct row length",
+                        )?);
+                        if row_len == 0 {
+                            break;
+                        }
+                        file.parser
+                            .reader
+                            .read_exact(&mut out[offset..offset + row_len])
+                            .map_err(BioFormatsError::Io)?;
+                        offset += row_len;
+                        let skip = (bpp as u64)
+                            .checked_mul(
+                                tile_width.saturating_sub(x as u64).saturating_sub(w as u64),
+                            )
+                            .ok_or_else(|| {
+                                BioFormatsError::Format(
+                                    "TIFF direct row tail skip overflows".into(),
+                                )
+                            })?;
+                        let current = file
+                            .parser
+                            .reader
+                            .stream_position()
+                            .map_err(BioFormatsError::Io)?;
+                        if current.saturating_add(skip) < file_len {
+                            file.parser
+                                .reader
+                                .seek(SeekFrom::Current(i64::try_from(skip).map_err(|_| {
+                                    BioFormatsError::Format(
+                                        "TIFF direct row tail skip overflows i64".into(),
+                                    )
+                                })?))
+                                .map_err(BioFormatsError::Io)?;
+                        }
+                    }
+                }
+            }
+
+            if effective_spp > 1 {
+                out = split_channels(
+                    &out,
+                    w,
+                    h,
+                    effective_spp,
+                    bytes_per_sample,
+                    "TIFF direct RGB output",
+                )?;
+            }
+            return Ok(out);
+        }
 
         // We assemble the full plane row-by-row, then crop to [x, y, w, h].
         let requested_rows_bytes = checked_mul_usize(h as usize, row_bytes, "TIFF crop row bytes")?;
@@ -1600,7 +1772,7 @@ impl TiffReader {
                                 )
                             })?);
                         }
-                        return finish_chunky_decoded_samples(
+                        return finish_get_samples(
                             out,
                             w,
                             h,
@@ -1650,7 +1822,7 @@ impl TiffReader {
             let offset = info.strip_offsets[0];
             let byte_count = info.strip_byte_counts[0] as usize;
             let mut compressed =
-                read_tiff_block_or_zero(&mut file.parser.reader, offset, byte_count)?
+                get_tile_bytes_or_zero(&mut file.parser.reader, offset, byte_count)?
                     .unwrap_or_default();
             apply_fill_order(&mut compressed, info.fill_order, info.compression);
             let merged = match info.jpeg_tables.as_deref() {
@@ -1717,7 +1889,7 @@ impl TiffReader {
                                 )
                             })?);
                         }
-                        return finish_chunky_decoded_samples(
+                        return finish_get_samples(
                             out,
                             w,
                             h,
@@ -1808,7 +1980,7 @@ impl TiffReader {
             };
 
             let strip_data = if let Some(mut compressed) =
-                read_tiff_block_or_zero(&mut file.parser.reader, offset, byte_count)?
+                get_tile_bytes_or_zero(&mut file.parser.reader, offset, byte_count)?
             {
                 apply_fill_order(&mut compressed, info.fill_order, info.compression);
                 let mut decoded = decompress(
@@ -1937,7 +2109,7 @@ impl TiffReader {
         }
 
         if subbyte_samples {
-            let unpacked = unpack_subbyte_samples(
+            let unpacked = unpack_bytes_subbyte(
                 &plane_rows,
                 info.width,
                 h,
@@ -1952,7 +2124,7 @@ impl TiffReader {
                 file.parser.little_endian,
             );
             if planarize_rgb {
-                out = planarize_chunky_samples(&out, w, h, effective_spp, 1, "TIFF RGB output")?;
+                out = split_channels(&out, w, h, effective_spp, 1, "TIFF RGB output")?;
             }
             return Ok(out);
         }
@@ -1962,7 +2134,7 @@ impl TiffReader {
             // TiffParser.unpackBytes reads each sample MSB-first via readBits and
             // writes it as bytes_per_sample little/big-endian bytes, with per-row
             // skipBits padding. Unpack to byte-aligned samples so we can crop columns.
-            let unpacked = unpack_packed_samples(
+            let unpacked = unpack_bytes_packed(
                 &plane_rows,
                 info.width,
                 h,
@@ -1985,7 +2157,7 @@ impl TiffReader {
                 file.parser.little_endian,
             );
             if planarize_rgb {
-                out = planarize_chunky_samples(
+                out = split_channels(
                     &out,
                     w,
                     h,
@@ -2030,7 +2202,7 @@ impl TiffReader {
             out
         };
         if planarize_rgb {
-            out = planarize_chunky_samples(
+            out = split_channels(
                 &out,
                 w,
                 h,
@@ -2042,7 +2214,7 @@ impl TiffReader {
         Ok(out)
     }
 
-    fn read_planar_stripped_plane(
+    fn get_planar_stripped_samples(
         &mut self,
         info: &IfdInfo,
         x: u32,
@@ -2135,7 +2307,7 @@ impl TiffReader {
                     "TIFF strip byte count",
                 )?;
                 let strip_data = if let Some(mut compressed) =
-                    read_tiff_block_or_zero(&mut file.parser.reader, offset, byte_count)?
+                    get_tile_bytes_or_zero(&mut file.parser.reader, offset, byte_count)?
                 {
                     apply_fill_order(&mut compressed, info.fill_order, info.compression);
                     let mut decoded = decompress(
@@ -2184,7 +2356,7 @@ impl TiffReader {
                 // then apply photometric inversion and crop, matching Java's
                 // per-sample unpacking in TiffParser.unpackBytes.
                 let mut unpacked =
-                    unpack_subbyte_samples(&channel_rows, info.width, h, 1, info.bits_per_sample);
+                    unpack_bytes_subbyte(&channel_rows, info.width, h, 1, info.bits_per_sample);
                 apply_photometric(
                     &mut unpacked,
                     info.photometric,
@@ -2197,7 +2369,7 @@ impl TiffReader {
             }
 
             if packed_samples {
-                let mut unpacked = unpack_packed_samples(
+                let mut unpacked = unpack_bytes_packed(
                     &channel_rows,
                     info.width,
                     h,
@@ -2275,7 +2447,7 @@ impl TiffReader {
         Ok(out)
     }
 
-    fn read_tiled_plane(
+    fn get_tiled_samples(
         &mut self,
         info: &IfdInfo,
         x: u32,
@@ -2285,7 +2457,7 @@ impl TiffReader {
         _plane_byte_len: usize,
     ) -> Result<Vec<u8>> {
         if info.planar_config == 2 && info.samples_per_pixel > 1 {
-            return self.read_planar_tiled_plane(info, x, y, w, h);
+            return self.get_planar_tiled_samples(info, x, y, w, h);
         }
 
         // JPEG/JPEG-XR-compressed YCbCr tiles decode to chunky RGB inside the
@@ -2297,7 +2469,7 @@ impl TiffReader {
                     "Only 8-bit chunky non-JPEG TIFF YCbCr is supported".into(),
                 ));
             }
-            return self.read_tiled_ycbcr_plane(info, x, y, w, h);
+            return self.get_ycbcr_tiled_samples(info, x, y, w, h);
         }
         let planarize_rgb = should_planarize_chunky_rgb(info, self.path.as_deref());
 
@@ -2334,7 +2506,7 @@ impl TiffReader {
                 let offset = info.tile_offsets[tile_idx];
                 let byte_count = info.tile_byte_counts[tile_idx] as usize;
                 let mut tile_data = if let Some(mut compressed) =
-                    read_tiff_block_or_zero(&mut file.parser.reader, offset, byte_count)?
+                    get_tile_bytes_or_zero(&mut file.parser.reader, offset, byte_count)?
                 {
                     apply_fill_order(&mut compressed, info.fill_order, info.compression);
                     let mut decoded = decompress(
@@ -2357,7 +2529,7 @@ impl TiffReader {
                     vec![0; raw_tile_data_bytes]
                 };
                 if subbyte {
-                    tile_data = unpack_subbyte_samples(
+                    tile_data = unpack_bytes_subbyte(
                         &tile_data,
                         info.tile_width,
                         info.tile_height,
@@ -2365,7 +2537,7 @@ impl TiffReader {
                         info.bits_per_sample,
                     );
                 } else if packed_samples {
-                    tile_data = unpack_packed_samples(
+                    tile_data = unpack_bytes_packed(
                         &tile_data,
                         info.tile_width,
                         info.tile_height,
@@ -2410,7 +2582,7 @@ impl TiffReader {
         }
 
         if planarize_rgb {
-            planarize_chunky_samples(
+            split_channels(
                 &out,
                 w,
                 h,
@@ -2426,7 +2598,7 @@ impl TiffReader {
     /// Read a tiled, subsampled YCbCr plane (chunky, 8-bit, non-JPEG), decoding
     /// each tile to planar RGB and assembling planar R, G, B output. Mirrors the
     /// YCbCr handling in Java's TiffParser.getTile + unpackBytes.
-    fn read_tiled_ycbcr_plane(
+    fn get_ycbcr_tiled_samples(
         &mut self,
         info: &IfdInfo,
         x: u32,
@@ -2460,7 +2632,7 @@ impl TiffReader {
                 let offset = info.tile_offsets[tile_idx];
                 let byte_count = info.tile_byte_counts[tile_idx] as usize;
                 let Some(mut compressed) =
-                    read_tiff_block_or_zero(&mut file.parser.reader, offset, byte_count)?
+                    get_tile_bytes_or_zero(&mut file.parser.reader, offset, byte_count)?
                 else {
                     continue;
                 };
@@ -2526,7 +2698,7 @@ impl TiffReader {
         Ok(out)
     }
 
-    fn read_planar_tiled_plane(
+    fn get_planar_tiled_samples(
         &mut self,
         info: &IfdInfo,
         x: u32,
@@ -2573,7 +2745,7 @@ impl TiffReader {
                     let offset = info.tile_offsets[tile_idx];
                     let byte_count = info.tile_byte_counts[tile_idx] as usize;
                     let mut tile_data = if let Some(mut compressed) =
-                        read_tiff_block_or_zero(&mut file.parser.reader, offset, byte_count)?
+                        get_tile_bytes_or_zero(&mut file.parser.reader, offset, byte_count)?
                     {
                         apply_fill_order(&mut compressed, info.fill_order, info.compression);
                         let mut decoded = decompress(
@@ -2597,7 +2769,7 @@ impl TiffReader {
                     };
                     if subbyte {
                         // Unpack the packed bits of this tile to one byte per sample.
-                        tile_data = unpack_subbyte_samples(
+                        tile_data = unpack_bytes_subbyte(
                             &tile_data,
                             info.tile_width,
                             info.tile_height,
@@ -2605,7 +2777,7 @@ impl TiffReader {
                             info.bits_per_sample,
                         );
                     } else if packed_samples {
-                        tile_data = unpack_packed_samples(
+                        tile_data = unpack_bytes_packed(
                             &tile_data,
                             info.tile_width,
                             info.tile_height,
@@ -2716,7 +2888,7 @@ fn should_planarize_chunky_rgb(info: &IfdInfo, _path: Option<&Path>) -> bool {
     true
 }
 
-fn finish_chunky_decoded_samples(
+fn finish_get_samples(
     data: Vec<u8>,
     width: u32,
     height: u32,
@@ -2726,7 +2898,7 @@ fn finish_chunky_decoded_samples(
     context: &str,
 ) -> Result<Vec<u8>> {
     if planarize {
-        planarize_chunky_samples(
+        split_channels(
             &data,
             width,
             height,
@@ -2739,7 +2911,7 @@ fn finish_chunky_decoded_samples(
     }
 }
 
-fn planarize_chunky_samples(
+fn split_channels(
     data: &[u8],
     width: u32,
     height: u32,
@@ -2867,7 +3039,7 @@ fn synthesize_byte_counts(
     Ok(vec![count; block_count])
 }
 
-fn read_tiff_block_or_zero<R: Read + Seek>(
+fn get_tile_bytes_or_zero<R: Read + Seek>(
     reader: &mut R,
     offset: u64,
     byte_count: usize,
@@ -3914,7 +4086,7 @@ fn checked_strip_start_row(strip_idx: usize, rows_per_strip: u32) -> Result<u32>
         .map_err(|_| BioFormatsError::Format("TIFF strip row offset overflows u32".into()))
 }
 
-fn unpack_subbyte_samples(
+fn unpack_bytes_subbyte(
     data: &[u8],
     width: u32,
     height: u32,
@@ -3945,7 +4117,7 @@ fn unpack_subbyte_samples(
 /// `ceil(bits_per_sample/8)` little/big-endian bytes. Mirrors the `noDiv8` path
 /// of Java's TiffParser.unpackBytes, including the per-row skipBits padding (rows
 /// are byte-aligned because each row occupies `packed_row_bytes` bytes).
-fn unpack_packed_samples(
+fn unpack_bytes_packed(
     data: &[u8],
     width: u32,
     height: u32,
@@ -4446,7 +4618,7 @@ impl crate::common::reader::FormatReader for TiffReader {
         let ifd = &file.ifds[ifd_index];
         let w = ifd.image_width().unwrap_or(0);
         let h = ifd.image_length().unwrap_or(0);
-        self.read_plane_bytes(ifd_index, 0, 0, w, h)
+        self.get_samples(ifd_index, 0, 0, w, h)
     }
 
     fn open_bytes_region(
@@ -4461,7 +4633,7 @@ impl crate::common::reader::FormatReader for TiffReader {
             return self.read_external_plane(&ext, x, y, w, h);
         }
         let ifd_index = self.resolve_ifd_index(plane_index)?;
-        self.read_plane_bytes(ifd_index, x, y, w, h)
+        self.get_samples(ifd_index, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -4486,7 +4658,7 @@ impl crate::common::reader::FormatReader for TiffReader {
         let th = h.min(256);
         let tx = (w - tw) / 2;
         let ty = (h - th) / 2;
-        self.read_plane_bytes(ifd_index, tx, ty, tw, th)
+        self.get_samples(ifd_index, tx, ty, tw, th)
     }
 
     fn resolution_count(&self) -> usize {
@@ -4958,6 +5130,42 @@ mod tests {
         }
 
         data
+    }
+
+    #[test]
+    fn uncompressed_stripped_region_matches_minimal_tiff_reader_direct_branch() {
+        let pixels = (0u8..18).collect::<Vec<_>>();
+        let path = std::env::temp_dir().join(format!(
+            "bioformats-rs-direct-stripped-region-{}.tif",
+            std::process::id()
+        ));
+        let specs = [TinyIfdSpec {
+            width: 3,
+            height: 2,
+            bits_per_sample: 8,
+            samples_per_pixel: 3,
+            photometric: 2,
+            new_subfile_type: None,
+            description: None,
+            color_map: None,
+            pixels,
+        }];
+        fs::write(&path, synthetic_tiff_chain(&specs)).unwrap();
+
+        let mut reader = TiffReader::new();
+        reader.set_id(&path).unwrap();
+        let region = reader.open_bytes_region(0, 1, 0, 2, 2).unwrap();
+
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(
+            region,
+            vec![
+                3, 6, 12, 15, // red plane
+                4, 7, 13, 16, // green plane
+                5, 8, 14, 17, // blue plane
+            ]
+        );
     }
 
     /// Build a Canon-style EXIF maker-note blob carrying a rational
@@ -5563,11 +5771,11 @@ mod tests {
     fn restart_window_cropped_band_finish_planarizes_samples() {
         let chunky = vec![1u8, 10, 100, 2, 20, 110];
         assert_eq!(
-            finish_chunky_decoded_samples(chunky.clone(), 2, 1, 3, 1, true, "test").unwrap(),
+            finish_get_samples(chunky.clone(), 2, 1, 3, 1, true, "test").unwrap(),
             vec![1, 2, 10, 20, 100, 110]
         );
         assert_eq!(
-            finish_chunky_decoded_samples(chunky.clone(), 2, 1, 3, 1, false, "test").unwrap(),
+            finish_get_samples(chunky.clone(), 2, 1, 3, 1, false, "test").unwrap(),
             chunky
         );
     }
