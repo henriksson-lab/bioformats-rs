@@ -393,9 +393,7 @@ fn terminal_text_companion_error(path: &Path, header: &[u8]) -> Option<BioFormat
                 || trimmed.contains("light_source")
                 || trimmed.contains("object") =>
         {
-            Some(BioFormatsError::UnsupportedFormat(
-                "POV-Ray .pov scene source is not a DF3 density grid image; only .df3-style voxel grids are readable".into(),
-            ))
+            Some(BioFormatsError::UnsupportedFormat(path.display().to_string()))
         }
         _ => None,
     }
@@ -1227,6 +1225,14 @@ mod tests {
         std::fs::write(path, bytes).unwrap();
     }
 
+    fn write_jpeg(path: &PathBuf, width: u32, height: u32, pixels: &[u8]) {
+        let mut bytes = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new(&mut bytes)
+            .encode(pixels, width, height, image::ExtendedColorType::Rgb8)
+            .unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+
     fn write_dicom(path: &PathBuf, width: u32, height: u32) {
         let meta = ImageMetadata {
             size_x: width,
@@ -1245,6 +1251,48 @@ mod tests {
 
     fn push_i32(buf: &mut Vec<u8>, value: i32) {
         buf.extend_from_slice(&value.to_le_bytes());
+    }
+
+    #[test]
+    fn jpeg_magic_wins_over_misleading_dib_suffix() {
+        let path = temp_path("misleading.dib");
+        write_jpeg(
+            &path,
+            2,
+            2,
+            &[255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255],
+        );
+
+        let mut reader = ImageReader::open(&path).expect("JPEG magic should dispatch to JPEG");
+        let meta = reader.metadata();
+        assert_eq!(meta.size_x, 2);
+        assert_eq!(meta.size_y, 2);
+        assert_eq!(meta.size_c, 3);
+        assert!(meta.is_rgb);
+        assert_eq!(reader.open_bytes(0).unwrap().len(), 12);
+
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn pov_scene_source_is_not_claimed_as_df3() {
+        let path = temp_path("scene.pov");
+        std::fs::write(
+            &path,
+            b"// PoVRay 3.7 Scene File\n#version 3.7;\ncamera { location <0,0,-1> }\n",
+        )
+        .unwrap();
+
+        let err = match ImageReader::open(&path) {
+            Ok(_) => panic!("POV scene source unexpectedly opened"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err, BioFormatsError::UnsupportedFormat(ref message) if message.contains("scene.pov")),
+            "{err:?}"
+        );
+
+        std::fs::remove_file(path).ok();
     }
 
     fn put_i32(buf: &mut [u8], offset: usize, value: i32) {

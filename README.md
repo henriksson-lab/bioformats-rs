@@ -254,7 +254,7 @@ so they are not rated here — see
 | NIfTI-1 / Analyze 7.5 | `.nii` `.nii.gz` `.hdr` `.img` | ✅ | Single/paired/gz, color datatypes |
 | ICS / ICS2 | `.ics` | ✅ | gzip, endianness rules, dim ordering |
 | Siemens Inveon | `.hdr` (+`.img`) | ✅ | All data-type codes + endianness |
-| POV-Ray DF3 | `.pov` `.df3` | ✅ | Raw voxel grid |
+| POV-Ray DF3 | `.df3` | ✅ | Raw voxel grid |
 | SBIG astronomy | `.fts` | ✅ | FITS-based |
 | FITS | `.fits` `.fit` `.fts` | ✅ | Primary HDU, big-endian, no BZERO/BSCALE (matches Java) |
 | NRRD | `.nrrd` `.nhdr` | ✅ | raw/gzip/ascii (Java has no bzip2 either) |

@@ -14045,7 +14045,7 @@ impl FormatWriter for ApngWriter {
 // ---------------------------------------------------------------------------
 // 11. POV-Ray density grid (DF3)
 // ---------------------------------------------------------------------------
-/// POV-Ray density grid reader (`.pov`, `.df3`).
+/// POV-Ray density grid reader (`.df3`).
 ///
 /// DF3 format: 6-byte header (3x uint16 BE: x, y, z dimensions) followed
 /// by raw uint8 voxel data.
@@ -14077,7 +14077,7 @@ impl FormatReader for PovrayReader {
             .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
-        matches!(ext.as_deref(), Some("pov") | Some("df3"))
+        matches!(ext.as_deref(), Some("df3"))
     }
 
     fn is_this_type_by_bytes(&self, _header: &[u8]) -> bool {

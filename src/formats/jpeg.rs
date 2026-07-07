@@ -30,7 +30,9 @@ impl Default for JpegReader {
 
 fn load_jpeg(path: &Path) -> Result<(ImageMetadata, Vec<u8>)> {
     use image::GenericImageView;
-    let img = image::open(path).map_err(|e| BioFormatsError::Format(e.to_string()))?;
+    let bytes = std::fs::read(path).map_err(BioFormatsError::Io)?;
+    let img = image::load_from_memory_with_format(&bytes, image::ImageFormat::Jpeg)
+        .map_err(|e| BioFormatsError::Format(e.to_string()))?;
     let (w, h) = img.dimensions();
     let is_rgb = img.color().channel_count() > 1;
     let (size_c, planar) = if is_rgb {
