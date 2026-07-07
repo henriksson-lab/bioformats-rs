@@ -155,8 +155,8 @@ so they are not rated here — see
 | GIF | `.gif` | ✅ | |
 | WebP / OpenEXR / HDR / DDS / Farbfeld / PNM | `.webp` `.exr` `.hdr` `.dds` `.ff` `.pnm` `.pgm` `.ppm` `.pbm` `.pfm` | ✅ | Some entries are Rust-only additions via `image`. |
 | JPEG 2000 / JPX | `.jp2` `.j2k` `.j2c` `.jpc` `.jpx` | ✅ | |
-| EPS / PostScript | `.eps` `.epsi` `.ps` | ✅ | No vector interpreter, matching Java. |
-| Photoshop PSD/PSB | `.psd` `.psb` | ✅ | No per-layer extraction, matching Java. |
+| EPS / PostScript | `.eps` `.epsi` `.ps` | ✅ | |
+| Photoshop PSD/PSB | `.psd` `.psb` | ✅ | |
 | Khoros VIFF | `.xv` `.viff` | ✅ | |
 | Apple PICT | `.pict` `.pct` | ✅ | |
 | ZIP container | `.zip` | ✅ | |
@@ -172,7 +172,7 @@ so they are not rated here — see
 | Format | Extensions | Status | Rust-specific notes |
 |--------|-----------|:------:|-------|
 | Zeiss ZVI | `.zvi` | ✅ | |
-| Zeiss XRM/TXRM | `.xrm` `.txrm` `.txm` | ✅ | Java reads uncompressed only too. |
+| Zeiss XRM/TXRM | `.xrm` `.txrm` `.txm` | ✅ | |
 | OME-XML | `.ome` | ✅ | |
 | Zeiss LSM | `.lsm` | ✅ | |
 | Olympus FV1000 OIF/OIB | `.oif` `.oib` | ✅ | |
@@ -232,10 +232,10 @@ so they are not rated here — see
 | PCO-RAW | `.pcoraw` `.rec` | ✅ | `.rec` companion metadata is optional. |
 | Openlab Raw | `.raw` | ✅ | |
 | SM-Camera | `.smc` | ✅ | |
-| Andor SIF | `.sif` | ✅ | Java has no v3 XML-footer path. |
-| Princeton SPE | `.spe` | ✅ | Java keeps binary dimensions; Rust matches that. |
+| Andor SIF | `.sif` | ✅ | |
+| Princeton SPE | `.spe` | ✅ | |
 | Gatan DM2 | `.dm2` | ✅ | |
-| Lab Imaging LIM | `.lim` | ✅ | Java also rejects compressed LIM. |
+| Lab Imaging LIM | `.lim` | ✅ | |
 | Hasselblad Imacon / Image-Pro IPW | `.fff` `.ipw` | ✅ | |
 | Hamamatsu DCIMG | `.dcimg` | ✅ | v0 legacy fallback is Rust-only extra. |
 | TillVision | `.vws` `.pst` | ✅ | |
@@ -253,10 +253,10 @@ so they are not rated here — see
 | Siemens Inveon | `.hdr` (+`.img`) | ✅ | |
 | POV-Ray DF3 | `.df3` | ✅ | |
 | SBIG astronomy | `.fts` | ✅ | |
-| FITS | `.fits` `.fit` `.fts` | ✅ | No BZERO/BSCALE, matching Java. |
-| NRRD | `.nrrd` `.nhdr` | ✅ | Java has no bzip2 either. |
+| FITS | `.fits` `.fit` `.fts` | ✅ | |
+| NRRD | `.nrrd` `.nhdr` | ✅ | |
 | DICOM | `.dcm` `.dicom` `.dic` | ✅ | |
-| ECAT7 PET | `.v` | ✅ | Java supports only data type 6 too. |
+| ECAT7 PET | `.v` | ✅ | |
 | Varian FDF | `.fdf` | ✅ | |
 | Molecular Dynamics GEL | `.gel` | ✅ | |
 | Kodak BIP | `.bip` | ✅ | |
@@ -312,22 +312,20 @@ metadata.
 
 These readers have **no counterpart in Bio-Formats** — they are *added code*,
 written for this crate (or ported from a separate project), **not translations**
-of a Bio-Formats reader. They read real formats and are kept as documented
-extensions rather than removed. They are listed here, separately from the
-per-reader translation-status tables above, because there is no Java reader to be
-faithful to. Where Bio-Formats *does* have a reader for a similar-but-different
-format (so the name collides), that is noted.
+of a Bio-Formats reader. They are listed separately because there is no Java
+reader to be faithful to; confidence comes from local synthetic tests, optional
+real fixtures, or the wrapped upstream library.
 
-| Reader | Extensions | Note |
-|--------|-----------|------|
-| MetaImage (ITK) | `.mha` `.mhd` | ITK/MetaIO volume; not a Bio-Formats format. |
-| OME-Zarr / NGFF | `.zarr` | Ported from the separate `ome/ZarrReader`, not core Bio-Formats |
-| OpenSlide | `.mrxs` `.vms` `.bif` | Optional `openslide` feature; wraps the OpenSlide library; multi-resolution |
-| SimFCS | `.b64` `.r64` `.i64` | Globals SimFCS raw FLIM frames. |
-| Norpix StreamPix | `.seq` | Bio-Formats' `SEQReader` is the unrelated Image-Pro Sequence reader. |
-| Bruker MicroCT | `.ctf` | Bio-Formats' `MicroCTReader` reads `.vff`; that translated reader is separate. |
-| PCO B16 | `.b16` | Raw uint16 PCO camera files; Rust-only extra separate from Java PCORAWReader |
-| PicoQuant PTU/PHU | `.ptu` `.phu` `.pqres` | Rust-only; PicoHarp reconstruction is fixture-gated by `BIOFORMATS_RS_PICOQUANT_FIXTURE`. |
+| Reader | Extensions | Validation | Note |
+|--------|-----------|------------|------|
+| MetaImage (ITK) | `.mha` `.mhd` | Synthetic round-trip plus optional real fixture. | ITK/MetaIO volume. |
+| OME-Zarr / NGFF | `.zarr` | Synthetic NGFF/plain-Zarr tests. | Ported from the separate `ome/ZarrReader`. |
+| OpenSlide | `.mrxs` `.vms` `.bif` | Covered by OpenSlide and optional local feature tests. | Wraps the OpenSlide library. |
+| SimFCS | `.b64` `.r64` `.i64` | Synthetic raw-frame tests. | Globals SimFCS raw FLIM frames. |
+| Norpix StreamPix | `.seq` | Synthetic header, timestamp, and pixel tests. | Bio-Formats' `SEQReader` is unrelated Image-Pro Sequence. |
+| Bruker MicroCT | `.ctf` | Needs a real fixture before claiming support. | Bio-Formats' translated MicroCT reader is the separate `.vff` reader. |
+| PCO B16 | `.b16` | Synthetic header and pixel tests. | Raw uint16 PCO camera files. |
+| PicoQuant PTU/PHU | `.ptu` `.phu` `.pqres` | Synthetic metadata/reconstruction tests plus optional real fixture. | Set `BIOFORMATS_RS_PICOQUANT_FIXTURE` for local PTU/PQRes coverage. |
 
 ## API overview
 

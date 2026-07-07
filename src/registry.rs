@@ -1018,6 +1018,9 @@ fn tiff_first_ifd_matches_dng(path: &Path) -> bool {
     let Some(ifd) = tiff_first_ifd(path) else {
         return false;
     };
+    if ifd.get_u16(crate::tiff::ifd::tag::PHOTOMETRIC_INTERPRETATION) == Some(32803) {
+        return true;
+    }
     let has_eps_tag = ifd.get(37398).is_some() || ifd.get(37500).is_some();
     let make = ifd.get_str(271);
     let model = ifd.get_str(272);
@@ -1536,16 +1539,15 @@ mod tests {
     #[test]
     fn dng_tif_dispatch_runs_before_generic_tiff_like_java() {
         let path = temp_path("canon_dng_as_tif.tif");
-        write_minimal_tiff_with_extra_tags(
-            &path,
-            &[
-                (262, 3, &32803u16.to_le_bytes()),
-                (271, 2, b"Canon\0"),
-                (305, 2, b"Canon Digital Camera\0"),
-                (33422, 3, &[0, 0, 1, 0, 1, 0, 2, 0]),
-                (37398, 3, &1u16.to_le_bytes()),
-            ],
-        );
+        write_minimal_dng_cfa_tiff(&path);
+
+        assert!(super::tiff_first_ifd_matches_dng(&path));
+        let mut direct = crate::formats::extended::DngReader::new();
+        direct.set_id(&path).expect("direct DNG reader failed");
+        assert!(matches!(
+            direct.metadata().series_metadata.get("format"),
+            Some(MetadataValue::String(value)) if value == "DNG"
+        ));
 
         let reader = ImageReader::open(&path).expect("DNG TIFF dispatch failed");
 
@@ -2860,6 +2862,47 @@ mod tests {
         bytes.extend_from_slice(&0u32.to_le_bytes());
         bytes.extend_from_slice(&extra_data);
         bytes.push(7);
+
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn write_minimal_dng_cfa_tiff(path: &PathBuf) {
+        let make = b"Canon\0";
+        let software = b"Canon Digital Camera\0";
+        let ifd_entry_count = 12u32;
+        let ifd_start = 8u32;
+        let make_offset = ifd_start + 2 + ifd_entry_count * 12 + 4;
+        let software_offset = make_offset + make.len() as u32;
+        let pixel_start = software_offset + software.len() as u32;
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"II");
+        bytes.extend_from_slice(&42u16.to_le_bytes());
+        bytes.extend_from_slice(&ifd_start.to_le_bytes());
+
+        let entries = [
+            tiff_entry(256, 4, 1, 2),                // ImageWidth
+            tiff_entry(257, 4, 1, 2),                // ImageLength
+            tiff_entry(258, 3, 1, 8),                // BitsPerSample
+            tiff_entry(259, 3, 1, 1),                // Compression
+            tiff_entry(262, 3, 1, 32803),            // PhotometricInterpretation = CFA
+            tiff_entry(273, 4, 1, pixel_start),      // StripOffsets
+            tiff_entry(277, 3, 1, 1),                // SamplesPerPixel
+            tiff_entry(278, 4, 1, 2),                // RowsPerStrip
+            tiff_entry(279, 4, 1, 4),                // StripByteCounts
+            tiff_entry(284, 3, 1, 1),                // PlanarConfiguration
+            tiff_entry(271, 2, make.len() as u32, make_offset),
+            tiff_entry(305, 2, software.len() as u32, software_offset),
+        ];
+
+        bytes.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        for entry in entries {
+            bytes.extend_from_slice(&entry);
+        }
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(make);
+        bytes.extend_from_slice(software);
+        bytes.extend_from_slice(&[1, 2, 3, 4]);
 
         std::fs::write(path, bytes).unwrap();
     }

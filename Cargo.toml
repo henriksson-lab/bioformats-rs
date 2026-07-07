@@ -82,6 +82,18 @@ path = "tests/java_writer_parity_test.rs"
 name = "new_features_test"
 path = "tests/new_features_test.rs"
 
+[[test]]
+name = "non_upstream_readers_test"
+path = "tests/non_upstream_readers_test.rs"
+
+[[test]]
+name = "zarr_test"
+path = "tests/zarr_test.rs"
+
+[[test]]
+name = "picoquant_ptu_metadata_test"
+path = "tests/picoquant_ptu_metadata_test.rs"
+
 [[bench]]
 name = "read_ome_tiff"
 harness = false

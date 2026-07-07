@@ -6936,6 +6936,7 @@ impl FormatReader for HamamatsuVmsReader {
                 ome.instruments.extend(image_ome.instruments);
             }
             ome.images.extend(image_ome.images);
+            let _ = ome.add_original_metadata_annotations(meta, image_index);
         }
 
         Some(ome)
@@ -7425,7 +7426,7 @@ mod hamamatsu_vms_tests {
         // Series 1: macro name, physical sizes, but no instrument/objective.
         reader.set_series(1).unwrap();
         let ome1 = reader.ome_metadata().unwrap();
-        let image1 = &ome1.images[0];
+        let image1 = &ome1.images[1];
         assert_eq!(
             image1.name.as_deref(),
             Some(format!("{base_name} macro").as_str())
@@ -7433,18 +7434,19 @@ mod hamamatsu_vms_tests {
         assert!((image1.physical_size_x.unwrap() - 4.0).abs() < 0.0001);
         assert!((image1.physical_size_y.unwrap() - 2.0).abs() < 0.0001);
         assert!(image1.instrument_ref.is_none());
-        assert!(ome1.instruments.is_empty());
+        assert_eq!(ome1.instruments.len(), 1);
 
         // Series 2: map name, no physical sizes, no instrument.
         reader.set_series(2).unwrap();
         let ome2 = reader.ome_metadata().unwrap();
-        let image2 = &ome2.images[0];
+        let image2 = &ome2.images[2];
         assert_eq!(
             image2.name.as_deref(),
             Some(format!("{base_name} map").as_str())
         );
         assert!(image2.physical_size_x.is_none());
-        assert!(ome2.instruments.is_empty());
+        assert!(image2.instrument_ref.is_none());
+        assert_eq!(ome2.instruments.len(), 1);
 
         // MINIMUM metadata level suppresses physical sizes and the objective,
         // but the image name is still set (matching Java initFile).

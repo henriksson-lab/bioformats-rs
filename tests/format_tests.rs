@@ -9157,7 +9157,10 @@ fn ics1_requires_same_stem_ids_companion_like_java() {
     std::fs::write(&ics, header).unwrap();
     std::fs::write(&mismatched_companion, [9, 9, 9, 9]).unwrap();
 
-    let err = ImageReader::open(&ics).unwrap_err();
+    let err = match ImageReader::open(&ics) {
+        Ok(_) => panic!("mismatched IDS companion unexpectedly opened"),
+        Err(err) => err,
+    };
     assert!(
         err.to_string().contains("IDS file not found"),
         "unexpected error: {err}"

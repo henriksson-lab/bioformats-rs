@@ -4956,7 +4956,7 @@ mod tests {
     }
 
     #[test]
-    fn stripped_reader_rejects_huge_row_without_wrapping_or_allocating() {
+    fn stripped_reader_crops_huge_row_without_wrapping_or_allocating() {
         let path = std::env::temp_dir().join(format!(
             "bioformats-rs-huge-stripped-row-{}.tif",
             std::process::id()
@@ -4965,14 +4965,11 @@ mod tests {
 
         let mut reader = TiffReader::new();
         reader.set_id(&path).unwrap();
-        let err = reader.open_bytes_region(0, 0, 0, 1, 1).unwrap_err();
+        let crop = reader.open_bytes_region(0, 0, 0, 1, 1).unwrap();
 
         let _ = fs::remove_file(&path);
 
-        assert!(
-            matches!(err, BioFormatsError::Format(ref message) if message.contains("too large") || message.contains("overflows")),
-            "unexpected error: {err:?}"
-        );
+        assert_eq!(crop, vec![1, 2, 3, 4]);
     }
 
     #[test]
