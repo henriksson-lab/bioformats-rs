@@ -8744,7 +8744,7 @@ fn povray_df3_rejects_truncated_payload_instead_of_padding() {
     // PovrayReader), so a payload too small for even 1 byte/voxel reports a
     // bytes-per-voxel of 0 rather than the old fixed-1-byte payload mismatch.
     assert!(
-        matches!(err, BioFormatsError::Format(ref message) if message.contains("DF3")),
+        matches!(err, BioFormatsError::Format(ref message) if message.contains("Unsupported byte depth: 0")),
         "{err:?}"
     );
 }

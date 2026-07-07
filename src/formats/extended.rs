@@ -14120,8 +14120,7 @@ impl FormatReader for PovrayReader {
             4 => (PixelType::Uint32, 32),
             other => {
                 return Err(BioFormatsError::Format(format!(
-                    "DF3 unsupported bytes-per-voxel: {} (expected 1, 2, or 4)",
-                    other
+                    "Unsupported byte depth: {other}"
                 )));
             }
         };
@@ -14320,6 +14319,26 @@ mod povray_tests {
 
         std::fs::remove_file(good).ok();
         std::fs::remove_file(bad).ok();
+    }
+
+    #[test]
+    fn pov_scene_text_renamed_to_df3_matches_java_byte_depth_error() {
+        let path =
+            std::env::temp_dir().join(format!("bioformats_df3_scene_{}.df3", std::process::id()));
+        std::fs::write(
+            &path,
+            b"// PoVRay 3.7 Scene File\n#version 3.7;\ncamera { location <0,0,-1> }\n",
+        )
+        .unwrap();
+
+        let mut reader = PovrayReader::new();
+        let err = reader.set_id(&path).unwrap_err();
+        assert!(
+            matches!(err, BioFormatsError::Format(ref message) if message == "Unsupported byte depth: 0"),
+            "{err:?}"
+        );
+
+        std::fs::remove_file(path).ok();
     }
 }
 
