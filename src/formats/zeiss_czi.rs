@@ -5,8 +5,7 @@
 //!   bytes 16-23: allocated size (int64 LE)
 //!   bytes 24-31: used size (int64 LE)
 //!
-//! Supported compressions: Uncompressed, JPEG (new-style), LZW, Zstd.
-//! JPEG-XR is detected but not decoded (needs a JXRC decoder).
+//! Supported compressions: Uncompressed, JPEG (new-style), JPEG-XR, LZW, Zstd.
 
 use std::collections::HashMap;
 use std::fs::File;

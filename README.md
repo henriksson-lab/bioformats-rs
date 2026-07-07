@@ -1,6 +1,6 @@
 # bioformats-rs
 
-A pure-Rust translation of [Bio-Formats](https://www.openmicroscopy.org/bio-formats/) 
+A pure-Rust translation of [Bio-Formats](https://www.openmicroscopy.org/bio-formats/)
 — a library for reading (and writing) scientific image formats used in microscopy, medical imaging, and astronomy.
 
 The internal Metakit table reader used for Volocity is translated from
@@ -8,17 +8,9 @@ The internal Metakit table reader used for Volocity is translated from
 [`ome/ome-metakit`](https://github.com/ome/ome-metakit) at commit
 `b8b3a629a6dd9bf422949f6b175b9e310ba6e252`.
 
-* 2026-06-30: Further fixes based on real data; faster tiff subregion reader
-* 2026-06-29: Audit on real data for remaining formats. Benchmarks and speed improvements
-* 2026-06-24: Further real data audits
-* 2026-06-21: Tracked translation audit complete. Every component has passed two clean audits without remarks. Not all readers have been tested on real files though
-* 2026-06-20: Close to all files audited. some left
-* 2026-06-19: Extensive reaudit with conservative LLM (many problems fixed). About half files now reaudited, passing only if clean twice in a row - the rest to come
-* 2026-06-17: Some more stragglers found. Definitely need a final audit, but using a different LLM
-* 2026-06-14: Translation theoretically as complete as it can get. Testing on more data is however needed; if the code does not work on some file you have, please provide if possible
-* 2026-05-27: Further progress but incomplete. See status of translation below. However, more test data is needed for audit
-* 2026-05-26: 60-70% there. see list of libraries below. translation of mdbtools underway to support key file formats
-* 2026-05-24: started proper audit; plenty left to do on this crate
+Current status: the tracked Java-to-Rust translation audit is complete; every
+translated reader/writer row has passed two clean audits. Real-file and Java
+parity coverage continue to expand as public fixtures become available.
 
 ## This is an LLM-mediated faithful (hopefully) translation, not the original code! 
 
@@ -40,9 +32,6 @@ But:
 * **Do not overinterpret the benchmark reports**. They are used to help evaluate the translation. If you want improved performance, you generally have to use this code as a library, and use the additional tricks it offers. We generally accept performance losses in order to reduce our dependency issues
 * **Check the original Github pages for information about the package**. This README is kept sparse on purpose. It is not meant to be the primary source of information
 * **If you are the author of the original code and wish to move to Rust, you can obtain ownership of this repository and crate**. Until then, our commitment is to offer an as-faithful-as-possible translation of a snapshot of your code. If we find serious bugs, we will report them to you. Otherwise we will just replicate them, to ensure comparability across studies that claim to use package XYZ v.666. Think of this like a fancy Ubuntu .deb-package of your software - that is how we treat it
-
-This blurb might be out of date. Go to [this page](https://github.com/henriksson-lab/rustification) for the latest information and further information about how we approach translation
-
 
 ## Quick start
 
@@ -110,7 +99,7 @@ Additional write-capable formats (read support listed elsewhere): OME-XML
 | Farbfeld | `.ff` | |
 | Leica LIF | `.lif` | Binary container with UTF-16 XML metadata; uncompressed and zlib/deflate payload layouts |
 | Nikon ND2 | `.nd2` | Chunk-based; raw, zlib, and JPEG2000 frames |
-| Zeiss CZI | `.czi` | ZISRAWFILE segments; scene/mosaic/pyramid support; uncompressed, JPEG, LZW, Zstd |
+| Zeiss CZI | `.czi` | ZISRAWFILE segments; scene/mosaic/pyramid support; uncompressed, JPEG, JPEG-XR, LZW, Zstd |
 | NIfTI-1 / Analyze 7.5 | `.nii` `.nii.gz` `.hdr` `.img` | gzip supported |
 | Zeiss LSM | `.lsm` | TIFF-based with CZ_LSMInfo metadata |
 | Applied Precision DeltaVision | `.dv` `.r3d` | Binary header + raw planes |
@@ -183,7 +172,7 @@ so they are not rated here — see
 | Leica TCS | `.xml` | ✅ | Full C/Z/T from Leica handler |
 | MicroManager | `metadata.txt` `.json` | ✅ | Per-plane file map, multi-position, channel/calibration metadata |
 | Visitech | `.xys` `.html` | ✅ | `.html`/`.xys` parse + multi-position series |
-| Zeiss CZI | `.czi` | ✅ | Scene/acquisition/angle series, mosaic stitching + fusion rebalancing, per-pixel-type split, rotation→moduloZ, PALM split, pyramids; JPEG-XR needs `jpegxr` feature |
+| Zeiss CZI | `.czi` | ✅ | Scene/acquisition/angle series, mosaic stitching + fusion rebalancing, per-pixel-type split, rotation→moduloZ, PALM split, pyramids; JPEG-XR via default-on `jpegxr` feature |
 | Nikon ND2 | `.nd2` | ✅ | Chunk-map validation/fallback, ImageDataSeq ordering, XML/LV/text metadata, channel colors/LUTs, zlib/JPEG2000/lossless paths, scanline padding, and plane mapping |
 | Prairie View | `.xml` `.cfg` `.env` `.tif` | ✅ | Channels/metadata + stage-position multi-series |
 | MetaMorph STK | `.stk` `.nd` | ✅ | Per-plane UIC metadata + multi-STK `.nd` file-group series |
@@ -460,12 +449,11 @@ let plane = reader.open_bytes(0)?;
 assert_eq!(plane.len(), meta.size_y as usize * row_bytes);
 ```
 
-## Planned (not yet implemented)
+## Remaining gaps
 
 - **ND2**: full coverage of modern structured `ImageDataSeq` variants and richer per-plane metadata (raw/zlib/JPEG2000 frames already decode; see status table)
-- **CZI**: broader vendor metadata enrichment beyond the implemented scene/acquisition/angle series, pyramid handling, and feature-gated JPEG-XR path
 - **Write support** for LIF, ND2, CZI
-- **OME metadata**: `reader.ome_metadata()` returns baseline OME metadata for all readers and enriches it with structured physical sizes, channel names, and plane positions where supported; richer parsing (instrument, experimenter) is partial
+- **OME metadata**: `reader.ome_metadata()` returns baseline OME metadata for all readers and enriches it with structured physical sizes, channel names, channel colors, wavelengths, and plane positions where supported; richer parsing (instrument, experimenter) is partial
 - **Pyramid writing UX**: direct `bioformats::tiff::PyramidOmeTiffWriter` exists; automatic `ImageWriter` dispatch intentionally writes ordinary OME-TIFF for plain `.ome.*` suffixes unless callers use the pyramid writer directly.
 
 ### Missing external codecs
@@ -474,8 +462,7 @@ A few pixel formats are **not stubs by choice** — they require a codec for
 which there is no pure-Rust decoder in this tree, and which upstream Java
 Bio-Formats itself decodes by delegating to native/platform libraries
 (QuickTime/Java ImageIO). Metadata for these files is still read; only the pixel
-decode is unavailable. Wiring a Rust codec crate (or an optional feature flag)
-for each would close the gap:
+decode is unavailable. Wiring a Rust codec crate for each would close the gap:
 
 | Codec | Used by | Status |
 | --- | --- | --- |
@@ -484,11 +471,10 @@ for each would close the gap:
 | **Apple ProRes** (`apch`, `apcn`, …) | QuickTime `.mov` | no Rust decoder; metadata-only |
 | **Motion JPEG 2000** (`mjp2`, `mj2k`) | QuickTime `.mov` | no Rust decoder; metadata-only |
 | **DV** (`dvcp`, `dv25`, …) | QuickTime `.mov` | no Rust decoder; metadata-only |
-| **JPEG-XR** | CZI, some OME-TIFF | implemented but **feature-gated**: build with `--features jpegxr` |
-
-Codecs that **are** implemented in-tree (no external dependency): LZW, PackBits,
-Deflate/zlib, Zstd, LZ4, JPEG (baseline), JPEG 2000 (JP2/J2K), Cinepak,
-Apple RLE/Animation, PNG, and the standard TIFF compressions.
+Codecs that **are** implemented without native/platform video decoders include:
+LZW, PackBits, Deflate/zlib, Zstd, LZ4, JPEG (baseline), JPEG 2000 (JP2/J2K),
+JPEG-XR (default-on `jpegxr` feature), Cinepak, Apple RLE/Animation, PNG, and
+the standard TIFF compressions.
 
 On the **write** side, **JPEG 2000 writing** (`.jp2`/`.j2k`) is now supported via
 the pure-Rust `openjp2` encoder, behind the default-on `jpeg2000-write` feature
