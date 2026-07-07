@@ -1,6 +1,6 @@
 [package]
 name = "bioformats"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2021"
 description = "Pure Rust translation of Bio-Formats — read/write scientific image formats"
 license = "GPL-2.0-or-later"
@@ -15,6 +15,7 @@ include = [
     "/src/**/*.rs",
     "/src/**/*.txt",
     "/src/metakit/tests/data/test.mk",
+    "/tests/**/*.rs",
     "/benches/read_ome_tiff.rs",
     "/README.md",
     "/bioformats_bug.txt",

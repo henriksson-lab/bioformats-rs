@@ -2881,16 +2881,16 @@ mod tests {
         bytes.extend_from_slice(&ifd_start.to_le_bytes());
 
         let entries = [
-            tiff_entry(256, 4, 1, 2),                // ImageWidth
-            tiff_entry(257, 4, 1, 2),                // ImageLength
-            tiff_entry(258, 3, 1, 8),                // BitsPerSample
-            tiff_entry(259, 3, 1, 1),                // Compression
-            tiff_entry(262, 3, 1, 32803),            // PhotometricInterpretation = CFA
-            tiff_entry(273, 4, 1, pixel_start),      // StripOffsets
-            tiff_entry(277, 3, 1, 1),                // SamplesPerPixel
-            tiff_entry(278, 4, 1, 2),                // RowsPerStrip
-            tiff_entry(279, 4, 1, 4),                // StripByteCounts
-            tiff_entry(284, 3, 1, 1),                // PlanarConfiguration
+            tiff_entry(256, 4, 1, 2),           // ImageWidth
+            tiff_entry(257, 4, 1, 2),           // ImageLength
+            tiff_entry(258, 3, 1, 8),           // BitsPerSample
+            tiff_entry(259, 3, 1, 1),           // Compression
+            tiff_entry(262, 3, 1, 32803),       // PhotometricInterpretation = CFA
+            tiff_entry(273, 4, 1, pixel_start), // StripOffsets
+            tiff_entry(277, 3, 1, 1),           // SamplesPerPixel
+            tiff_entry(278, 4, 1, 2),           // RowsPerStrip
+            tiff_entry(279, 4, 1, 4),           // StripByteCounts
+            tiff_entry(284, 3, 1, 1),           // PlanarConfiguration
             tiff_entry(271, 2, make.len() as u32, make_offset),
             tiff_entry(305, 2, software.len() as u32, software_offset),
         ];
