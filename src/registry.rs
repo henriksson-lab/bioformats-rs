@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use crate::common::compressed::{CompressedExtractionSupport, CompressedTile, CompressedTileMode};
 use crate::common::error::{BioFormatsError, Result};
 use crate::common::io::peek_header;
 use crate::common::metadata::ImageMetadata;
@@ -72,6 +73,24 @@ impl ImageReader {
     }
     pub fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
         self.inner.open_thumb_bytes(plane_index)
+    }
+    pub fn compressed_level_info(
+        &self,
+        plane_index: u32,
+        level: u32,
+    ) -> Result<CompressedExtractionSupport> {
+        self.inner.compressed_level_info(plane_index, level)
+    }
+    pub fn read_compressed_tile(
+        &mut self,
+        plane_index: u32,
+        level: u32,
+        col: u64,
+        row: u64,
+        preferred_modes: &[CompressedTileMode],
+    ) -> Result<CompressedTile> {
+        self.inner
+            .read_compressed_tile(plane_index, level, col, row, preferred_modes)
     }
     pub fn resolution_count(&self) -> usize {
         self.inner.resolution_count()

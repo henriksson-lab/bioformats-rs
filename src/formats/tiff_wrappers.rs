@@ -5,6 +5,7 @@
 
 use std::path::Path;
 
+use crate::common::compressed::{CompressedExtractionSupport, CompressedTile, CompressedTileMode};
 use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::ImageMetadata;
 use crate::common::reader::FormatReader;
@@ -989,6 +990,24 @@ impl FormatReader for NdpiReader {
     fn open_thumb_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
         self.inner.open_thumb_bytes(p)
     }
+    fn compressed_level_info(
+        &self,
+        plane_index: u32,
+        level: u32,
+    ) -> Result<CompressedExtractionSupport> {
+        self.inner.compressed_level_info(plane_index, level)
+    }
+    fn read_compressed_tile(
+        &mut self,
+        plane_index: u32,
+        level: u32,
+        col: u64,
+        row: u64,
+        preferred_modes: &[CompressedTileMode],
+    ) -> Result<CompressedTile> {
+        self.inner
+            .read_compressed_tile(plane_index, level, col, row, preferred_modes)
+    }
     fn resolution_count(&self) -> usize {
         self.inner.resolution_count()
     }
@@ -1547,6 +1566,24 @@ impl FormatReader for LeicaScnReader {
     }
     fn open_thumb_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
         self.inner.open_thumb_bytes(p)
+    }
+    fn compressed_level_info(
+        &self,
+        plane_index: u32,
+        level: u32,
+    ) -> Result<CompressedExtractionSupport> {
+        self.inner.compressed_level_info(plane_index, level)
+    }
+    fn read_compressed_tile(
+        &mut self,
+        plane_index: u32,
+        level: u32,
+        col: u64,
+        row: u64,
+        preferred_modes: &[CompressedTileMode],
+    ) -> Result<CompressedTile> {
+        self.inner
+            .read_compressed_tile(plane_index, level, col, row, preferred_modes)
     }
     fn resolution_count(&self) -> usize {
         self.inner.resolution_count()

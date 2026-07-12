@@ -12,6 +12,10 @@ use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
+use crate::common::compressed::{
+    mode_allowed, CompressedBytes, CompressedExtractionConstraint, CompressedExtractionSupport,
+    CompressedLevelInfo, CompressedTile, CompressedTileMode, JpegColorSpace, LossyCodec,
+};
 use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue, ModuloAnnotation};
 use crate::common::pixel_type::PixelType;
@@ -1808,10 +1812,14 @@ impl ZeissCziReader {
             .unwrap_or(&[])
     }
 
-    fn matching_entries(&self, plane_index: u32) -> Option<Vec<DirEntry>> {
+    fn matching_entries_at_resolution(
+        &self,
+        plane_index: u32,
+        resolution_index: usize,
+    ) -> Option<Vec<DirEntry>> {
         let (z, c, t) = self.plane_zct(plane_index)?;
         let series = self.series.get(self.current_series)?;
-        let res = self.current_resolutions().get(self.current_resolution)?;
+        let res = self.current_resolutions().get(resolution_index)?;
         let r = res.r;
         let want_resolution_key = CziResolutionKey {
             r: res.r,
@@ -1898,6 +1906,10 @@ impl ZeissCziReader {
         (!entries.is_empty()).then_some(entries)
     }
 
+    fn matching_entries(&self, plane_index: u32) -> Option<Vec<DirEntry>> {
+        self.matching_entries_at_resolution(plane_index, self.current_resolution)
+    }
+
     /// Apply the active series/resolution's X/Y size to the cached metadata.
     fn refresh_meta_dimensions(&mut self) {
         let (width, height, res_count) = {
@@ -1918,45 +1930,10 @@ impl ZeissCziReader {
     }
 
     fn read_subblock(path: &Path, entry: &DirEntry, pixel_bytes: usize) -> Result<Vec<u8>> {
+        let (data_offset, data_size) = Self::subblock_data_range(path, entry)?;
         let mut f = File::open(path).map_err(BioFormatsError::Io)?;
-        f.seek(SeekFrom::Start(entry.file_position as u64))
+        f.seek(SeekFrom::Start(data_offset))
             .map_err(BioFormatsError::Io)?;
-        let mut seg_hdr = vec![0u8; SEG_HEADER];
-        f.read_exact(&mut seg_hdr).map_err(BioFormatsError::Io)?;
-
-        // SubBlock body (matching ZeissCZIReader.SubBlock.fillInData:4175-4183):
-        //   body_start (fp) = file_position + HEADER_SIZE
-        //   metadataSize (int), attachmentSize (int), dataSize (long) -> 16 bytes
-        //   DirectoryEntry, then skip max(256 - (filePointer - fp), 0) so the
-        //   fixed part of the body is *at least* 256 bytes (measured from fp),
-        //   then metadata of metadataSize bytes. Pixel data therefore starts at
-        //   fp + max(256, 16 + dirEntryLen) + metadataSize.
-        let mut sb_hdr = vec![0u8; 16];
-        f.read_exact(&mut sb_hdr).map_err(BioFormatsError::Io)?;
-        let metadata_size = read_i32(&sb_hdr, 0) as u64;
-        let data_size = read_u64(&sb_hdr, 8);
-
-        // Read the subblock's own DirectoryEntry header far enough to learn its
-        // dimensionCount, then compute its on-disk length. The DirectoryEntry is
-        // a 32-byte fixed header (dimensionCount at offset 28) followed by 20
-        // bytes per DimensionEntry (ZeissCZIReader.DirectoryEntry:4604-4630).
-        let mut de_hdr = vec![0u8; 32];
-        f.read_exact(&mut de_hdr).map_err(BioFormatsError::Io)?;
-        let dim_count = read_i32(&de_hdr, 28).max(0) as i64;
-        let dir_entry_len = 32 + 20 * dim_count;
-
-        // Java skips max(256 - (filePointer - fp), 0) once positioned just after
-        // the full DirectoryEntry, where (filePointer - fp) == 16 + dir_entry_len.
-        // We have so far consumed only 16 + 32 bytes (size header + DirectoryEntry
-        // fixed header), so to reach Java's post-DirectoryEntry position we must
-        // first skip the remaining DimensionEntry array (20*dim_count bytes), then
-        // apply Java's padding skip of max(256 - 16 - dir_entry_len, 0), then the
-        // metadata. When dim_count is large (dir_entry_len > 240) the padding skip
-        // is 0, so pixel data starts immediately after metadata (no fixed 256).
-        let skip = 20 * dim_count + (256 - 16 - dir_entry_len).max(0) + metadata_size as i64;
-        f.seek(SeekFrom::Current(skip))
-            .map_err(BioFormatsError::Io)?;
-
         let mut compressed = vec![0u8; data_size as usize];
         f.read_exact(&mut compressed).map_err(BioFormatsError::Io)?;
 
@@ -1971,6 +1948,73 @@ impl ZeissCziReader {
             Err(_err) if entry.compression == 4 => Ok(vec![0; max_bytes]),
             Err(err) => Err(err),
         }
+    }
+
+    fn subblock_data_range(path: &Path, entry: &DirEntry) -> Result<(u64, u64)> {
+        if entry.file_position < 0 {
+            return Err(BioFormatsError::Format(
+                "CZI subblock has negative file position".into(),
+            ));
+        }
+        let mut f = File::open(path).map_err(BioFormatsError::Io)?;
+        f.seek(SeekFrom::Start(entry.file_position as u64))
+            .map_err(BioFormatsError::Io)?;
+        let mut seg_hdr = vec![0u8; SEG_HEADER];
+        f.read_exact(&mut seg_hdr).map_err(BioFormatsError::Io)?;
+
+        let mut sb_hdr = vec![0u8; 16];
+        f.read_exact(&mut sb_hdr).map_err(BioFormatsError::Io)?;
+        let metadata_size = read_i32(&sb_hdr, 0).max(0) as u64;
+        let data_size = read_u64(&sb_hdr, 8);
+
+        let mut de_hdr = vec![0u8; 32];
+        f.read_exact(&mut de_hdr).map_err(BioFormatsError::Io)?;
+        let dim_count = read_i32(&de_hdr, 28).max(0) as u64;
+        let dir_entry_len = 32u64 + 20u64 * dim_count;
+        let padding = 256u64.saturating_sub(16 + dir_entry_len);
+        let data_offset = (entry.file_position as u64)
+            .checked_add(SEG_HEADER as u64)
+            .and_then(|v| v.checked_add(16))
+            .and_then(|v| v.checked_add(dir_entry_len))
+            .and_then(|v| v.checked_add(padding))
+            .and_then(|v| v.checked_add(metadata_size))
+            .ok_or_else(|| BioFormatsError::Format("CZI subblock data offset overflows".into()))?;
+        let file_len = f.metadata().map_err(BioFormatsError::Io)?.len();
+        if data_size == 0
+            || data_offset
+                .checked_add(data_size)
+                .is_none_or(|end| end > file_len)
+        {
+            return Err(BioFormatsError::Format(
+                "CZI subblock compressed byte range is invalid".into(),
+            ));
+        }
+        Ok((data_offset, data_size))
+    }
+
+    fn compressed_codec_for_entry(entry: &DirEntry) -> Option<LossyCodec> {
+        match entry.compression {
+            1 => Some(LossyCodec::Jpeg {
+                color_space: match czi_pixel_type(entry.pixel_type).ok().map(|(_, spp)| spp) {
+                    Some(1) => JpegColorSpace::Gray,
+                    Some(3..) => JpegColorSpace::Unknown,
+                    _ => JpegColorSpace::Unknown,
+                },
+                subsampling: None,
+            }),
+            4 => Some(LossyCodec::JpegXr),
+            _ => None,
+        }
+    }
+
+    fn czi_unsupported_compression_reason(entries: &[DirEntry]) -> String {
+        let mut codes: Vec<i32> = entries.iter().map(|e| e.compression).collect();
+        codes.sort_unstable();
+        codes.dedup();
+        format!(
+            "CZI compressed extraction only supports clean single JPEG/JPEG-XR subblocks; found compression code(s) {:?}",
+            codes
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2282,6 +2326,172 @@ impl FormatReader for ZeissCziReader {
         let (tw, th) = (meta.size_x.min(256), meta.size_y.min(256));
         let (tx, ty) = ((meta.size_x - tw) / 2, (meta.size_y - th) / 2);
         self.open_bytes_region(plane_index, tx, ty, tw, th)
+    }
+
+    fn compressed_level_info(
+        &self,
+        plane_index: u32,
+        level: u32,
+    ) -> Result<CompressedExtractionSupport> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        if plane_index >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        let Some(res) = self.current_resolutions().get(level as usize) else {
+            return Ok(CompressedExtractionSupport::NotSupported {
+                reason: format!("CZI resolution level {level} is out of range"),
+            });
+        };
+        let Some(entries) = self.matching_entries_at_resolution(plane_index, level as usize) else {
+            return Ok(CompressedExtractionSupport::NotSupported {
+                reason: "CZI plane has no source subblocks at requested resolution".into(),
+            });
+        };
+        let Some(codec) = Self::compressed_codec_for_entry(&entries[0]) else {
+            return Ok(CompressedExtractionSupport::NotSupported {
+                reason: Self::czi_unsupported_compression_reason(&entries),
+            });
+        };
+        if entries
+            .iter()
+            .any(|entry| Self::compressed_codec_for_entry(entry) != Some(codec.clone()))
+        {
+            return Ok(CompressedExtractionSupport::NotSupported {
+                reason: Self::czi_unsupported_compression_reason(&entries),
+            });
+        }
+
+        let tile_width = entries[0].dim_stored_size("X").max(0) as u32;
+        let tile_height = entries[0].dim_stored_size("Y").max(0) as u32;
+        if tile_width == 0 || tile_height == 0 {
+            return Ok(CompressedExtractionSupport::NotSupported {
+                reason: "CZI compressed subblock dimensions are zero".into(),
+            });
+        }
+        if entries.iter().any(|entry| {
+            entry.dim_stored_size("X").max(0) as u32 != tile_width
+                || entry.dim_stored_size("Y").max(0) as u32 != tile_height
+        }) {
+            return Ok(CompressedExtractionSupport::NotSupported {
+                reason: "CZI compressed extraction requires a uniform subblock grid".into(),
+            });
+        }
+
+        let tiles_across = u64::from(res.width).div_ceil(u64::from(tile_width));
+        let tiles_down = u64::from(res.height).div_ceil(u64::from(tile_height));
+        let mut constraints = Vec::new();
+        if res.width % tile_width != 0 || res.height % tile_height != 0 {
+            constraints.push(CompressedExtractionConstraint::EdgeTilesMayBePartial);
+        }
+        Ok(CompressedExtractionSupport::Supported(
+            CompressedLevelInfo {
+                plane_index,
+                level,
+                width: u64::from(res.width),
+                height: u64::from(res.height),
+                tile_width,
+                tile_height,
+                tiles_across,
+                tiles_down,
+                codec,
+                modes: vec![CompressedTileMode::OriginalBytes],
+                constraints,
+            },
+        ))
+    }
+
+    fn read_compressed_tile(
+        &mut self,
+        plane_index: u32,
+        level: u32,
+        col: u64,
+        row: u64,
+        preferred_modes: &[CompressedTileMode],
+    ) -> Result<CompressedTile> {
+        if !mode_allowed(preferred_modes, CompressedTileMode::OriginalBytes) {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "requested compressed tile modes are not available for CZI subblocks".into(),
+            ));
+        }
+        let support = self.compressed_level_info(plane_index, level)?;
+        let CompressedExtractionSupport::Supported(info) = support else {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "CZI plane is not available as compressed source subblocks".into(),
+            ));
+        };
+        if col >= info.tiles_across || row >= info.tiles_down {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+
+        let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let entries = self
+            .matching_entries_at_resolution(plane_index, level as usize)
+            .ok_or(BioFormatsError::PlaneOutOfRange(plane_index))?;
+        let res = self
+            .current_resolutions()
+            .get(level as usize)
+            .ok_or(BioFormatsError::PlaneOutOfRange(plane_index))?;
+        let scale_x = res.scale_x.max(1);
+        let scale_y = res.scale_y.max(1);
+        let min_col = entries
+            .iter()
+            .map(|entry| entry.dim_start("X") / scale_x)
+            .min()
+            .unwrap_or(0)
+            .max(0);
+        let min_row = entries
+            .iter()
+            .map(|entry| entry.dim_start("Y") / scale_y)
+            .min()
+            .unwrap_or(0)
+            .max(0);
+
+        for entry in entries {
+            let origin_x = ((entry.dim_start("X") / scale_x) - min_col).max(0) as u64;
+            let origin_y = ((entry.dim_start("Y") / scale_y) - min_row).max(0) as u64;
+            if origin_x / u64::from(info.tile_width) != col
+                || origin_y / u64::from(info.tile_height) != row
+            {
+                continue;
+            }
+            if origin_x % u64::from(info.tile_width) != 0
+                || origin_y % u64::from(info.tile_height) != 0
+            {
+                return Err(BioFormatsError::UnsupportedFormat(
+                    "CZI compressed subblocks do not align to a regular tile grid".into(),
+                ));
+            }
+            let (offset, length) = Self::subblock_data_range(path, &entry)?;
+            let width = info
+                .tile_width
+                .min((info.width - origin_x).try_into().unwrap_or(u32::MAX));
+            let height = info
+                .tile_height
+                .min((info.height - origin_y).try_into().unwrap_or(u32::MAX));
+            return Ok(CompressedTile {
+                plane_index,
+                level,
+                col,
+                row,
+                origin_x,
+                origin_y,
+                width,
+                height,
+                nominal_tile_width: info.tile_width,
+                nominal_tile_height: info.tile_height,
+                codec: info.codec,
+                mode: CompressedTileMode::OriginalBytes,
+                bytes: CompressedBytes::FileRange {
+                    path: path.clone(),
+                    offset,
+                    length,
+                },
+            });
+        }
+
+        Err(BioFormatsError::UnsupportedFormat(
+            "CZI requested compressed tile is missing from the source subblocks".into(),
+        ))
     }
 
     fn resolution_count(&self) -> usize {
@@ -3172,6 +3382,61 @@ mod tests {
         reader.set_id(&path).unwrap();
 
         assert_eq!(reader.open_bytes(0).unwrap(), vec![0, 0]);
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn czi_exposes_single_jpeg_subblock_as_original_bytes() {
+        let jpeg = vec![0xff, 0xd8, 0xff, 0xd9];
+        let entry = with_compression(directory_entry_dims(0, 0, 0, 0, 0, 2, 1, 0), 1);
+        let path = write_synthetic_czi_entries("compressed_jpeg_passthrough", vec![(entry, jpeg)]);
+        let mut reader = ZeissCziReader::new();
+        reader.set_id(&path).unwrap();
+
+        let info = reader.compressed_level_info(0, 0).unwrap();
+        assert!(matches!(info, CompressedExtractionSupport::Supported(_)));
+        let tile = reader
+            .read_compressed_tile(0, 0, 0, 0, &[CompressedTileMode::OriginalBytes])
+            .unwrap();
+        assert_eq!(tile.mode, CompressedTileMode::OriginalBytes);
+        assert_eq!(
+            tile.codec,
+            LossyCodec::Jpeg {
+                color_space: JpegColorSpace::Gray,
+                subsampling: None
+            }
+        );
+        match tile.bytes {
+            CompressedBytes::FileRange {
+                path: tile_path,
+                offset: _,
+                length,
+            } => {
+                assert_eq!(tile_path, path);
+                assert_eq!(length, 4);
+            }
+            other => panic!("expected file range, got {other:?}"),
+        }
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn czi_rejects_uncompressed_subblock_for_compressed_extraction() {
+        let entry = directory_entry_dims(0, 0, 0, 0, 0, 2, 1, 0);
+        let path = write_synthetic_czi_entries(
+            "compressed_uncompressed_reject",
+            vec![(entry, vec![1, 2])],
+        );
+        let mut reader = ZeissCziReader::new();
+        reader.set_id(&path).unwrap();
+
+        let info = reader.compressed_level_info(0, 0).unwrap();
+        assert!(matches!(
+            info,
+            CompressedExtractionSupport::NotSupported { .. }
+        ));
 
         fs::remove_file(path).unwrap();
     }

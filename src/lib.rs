@@ -45,6 +45,11 @@ mod writer_order;
 pub mod writer_registry;
 
 pub use crate::cache::{CacheStrategy, CachedReader};
+pub use crate::common::compressed::{
+    CompressedBytes, CompressedExtractionConstraint, CompressedExtractionSupport,
+    CompressedFileRange, CompressedLevelInfo, CompressedTile, CompressedTileMode,
+    Jpeg2000Container, JpegColorSpace, JpegSubsampling, LossyCodec,
+};
 pub use crate::common::ome_metadata::{
     create_lsid, OmeAnnotation, OmeChannel, OmeDataset, OmeDetector, OmeDichroic, OmeExperiment,
     OmeExperimenter, OmeFilter, OmeImage, OmeInstrument, OmeLightPath, OmeLightSource, OmeMetadata,

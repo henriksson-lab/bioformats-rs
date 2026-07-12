@@ -8,6 +8,10 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::common::codec::decompress_rpza;
+use crate::common::compressed::{
+    mode_allowed, CompressedBytes, CompressedExtractionSupport, CompressedLevelInfo,
+    CompressedTile, CompressedTileMode, JpegColorSpace, JpegSubsampling, LossyCodec,
+};
 use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
 use crate::common::ome_metadata::{OmeMetadata, OmePlane};
@@ -391,6 +395,152 @@ impl FormatReader for QtReader {
             .get(self.current_series)
             .map(|series| &series.meta)
             .unwrap_or(crate::common::reader::uninitialized_metadata())
+    }
+
+    fn compressed_level_info(
+        &self,
+        plane_index: u32,
+        level: u32,
+    ) -> Result<CompressedExtractionSupport> {
+        let series = self
+            .series
+            .get(self.current_series)
+            .ok_or(BioFormatsError::NotInitialized)?;
+        let meta = &series.meta;
+        if plane_index >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        if level != 0 {
+            return Ok(CompressedExtractionSupport::NotSupported {
+                reason: format!("QuickTime resolution level {level} is not available"),
+            });
+        }
+        let index = plane_index as usize;
+        let sample_index = series
+            .sample_read_order
+            .as_ref()
+            .and_then(|order| order.get(index).copied())
+            .unwrap_or(index);
+        let sample_codec = series
+            .sample_codecs
+            .get(sample_index)
+            .copied()
+            .unwrap_or(series.codec);
+        if sample_codec != QuickTimeCodec::Jpeg {
+            return Ok(CompressedExtractionSupport::NotSupported {
+                reason: "QuickTime sample codec is not plain JPEG".into(),
+            });
+        }
+        Ok(CompressedExtractionSupport::Supported(
+            CompressedLevelInfo {
+                plane_index,
+                level,
+                width: meta.size_x as u64,
+                height: meta.size_y as u64,
+                tile_width: meta.size_x,
+                tile_height: meta.size_y,
+                tiles_across: 1,
+                tiles_down: 1,
+                codec: LossyCodec::Jpeg {
+                    color_space: if meta.size_c == 1 {
+                        JpegColorSpace::Gray
+                    } else {
+                        JpegColorSpace::Unknown
+                    },
+                    subsampling: Some(JpegSubsampling::Other {
+                        horizontal: 0,
+                        vertical: 0,
+                    }),
+                },
+                modes: vec![CompressedTileMode::OriginalBytes],
+                constraints: Vec::new(),
+            },
+        ))
+    }
+
+    fn read_compressed_tile(
+        &mut self,
+        plane_index: u32,
+        level: u32,
+        col: u64,
+        row: u64,
+        preferred_modes: &[CompressedTileMode],
+    ) -> Result<CompressedTile> {
+        let series = self
+            .series
+            .get(self.current_series)
+            .ok_or(BioFormatsError::NotInitialized)?;
+        let meta = &series.meta;
+        if plane_index >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        if level != 0 || col != 0 || row != 0 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "QuickTime compressed extraction exposes one sample-sized tile at level 0".into(),
+            ));
+        }
+        if !mode_allowed(preferred_modes, CompressedTileMode::OriginalBytes) {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "QuickTime JPEG samples are available only as original bytes".into(),
+            ));
+        }
+        let index = plane_index as usize;
+        let sample_index = series
+            .sample_read_order
+            .as_ref()
+            .and_then(|order| order.get(index).copied())
+            .unwrap_or(index);
+        let sample_codec = series
+            .sample_codecs
+            .get(sample_index)
+            .copied()
+            .unwrap_or(series.codec);
+        if sample_codec != QuickTimeCodec::Jpeg {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "QuickTime sample codec is not plain JPEG".into(),
+            ));
+        }
+        let offset = *series
+            .sample_offsets
+            .get(sample_index)
+            .ok_or(BioFormatsError::PlaneOutOfRange(plane_index))?;
+        let length = *series
+            .sample_sizes
+            .get(sample_index)
+            .ok_or(BioFormatsError::PlaneOutOfRange(plane_index))?;
+        Ok(CompressedTile {
+            plane_index,
+            level,
+            col,
+            row,
+            origin_x: 0,
+            origin_y: 0,
+            width: meta.size_x,
+            height: meta.size_y,
+            nominal_tile_width: meta.size_x,
+            nominal_tile_height: meta.size_y,
+            codec: LossyCodec::Jpeg {
+                color_space: if meta.size_c == 1 {
+                    JpegColorSpace::Gray
+                } else {
+                    JpegColorSpace::Unknown
+                },
+                subsampling: Some(JpegSubsampling::Other {
+                    horizontal: 0,
+                    vertical: 0,
+                }),
+            },
+            mode: CompressedTileMode::OriginalBytes,
+            bytes: CompressedBytes::FileRange {
+                path: self
+                    .path
+                    .as_ref()
+                    .ok_or(BioFormatsError::NotInitialized)?
+                    .clone(),
+                offset,
+                length: length as u64,
+            },
+        })
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {

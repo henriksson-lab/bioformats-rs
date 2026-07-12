@@ -16,6 +16,11 @@ use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
+use crate::common::compressed::{
+    mode_allowed, CompressedBytes, CompressedExtractionConstraint, CompressedExtractionSupport,
+    CompressedFileRange, CompressedLevelInfo, CompressedTile, CompressedTileMode,
+    Jpeg2000Container, JpegColorSpace, JpegSubsampling, LossyCodec,
+};
 use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata, LookupTable, MetadataValue};
 use crate::common::pixel_type::PixelType;
@@ -2613,6 +2618,75 @@ impl DicomReader {
         }
         Ok(out)
     }
+
+    fn compressed_codec(&self) -> Option<LossyCodec> {
+        match classify_transfer_syntax(&self.transfer_syntax) {
+            EncapsulatedSyntax::Jpeg => {
+                let photometric = self.photometric_interpretation.trim();
+                let color_space = if photometric.starts_with("MONOCHROME") {
+                    JpegColorSpace::Gray
+                } else if photometric.starts_with("YBR") {
+                    JpegColorSpace::YCbCr
+                } else if photometric == "RGB" {
+                    JpegColorSpace::Rgb
+                } else {
+                    JpegColorSpace::Unknown
+                };
+                Some(LossyCodec::Jpeg {
+                    color_space,
+                    subsampling: Some(JpegSubsampling::Other {
+                        horizontal: 0,
+                        vertical: 0,
+                    }),
+                })
+            }
+            EncapsulatedSyntax::Jpeg2000 => Some(LossyCodec::Jpeg2000 {
+                container: Jpeg2000Container::Unknown,
+            }),
+            EncapsulatedSyntax::Rle | EncapsulatedSyntax::Deflate | EncapsulatedSyntax::Unknown => {
+                None
+            }
+        }
+    }
+
+    fn compressed_frame_index(&self, plane_index: u32, col: u64, row: u64) -> Result<u32> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        if self.is_tiled_wsi() {
+            let tiles_across = meta.size_x.div_ceil(self.source_tile_width.max(1)) as u64;
+            let tiles_down = meta.size_y.div_ceil(self.source_tile_height.max(1)) as u64;
+            if plane_index != 0 || col >= tiles_across || row >= tiles_down {
+                return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+            }
+            if !self.tile_positions.is_empty() {
+                let target_x = col as u32 * self.source_tile_width;
+                let target_y = row as u32 * self.source_tile_height;
+                return (0..self.source_frame_count)
+                    .find(|&frame| self.tile_position(frame, meta) == (target_x, target_y))
+                    .ok_or_else(|| {
+                        BioFormatsError::UnsupportedFormat(
+                            "DICOM: requested compressed tile has no source frame".into(),
+                        )
+                    });
+            }
+            let frame = row
+                .checked_mul(tiles_across)
+                .and_then(|v| v.checked_add(col))
+                .ok_or_else(|| BioFormatsError::Format("DICOM tile index overflows".into()))?;
+            if frame >= self.source_frame_count as u64 {
+                return Err(BioFormatsError::UnsupportedFormat(
+                    "DICOM: requested compressed tile has no source frame".into(),
+                ));
+            }
+            Ok(frame as u32)
+        } else {
+            if col != 0 || row != 0 {
+                return Err(BioFormatsError::UnsupportedFormat(
+                    "DICOM compressed extraction exposes one frame-sized tile per plane".into(),
+                ));
+            }
+            Ok(plane_index)
+        }
+    }
 }
 
 impl Default for DicomReader {
@@ -2741,6 +2815,181 @@ impl FormatReader for DicomReader {
         self.meta
             .as_ref()
             .unwrap_or(crate::common::reader::uninitialized_metadata())
+    }
+
+    fn compressed_level_info(
+        &self,
+        plane_index: u32,
+        level: u32,
+    ) -> Result<CompressedExtractionSupport> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        if plane_index >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        if level != 0 {
+            return Ok(CompressedExtractionSupport::NotSupported {
+                reason: format!("DICOM resolution level {level} is not available"),
+            });
+        }
+        if self
+            .series_files
+            .get(self.current_series)
+            .is_some_and(|files| files.len() > 1)
+        {
+            return Ok(CompressedExtractionSupport::NotSupported {
+                reason:
+                    "DICOM compressed extraction for grouped multi-file series is not supported"
+                        .into(),
+            });
+        }
+        if !self.encapsulated {
+            return Ok(CompressedExtractionSupport::NotSupported {
+                reason: "DICOM pixel data is not encapsulated".into(),
+            });
+        }
+        let Some(codec) = self.compressed_codec() else {
+            return Ok(CompressedExtractionSupport::NotSupported {
+                reason: format!(
+                    "DICOM transfer syntax {} is not exposed by the compressed extraction API",
+                    self.transfer_syntax
+                ),
+            });
+        };
+        let (tile_width, tile_height, tiles_across, tiles_down) = if self.is_tiled_wsi() {
+            (
+                self.source_tile_width,
+                self.source_tile_height,
+                meta.size_x.div_ceil(self.source_tile_width.max(1)) as u64,
+                meta.size_y.div_ceil(self.source_tile_height.max(1)) as u64,
+            )
+        } else {
+            (meta.size_x, meta.size_y, 1, 1)
+        };
+        let mut constraints = Vec::new();
+        if self
+            .encapsulated_frames
+            .iter()
+            .any(|frame| frame.fragments.len() > 1)
+        {
+            constraints.push(CompressedExtractionConstraint::FragmentedSource);
+        }
+        if self.is_tiled_wsi()
+            && (meta.size_x % tile_width.max(1) != 0 || meta.size_y % tile_height.max(1) != 0)
+        {
+            constraints.push(CompressedExtractionConstraint::EdgeTilesMayBePartial);
+        }
+        Ok(CompressedExtractionSupport::Supported(
+            CompressedLevelInfo {
+                plane_index,
+                level,
+                width: meta.size_x as u64,
+                height: meta.size_y as u64,
+                tile_width,
+                tile_height,
+                tiles_across,
+                tiles_down,
+                codec,
+                modes: vec![CompressedTileMode::OriginalBytes],
+                constraints,
+            },
+        ))
+    }
+
+    fn read_compressed_tile(
+        &mut self,
+        plane_index: u32,
+        level: u32,
+        col: u64,
+        row: u64,
+        preferred_modes: &[CompressedTileMode],
+    ) -> Result<CompressedTile> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        if plane_index >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        if level != 0 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "DICOM compressed extraction exposes only level 0".into(),
+            ));
+        }
+        if !mode_allowed(preferred_modes, CompressedTileMode::OriginalBytes) {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "DICOM encapsulated frames are available only as original bytes".into(),
+            ));
+        }
+        if self
+            .series_files
+            .get(self.current_series)
+            .is_some_and(|files| files.len() > 1)
+        {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "DICOM compressed extraction for grouped multi-file series is not supported".into(),
+            ));
+        }
+        let Some(codec) = self.compressed_codec() else {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "DICOM transfer syntax {} is not exposed by the compressed extraction API",
+                self.transfer_syntax
+            )));
+        };
+        let frame_index = self.compressed_frame_index(plane_index, col, row)?;
+        let frame = self
+            .encapsulated_frames
+            .get(frame_index as usize)
+            .ok_or_else(|| BioFormatsError::Format("DICOM: missing pixel fragments".into()))?;
+        let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let bytes = if frame.fragments.len() == 1 {
+            let fragment = &frame.fragments[0];
+            CompressedBytes::FileRange {
+                path: path.clone(),
+                offset: fragment.offset,
+                length: fragment.length,
+            }
+        } else {
+            CompressedBytes::FileRanges {
+                ranges: frame
+                    .fragments
+                    .iter()
+                    .map(|fragment| CompressedFileRange {
+                        path: path.clone(),
+                        offset: fragment.offset,
+                        length: fragment.length,
+                    })
+                    .collect(),
+            }
+        };
+        let (origin_x, origin_y, width, height, nominal_tile_width, nominal_tile_height) =
+            if self.is_tiled_wsi() {
+                let origin_x = col * self.source_tile_width as u64;
+                let origin_y = row * self.source_tile_height as u64;
+                (
+                    origin_x,
+                    origin_y,
+                    self.source_tile_width
+                        .min(meta.size_x.saturating_sub(origin_x as u32)),
+                    self.source_tile_height
+                        .min(meta.size_y.saturating_sub(origin_y as u32)),
+                    self.source_tile_width,
+                    self.source_tile_height,
+                )
+            } else {
+                (0, 0, meta.size_x, meta.size_y, meta.size_x, meta.size_y)
+            };
+        Ok(CompressedTile {
+            plane_index,
+            level,
+            col,
+            row,
+            origin_x,
+            origin_y,
+            width,
+            height,
+            nominal_tile_width,
+            nominal_tile_height,
+            codec,
+            mode: CompressedTileMode::OriginalBytes,
+            bytes,
+        })
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {

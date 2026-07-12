@@ -1,4 +1,6 @@
 use super::ome_metadata::OmeMetadata;
+use crate::common::compressed::{CompressedExtractionSupport, CompressedTile, CompressedTileMode};
+use crate::common::error::BioFormatsError;
 use crate::common::metadata::{ImageMetadata, LookupTable, MetadataOptions};
 use crate::error::Result;
 use std::path::Path;
@@ -35,6 +37,36 @@ pub trait FormatReader: Send + Sync {
         h: u32,
     ) -> Result<Vec<u8>>;
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>>;
+
+    /// Report whether a logical plane/resolution level can expose source
+    /// lossy-compressed blocks without pixel-domain decode/recompress.
+    ///
+    /// Most readers return `NotSupported`. Implementations should be
+    /// conservative and only report `Supported` when one requested compressed
+    /// tile/frame maps cleanly to stored source bytes or a lossless repack.
+    fn compressed_level_info(
+        &self,
+        _plane_index: u32,
+        _level: u32,
+    ) -> Result<CompressedExtractionSupport> {
+        Ok(CompressedExtractionSupport::NotSupported {
+            reason: "reader does not expose compressed source blocks".into(),
+        })
+    }
+
+    /// Return one source compressed tile/frame for a logical plane/resolution.
+    fn read_compressed_tile(
+        &mut self,
+        _plane_index: u32,
+        _level: u32,
+        _col: u64,
+        _row: u64,
+        _preferred_modes: &[CompressedTileMode],
+    ) -> Result<CompressedTile> {
+        Err(BioFormatsError::UnsupportedFormat(
+            "reader does not expose compressed source blocks".into(),
+        ))
+    }
     fn resolution_count(&self) -> usize {
         1
     }

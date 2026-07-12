@@ -13,6 +13,10 @@ use std::fs::File;
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+use crate::common::compressed::{
+    mode_allowed, CompressedBytes, CompressedExtractionSupport, CompressedLevelInfo,
+    CompressedTile, CompressedTileMode, JpegColorSpace, JpegSubsampling, LossyCodec,
+};
 use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata, LookupTable, MetadataValue};
 use crate::common::pixel_type::PixelType;
@@ -867,6 +871,115 @@ impl FormatReader for AviReader {
         self.meta
             .as_ref()
             .unwrap_or(crate::common::reader::uninitialized_metadata())
+    }
+
+    fn compressed_level_info(
+        &self,
+        plane_index: u32,
+        level: u32,
+    ) -> Result<CompressedExtractionSupport> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        if plane_index >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        if level != 0 {
+            return Ok(CompressedExtractionSupport::NotSupported {
+                reason: format!("AVI resolution level {level} is not available"),
+            });
+        }
+        if self.compression != AVI_JPEG {
+            return Ok(CompressedExtractionSupport::NotSupported {
+                reason: format!(
+                    "AVI codec {} is not exposed by the compressed extraction API",
+                    fourcc_to_string(self.compression.to_le_bytes())
+                ),
+            });
+        }
+        Ok(CompressedExtractionSupport::Supported(
+            CompressedLevelInfo {
+                plane_index,
+                level,
+                width: meta.size_x as u64,
+                height: meta.size_y as u64,
+                tile_width: meta.size_x,
+                tile_height: meta.size_y,
+                tiles_across: 1,
+                tiles_down: 1,
+                codec: LossyCodec::Jpeg {
+                    color_space: JpegColorSpace::Unknown,
+                    subsampling: Some(JpegSubsampling::Other {
+                        horizontal: 0,
+                        vertical: 0,
+                    }),
+                },
+                modes: vec![CompressedTileMode::OriginalBytes],
+                constraints: Vec::new(),
+            },
+        ))
+    }
+
+    fn read_compressed_tile(
+        &mut self,
+        plane_index: u32,
+        level: u32,
+        col: u64,
+        row: u64,
+        preferred_modes: &[CompressedTileMode],
+    ) -> Result<CompressedTile> {
+        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        if plane_index >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        if level != 0 || col != 0 || row != 0 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "AVI compressed extraction exposes one frame-sized tile at level 0".into(),
+            ));
+        }
+        if self.compression != AVI_JPEG {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "AVI codec {} is not exposed by the compressed extraction API",
+                fourcc_to_string(self.compression.to_le_bytes())
+            )));
+        }
+        if !mode_allowed(preferred_modes, CompressedTileMode::OriginalBytes) {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "AVI Motion-JPEG frames are available only as original bytes".into(),
+            ));
+        }
+        let (offset, length) = self
+            .frame_offsets
+            .get(plane_index as usize)
+            .copied()
+            .ok_or(BioFormatsError::PlaneOutOfRange(plane_index))?;
+        Ok(CompressedTile {
+            plane_index,
+            level,
+            col,
+            row,
+            origin_x: 0,
+            origin_y: 0,
+            width: meta.size_x,
+            height: meta.size_y,
+            nominal_tile_width: meta.size_x,
+            nominal_tile_height: meta.size_y,
+            codec: LossyCodec::Jpeg {
+                color_space: JpegColorSpace::Unknown,
+                subsampling: Some(JpegSubsampling::Other {
+                    horizontal: 0,
+                    vertical: 0,
+                }),
+            },
+            mode: CompressedTileMode::OriginalBytes,
+            bytes: CompressedBytes::FileRange {
+                path: self
+                    .path
+                    .as_ref()
+                    .ok_or(BioFormatsError::NotInitialized)?
+                    .clone(),
+                offset,
+                length: length as u64,
+            },
+        })
     }
 
     fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {

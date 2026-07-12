@@ -1,4 +1,5 @@
 pub mod codec;
+pub mod compressed;
 pub mod endian;
 pub mod error;
 pub mod io;

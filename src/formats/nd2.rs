@@ -16,6 +16,10 @@ use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
+use crate::common::compressed::{
+    mode_allowed, CompressedBytes, CompressedExtractionSupport, CompressedLevelInfo,
+    CompressedTile, CompressedTileMode, Jpeg2000Container, LossyCodec,
+};
 use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
 use crate::common::pixel_type::PixelType;
@@ -1727,6 +1731,40 @@ fn assemble_nd2_frame_chunks(data: &[u8], table: &Nd2FrameChunkTable) -> Vec<u8>
     out
 }
 
+fn nd2_jpeg2000_container(data: &[u8]) -> Jpeg2000Container {
+    if data.starts_with(&[0xff, 0x4f, 0xff, 0x51]) {
+        Jpeg2000Container::Codestream
+    } else if data.starts_with(&[0x00, 0x00, 0x00, 0x0c, b'j', b'P', b' ', b' ']) {
+        Jpeg2000Container::Jp2
+    } else {
+        Jpeg2000Container::Unknown
+    }
+}
+
+fn nd2_compressed_jpeg2000_payload(data: &[u8]) -> Option<(Vec<u8>, Jpeg2000Container)> {
+    const FRAME_PREFIX_LEN: usize = 8;
+    const NIKON_PAYLOAD_OFFSET: usize = 4096;
+
+    for prefix_len in [0usize, FRAME_PREFIX_LEN, NIKON_PAYLOAD_OFFSET] {
+        let Some(payload) = data.get(prefix_len..) else {
+            continue;
+        };
+        if looks_like_jpeg2000(payload) {
+            return Some((payload.to_vec(), nd2_jpeg2000_container(payload)));
+        }
+    }
+
+    let table = nd2_frame_chunk_table_any_payload(data, data.len())?;
+    if nd2_chunk_table_per_chunk_compression_label(data, &table).is_some() {
+        return None;
+    }
+    let payload = assemble_nd2_frame_chunks(data, &table);
+    looks_like_jpeg2000(&payload).then(|| {
+        let container = nd2_jpeg2000_container(&payload);
+        (payload, container)
+    })
+}
+
 fn nd2_chunk_table_label(table: &Nd2FrameChunkTable, suffix: &str) -> Option<&'static str> {
     match (table.entry_width, suffix) {
         (4, "") => Some("chunk_table_le32"),
@@ -2503,6 +2541,59 @@ impl Nd2Reader {
         self.file = Some(reader);
         self.path = Some(path.to_path_buf());
         Ok(())
+    }
+
+    fn current_meta_checked(&self, plane_index: u32) -> Result<&ImageMetadata> {
+        let meta = self
+            .meta
+            .get(self.current_series)
+            .ok_or(BioFormatsError::NotInitialized)?;
+        if plane_index >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        Ok(meta)
+    }
+
+    fn normal_frame_chunk_for_plane(&self, plane_index: u32) -> Result<&Nd2Chunk> {
+        let series_chunks = self
+            .series_image_chunks
+            .get(self.current_series)
+            .unwrap_or(&self.image_chunks);
+        let chunk_idx = series_chunks
+            .get(plane_index as usize)
+            .copied()
+            .ok_or(BioFormatsError::PlaneOutOfRange(plane_index))?;
+        self.chunks
+            .get(chunk_idx)
+            .ok_or(BioFormatsError::PlaneOutOfRange(plane_index))
+    }
+
+    fn read_normal_frame_data(&self, chunk: &Nd2Chunk) -> Result<Vec<u8>> {
+        let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let mut reader = BufReader::new(File::open(path).map_err(BioFormatsError::Io)?);
+        read_chunk_data(&mut reader, chunk).map_err(BioFormatsError::Io)
+    }
+
+    fn nd2_compressed_payload_for_plane(
+        &self,
+        plane_index: u32,
+    ) -> Result<(Vec<u8>, Jpeg2000Container)> {
+        self.current_meta_checked(plane_index)?;
+        if !self.old_jp2_planes.is_empty() {
+            return self
+                .old_jp2_planes
+                .get(self.current_series)
+                .and_then(|planes| planes.get(plane_index as usize))
+                .map(|_| (Vec::new(), Jpeg2000Container::Codestream))
+                .ok_or(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        let chunk = self.normal_frame_chunk_for_plane(plane_index)?;
+        let data = self.read_normal_frame_data(chunk)?;
+        nd2_compressed_jpeg2000_payload(&data).ok_or_else(|| {
+            BioFormatsError::UnsupportedFormat(
+                "ND2 frame is not a clean whole-frame JPEG2000 payload".into(),
+            )
+        })
     }
 }
 
@@ -3745,6 +3836,101 @@ impl FormatReader for Nd2Reader {
         self.open_bytes_region(plane_index, tx, ty, tw, th)
     }
 
+    fn compressed_level_info(
+        &self,
+        plane_index: u32,
+        level: u32,
+    ) -> Result<CompressedExtractionSupport> {
+        let meta = self.current_meta_checked(plane_index)?;
+        if level != 0 {
+            return Ok(CompressedExtractionSupport::NotSupported {
+                reason: "ND2 compressed extraction only supports resolution level 0".into(),
+            });
+        }
+        let container = match self.nd2_compressed_payload_for_plane(plane_index) {
+            Ok((_, container)) => container,
+            Err(BioFormatsError::UnsupportedFormat(reason)) => {
+                return Ok(CompressedExtractionSupport::NotSupported { reason });
+            }
+            Err(err) => return Err(err),
+        };
+        Ok(CompressedExtractionSupport::Supported(
+            CompressedLevelInfo {
+                plane_index,
+                level,
+                width: u64::from(meta.size_x),
+                height: u64::from(meta.size_y),
+                tile_width: meta.size_x,
+                tile_height: meta.size_y,
+                tiles_across: 1,
+                tiles_down: 1,
+                codec: LossyCodec::Jpeg2000 { container },
+                modes: vec![CompressedTileMode::OriginalBytes],
+                constraints: Vec::new(),
+            },
+        ))
+    }
+
+    fn read_compressed_tile(
+        &mut self,
+        plane_index: u32,
+        level: u32,
+        col: u64,
+        row: u64,
+        preferred_modes: &[CompressedTileMode],
+    ) -> Result<CompressedTile> {
+        if !mode_allowed(preferred_modes, CompressedTileMode::OriginalBytes) {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "requested compressed tile modes are not available for ND2 frames".into(),
+            ));
+        }
+        let meta = self.current_meta_checked(plane_index)?;
+        if level != 0 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "ND2 compressed extraction only supports resolution level 0".into(),
+            ));
+        }
+        if col != 0 || row != 0 {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        let codec;
+        let bytes = if !self.old_jp2_planes.is_empty() {
+            let plane = self
+                .old_jp2_planes
+                .get(self.current_series)
+                .and_then(|planes| planes.get(plane_index as usize))
+                .ok_or(BioFormatsError::PlaneOutOfRange(plane_index))?;
+            let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+            codec = LossyCodec::Jpeg2000 {
+                container: Jpeg2000Container::Codestream,
+            };
+            CompressedBytes::FileRange {
+                path: path.clone(),
+                offset: plane.data_offset,
+                length: plane.data_length,
+            }
+        } else {
+            let (payload, container) = self.nd2_compressed_payload_for_plane(plane_index)?;
+            codec = LossyCodec::Jpeg2000 { container };
+            CompressedBytes::Owned(payload)
+        };
+        Ok(CompressedTile {
+            plane_index,
+            level,
+            col,
+            row,
+            origin_x: 0,
+            origin_y: 0,
+            width: meta.size_x,
+            height: meta.size_y,
+            nominal_tile_width: meta.size_x,
+            nominal_tile_height: meta.size_y,
+            codec,
+            mode: CompressedTileMode::OriginalBytes,
+            bytes,
+        })
+    }
+
     fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
         use crate::common::ome_metadata::{
             create_lsid, OmeDetector, OmeInstrument, OmeMetadata, OmeObjective, OmePlane,
@@ -3999,6 +4185,33 @@ mod tests {
         let (encoding, payload_offset) = nd2_frame_payload_layout(&frame, frame.len(), 4);
         assert_eq!(encoding, "chunk_table_le32_jpeg2000");
         assert_eq!(payload_offset, 0);
+    }
+
+    #[test]
+    fn nd2_compressed_payload_returns_direct_jpeg2000_frame() {
+        let jp2 = vec![0xff, 0x4f, 0xff, 0x51, 1, 2, 3, 4];
+        let (payload, container) = nd2_compressed_jpeg2000_payload(&jp2).unwrap();
+        assert_eq!(payload, jp2);
+        assert_eq!(container, Jpeg2000Container::Codestream);
+    }
+
+    #[test]
+    fn nd2_compressed_payload_assembles_split_jpeg2000_frame() {
+        let jp2 = [0xff, 0x4f, 0xff, 0x51, 1, 2, 3, 4];
+        let frame = chunk_table_frame(&[(20, &jp2[..4]), (28, &jp2[4..])]);
+
+        let (payload, container) = nd2_compressed_jpeg2000_payload(&frame).unwrap();
+        assert_eq!(payload, jp2);
+        assert_eq!(container, Jpeg2000Container::Codestream);
+    }
+
+    #[test]
+    fn nd2_compressed_payload_rejects_per_chunk_jpeg2000() {
+        let first = [0xff, 0x4f, 0xff, 0x51, 1];
+        let second = [0xff, 0x4f, 0xff, 0x51, 2];
+        let frame = chunk_table_frame(&[(20, &first), (32, &second)]);
+
+        assert!(nd2_compressed_jpeg2000_payload(&frame).is_none());
     }
 
     #[test]

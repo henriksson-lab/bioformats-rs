@@ -3,6 +3,11 @@ use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
+use crate::common::compressed::{
+    mode_allowed, CompressedBytes, CompressedExtractionConstraint, CompressedExtractionSupport,
+    CompressedLevelInfo, CompressedTile, CompressedTileMode, Jpeg2000Container, JpegColorSpace,
+    JpegSubsampling, LossyCodec,
+};
 use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata};
 use crate::common::path::confined_join;
@@ -1300,13 +1305,22 @@ impl TiffReader {
 
     /// Resolve the IFD index for a given plane, taking current resolution into account.
     fn resolve_ifd_index(&self, plane_index: u32) -> Result<usize> {
-        let s = self.series.get(self.current_series).ok_or_else(|| {
+        self.resolve_ifd_index_at(self.current_series, self.current_resolution, plane_index)
+    }
+
+    fn resolve_ifd_index_at(
+        &self,
+        series: usize,
+        resolution: usize,
+        plane_index: u32,
+    ) -> Result<usize> {
+        let s = self.series.get(series).ok_or_else(|| {
             BioFormatsError::Format(format!(
                 "TIFF reader has no initialized series for current series {}",
-                self.current_series
+                series
             ))
         })?;
-        if self.current_resolution == 0 {
+        if resolution == 0 {
             // Main resolution
             if !s.plane_ifd_indices.is_empty() {
                 return s
@@ -1321,12 +1335,9 @@ impl TiffReader {
                 .ok_or(BioFormatsError::PlaneOutOfRange(plane_index))
         } else {
             // Sub-resolution level (1-based index into sub_resolutions)
-            let level = self.current_resolution - 1;
+            let level = resolution - 1;
             let sub = s.sub_resolutions.get(level).ok_or_else(|| {
-                BioFormatsError::Format(format!(
-                    "resolution level {} out of range",
-                    self.current_resolution
-                ))
+                BioFormatsError::Format(format!("resolution level {} out of range", resolution))
             })?;
             sub.get(plane_index as usize)
                 .copied()
@@ -1346,6 +1357,136 @@ impl TiffReader {
             .external_planes
             .get(plane_index as usize)
             .and_then(|p| p.clone())
+    }
+
+    fn compressed_info_for_ifd(
+        &self,
+        ifd_index: usize,
+        plane_index: u32,
+        level: u32,
+    ) -> Result<CompressedExtractionSupport> {
+        let file = self.file.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let ifd = file
+            .ifds
+            .get(ifd_index)
+            .ok_or_else(|| BioFormatsError::Format(format!("TIFF IFD {ifd_index} out of range")))?;
+        let info = Self::ifd_info(ifd, self.is_little_endian())?;
+        let Some(codec) = tiff_lossy_codec(&info) else {
+            return Ok(CompressedExtractionSupport::NotSupported {
+                reason: format!(
+                    "TIFF compression {:?} is not a supported lossy block codec",
+                    info.compression
+                ),
+            });
+        };
+        let (tile_width, tile_height, tiles_across, tiles_down) = tiff_compressed_grid(&info)?;
+        let modes = tiff_compressed_modes(&info);
+        if modes.is_empty() {
+            return Ok(CompressedExtractionSupport::NotSupported {
+                reason: "TIFF compressed block mode is not supported".into(),
+            });
+        }
+        Ok(CompressedExtractionSupport::Supported(
+            CompressedLevelInfo {
+                plane_index,
+                level,
+                width: u64::from(info.width),
+                height: u64::from(info.height),
+                tile_width,
+                tile_height,
+                tiles_across,
+                tiles_down,
+                codec,
+                modes,
+                constraints: vec![
+                    CompressedExtractionConstraint::RequiresCustomZarrCodec,
+                    CompressedExtractionConstraint::EdgeTilesMayBePartial,
+                ],
+            },
+        ))
+    }
+
+    fn compressed_tile_for_ifd(
+        &self,
+        ifd_index: usize,
+        plane_index: u32,
+        level: u32,
+        col: u64,
+        row: u64,
+        preferred_modes: &[CompressedTileMode],
+    ) -> Result<CompressedTile> {
+        let path = self.path.clone().ok_or(BioFormatsError::NotInitialized)?;
+        let file = self.file.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        let ifd = file
+            .ifds
+            .get(ifd_index)
+            .ok_or_else(|| BioFormatsError::Format(format!("TIFF IFD {ifd_index} out of range")))?;
+        let info = Self::ifd_info(ifd, self.is_little_endian())?;
+        let codec = tiff_lossy_codec(&info).ok_or_else(|| {
+            BioFormatsError::UnsupportedFormat(format!(
+                "TIFF compression {:?} is not a supported lossy block codec",
+                info.compression
+            ))
+        })?;
+        let (
+            offset,
+            length,
+            origin_x,
+            origin_y,
+            width,
+            height,
+            nominal_tile_width,
+            nominal_tile_height,
+        ) = tiff_compressed_block(&info, col, row)?;
+        let modes = tiff_compressed_modes(&info);
+        let mode = if modes.contains(&CompressedTileMode::OriginalBytes)
+            && mode_allowed(preferred_modes, CompressedTileMode::OriginalBytes)
+        {
+            CompressedTileMode::OriginalBytes
+        } else if modes.contains(&CompressedTileMode::DerivedLosslessJpeg)
+            && mode_allowed(preferred_modes, CompressedTileMode::DerivedLosslessJpeg)
+        {
+            CompressedTileMode::DerivedLosslessJpeg
+        } else {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "requested compressed tile modes are not available for this TIFF block".into(),
+            ));
+        };
+        let bytes = match mode {
+            CompressedTileMode::OriginalBytes => CompressedBytes::FileRange {
+                path,
+                offset,
+                length,
+            },
+            CompressedTileMode::DerivedLosslessJpeg => {
+                let tables = info.jpeg_tables.as_deref().ok_or_else(|| {
+                    BioFormatsError::UnsupportedFormat(
+                        "TIFF derived standalone JPEG requires JPEGTables".into(),
+                    )
+                })?;
+                let mut f = File::open(&path).map_err(BioFormatsError::Io)?;
+                f.seek(SeekFrom::Start(offset))
+                    .map_err(BioFormatsError::Io)?;
+                let mut data = vec![0u8; length as usize];
+                f.read_exact(&mut data).map_err(BioFormatsError::Io)?;
+                CompressedBytes::Owned(merge_jpeg_tables(tables, &data))
+            }
+        };
+        Ok(CompressedTile {
+            plane_index,
+            level,
+            col,
+            row,
+            origin_x,
+            origin_y,
+            width,
+            height,
+            nominal_tile_width,
+            nominal_tile_height,
+            codec,
+            mode,
+            bytes,
+        })
     }
 
     /// Read one plane region from a companion TIFF, opening (and caching) a
@@ -4268,6 +4409,125 @@ fn jpeg_color_for(info: &IfdInfo) -> JpegColor {
     }
 }
 
+fn tiff_lossy_codec(info: &IfdInfo) -> Option<LossyCodec> {
+    match info.compression {
+        Compression::Jpeg | Compression::JpegNew => Some(LossyCodec::Jpeg {
+            color_space: match info.photometric {
+                Photometric::Rgb => JpegColorSpace::Rgb,
+                Photometric::YCbCr => JpegColorSpace::YCbCr,
+                Photometric::MinIsBlack | Photometric::MinIsWhite => JpegColorSpace::Gray,
+                _ => JpegColorSpace::Unknown,
+            },
+            subsampling: if info.photometric == Photometric::YCbCr {
+                Some(match info.ycbcr_subsampling {
+                    (1, 1) => JpegSubsampling::Cs444,
+                    (2, 1) => JpegSubsampling::Cs422,
+                    (2, 2) => JpegSubsampling::Cs420,
+                    (horizontal, vertical) => JpegSubsampling::Other {
+                        horizontal,
+                        vertical,
+                    },
+                })
+            } else {
+                None
+            },
+        }),
+        Compression::Jpeg2000 => Some(LossyCodec::Jpeg2000 {
+            container: Jpeg2000Container::Unknown,
+        }),
+        Compression::JpegXR => Some(LossyCodec::JpegXr),
+        _ => None,
+    }
+}
+
+fn tiff_compressed_modes(info: &IfdInfo) -> Vec<CompressedTileMode> {
+    match info.compression {
+        Compression::Jpeg | Compression::JpegNew if info.jpeg_tables.is_some() => {
+            vec![CompressedTileMode::DerivedLosslessJpeg]
+        }
+        Compression::Jpeg | Compression::JpegNew | Compression::Jpeg2000 | Compression::JpegXR => {
+            vec![CompressedTileMode::OriginalBytes]
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn tiff_compressed_grid(info: &IfdInfo) -> Result<(u32, u32, u64, u64)> {
+    if info.is_tiled {
+        if info.tile_width == 0 || info.tile_height == 0 {
+            return Err(BioFormatsError::Format(
+                "TIFF compressed tile dimensions are zero".into(),
+            ));
+        }
+        Ok((
+            info.tile_width,
+            info.tile_height,
+            u64::from(info.width).div_ceil(u64::from(info.tile_width)),
+            u64::from(info.height).div_ceil(u64::from(info.tile_height)),
+        ))
+    } else {
+        let rows_per_strip = info.rows_per_strip.max(1);
+        let rows = if !info.strip_offsets.is_empty() {
+            info.strip_offsets.len() as u64
+        } else {
+            u64::from(info.height).div_ceil(u64::from(rows_per_strip))
+        };
+        Ok((info.width, rows_per_strip, 1, rows))
+    }
+}
+
+#[allow(clippy::type_complexity)]
+fn tiff_compressed_block(
+    info: &IfdInfo,
+    col: u64,
+    row: u64,
+) -> Result<(u64, u64, u64, u64, u32, u32, u32, u32)> {
+    let (tile_width, tile_height, tiles_across, tiles_down) = tiff_compressed_grid(info)?;
+    if col >= tiles_across || row >= tiles_down {
+        return Err(BioFormatsError::Format(format!(
+            "TIFF compressed block ({col}, {row}) out of range ({tiles_across}x{tiles_down})"
+        )));
+    }
+    let index = if info.is_tiled {
+        row.checked_mul(tiles_across)
+            .and_then(|base| base.checked_add(col))
+            .ok_or_else(|| BioFormatsError::Format("TIFF compressed tile index overflows".into()))?
+            as usize
+    } else {
+        if col != 0 {
+            return Err(BioFormatsError::Format(
+                "TIFF stripped compressed blocks only have column 0".into(),
+            ));
+        }
+        row as usize
+    };
+    let (offsets, byte_counts) = if info.is_tiled {
+        (&info.tile_offsets, &info.tile_byte_counts)
+    } else {
+        (&info.strip_offsets, &info.strip_byte_counts)
+    };
+    let offset = *offsets.get(index).ok_or_else(|| {
+        BioFormatsError::Format(format!("TIFF compressed block {index} has no offset"))
+    })?;
+    let length = *byte_counts.get(index).ok_or_else(|| {
+        BioFormatsError::Format(format!("TIFF compressed block {index} has no byte count"))
+    })?;
+    let origin_x = col * u64::from(tile_width);
+    let origin_y = row * u64::from(tile_height);
+    let width = u64::from(tile_width).min(u64::from(info.width).saturating_sub(origin_x)) as u32;
+    let height = u64::from(tile_height).min(u64::from(info.height).saturating_sub(origin_y)) as u32;
+    Ok((
+        offset,
+        length,
+        origin_x,
+        origin_y,
+        width,
+        height,
+        tile_width,
+        tile_height,
+    ))
+}
+
 fn is_unsupported_ycbcr(info: &IfdInfo) -> bool {
     info.bits_per_sample != 8 || info.planar_config != 1 || info.samples_per_pixel < 3
 }
@@ -4661,6 +4921,62 @@ impl crate::common::reader::FormatReader for TiffReader {
         self.get_samples(ifd_index, tx, ty, tw, th)
     }
 
+    fn compressed_level_info(
+        &self,
+        plane_index: u32,
+        level: u32,
+    ) -> Result<CompressedExtractionSupport> {
+        let level_usize = level as usize;
+        let s = self.series.get(self.current_series).ok_or_else(|| {
+            BioFormatsError::Format(format!(
+                "TIFF reader has no initialized series for current series {}",
+                self.current_series
+            ))
+        })?;
+        if level_usize == 0
+            && s.external_planes
+                .get(plane_index as usize)
+                .and_then(|p| p.as_ref())
+                .is_some()
+        {
+            return Ok(CompressedExtractionSupport::NotSupported {
+                reason: "compressed extraction for multi-file OME-TIFF companion planes is not supported".into(),
+            });
+        }
+        let ifd_index = self.resolve_ifd_index_at(self.current_series, level_usize, plane_index)?;
+        self.compressed_info_for_ifd(ifd_index, plane_index, level)
+    }
+
+    fn read_compressed_tile(
+        &mut self,
+        plane_index: u32,
+        level: u32,
+        col: u64,
+        row: u64,
+        preferred_modes: &[CompressedTileMode],
+    ) -> Result<CompressedTile> {
+        let level_usize = level as usize;
+        let s = self.series.get(self.current_series).ok_or_else(|| {
+            BioFormatsError::Format(format!(
+                "TIFF reader has no initialized series for current series {}",
+                self.current_series
+            ))
+        })?;
+        if level_usize == 0
+            && s.external_planes
+                .get(plane_index as usize)
+                .and_then(|p| p.as_ref())
+                .is_some()
+        {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "compressed extraction for multi-file OME-TIFF companion planes is not supported"
+                    .into(),
+            ));
+        }
+        let ifd_index = self.resolve_ifd_index_at(self.current_series, level_usize, plane_index)?;
+        self.compressed_tile_for_ifd(ifd_index, plane_index, level, col, row, preferred_modes)
+    }
+
     fn resolution_count(&self) -> usize {
         let s = &self.series[self.current_series];
         1 + s.sub_resolutions.len()
@@ -4739,6 +5055,30 @@ mod tests {
         push_u32_le(data, value);
     }
 
+    fn synthetic_jpeg_stripped_tiff() -> Vec<u8> {
+        let compressed = [0xff, 0xd8, 0xff, 0xd9];
+        let entry_count = 10u16;
+        let pixel_offset = 8 + 2 + u32::from(entry_count) * 12 + 4;
+        let mut data = Vec::new();
+        data.extend_from_slice(b"II");
+        push_u16_le(&mut data, 42);
+        push_u32_le(&mut data, 8);
+        push_u16_le(&mut data, entry_count);
+        push_ifd_long(&mut data, tag::IMAGE_WIDTH, 2);
+        push_ifd_long(&mut data, tag::IMAGE_LENGTH, 2);
+        push_ifd_short(&mut data, tag::BITS_PER_SAMPLE, 8);
+        push_ifd_short(&mut data, tag::COMPRESSION, 7);
+        push_ifd_short(&mut data, tag::PHOTOMETRIC_INTERPRETATION, 2);
+        push_ifd_long(&mut data, tag::STRIP_OFFSETS, pixel_offset);
+        push_ifd_short(&mut data, tag::SAMPLES_PER_PIXEL, 3);
+        push_ifd_long(&mut data, tag::ROWS_PER_STRIP, 2);
+        push_ifd_long(&mut data, tag::STRIP_BYTE_COUNTS, compressed.len() as u32);
+        push_ifd_short(&mut data, tag::PLANAR_CONFIGURATION, 1);
+        push_u32_le(&mut data, 0);
+        data.extend_from_slice(&compressed);
+        data
+    }
+
     fn push_ifd_undefined(data: &mut Vec<u8>, tag: u16, value: &[u8], offset: u32) {
         push_u16_le(data, tag);
         push_u16_le(data, 7);
@@ -4773,6 +5113,55 @@ mod tests {
         let mut maker_note = b"Nikon\0\x02\0\0\0".to_vec();
         maker_note.extend_from_slice(&nested);
         maker_note
+    }
+
+    #[test]
+    fn compressed_api_exposes_jpeg_strip_file_range() {
+        let path = std::env::temp_dir().join(format!(
+            "bioformats-rs-compressed-strip-{}.tif",
+            std::process::id()
+        ));
+        fs::write(&path, synthetic_jpeg_stripped_tiff()).unwrap();
+
+        let mut reader = TiffReader::new();
+        reader.set_id(&path).unwrap();
+
+        let support = reader.compressed_level_info(0, 0).unwrap();
+        let info = match support {
+            CompressedExtractionSupport::Supported(info) => info,
+            CompressedExtractionSupport::NotSupported { reason } => {
+                panic!("expected compressed extraction support: {reason}")
+            }
+        };
+        assert_eq!(info.plane_index, 0);
+        assert_eq!(info.level, 0);
+        assert_eq!(info.width, 2);
+        assert_eq!(info.height, 2);
+        assert_eq!(info.tile_width, 2);
+        assert_eq!(info.tile_height, 2);
+        assert_eq!(info.tiles_across, 1);
+        assert_eq!(info.tiles_down, 1);
+        assert_eq!(info.modes, vec![CompressedTileMode::OriginalBytes]);
+
+        let tile = reader.read_compressed_tile(0, 0, 0, 0, &[]).unwrap();
+        assert_eq!(tile.width, 2);
+        assert_eq!(tile.height, 2);
+        assert_eq!(tile.codec, info.codec);
+        assert_eq!(tile.mode, CompressedTileMode::OriginalBytes);
+        match tile.bytes {
+            CompressedBytes::FileRange {
+                path: range_path,
+                offset,
+                length,
+            } => {
+                assert_eq!(range_path, path);
+                assert_eq!(offset, 134);
+                assert_eq!(length, 4);
+            }
+            other => panic!("expected file range, got {other:?}"),
+        }
+
+        let _ = fs::remove_file(path);
     }
 
     #[test]

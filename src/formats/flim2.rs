@@ -10,6 +10,11 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::common::codec::{decompress_deflate, decompress_lzw, decompress_packbits};
+use crate::common::compressed::{
+    mode_allowed, CompressedBytes, CompressedExtractionConstraint, CompressedExtractionSupport,
+    CompressedLevelInfo, CompressedTile, CompressedTileMode, Jpeg2000Container, JpegColorSpace,
+    LossyCodec,
+};
 use crate::common::error::{BioFormatsError, Result};
 use crate::common::io::read_bytes_at;
 use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue, ModuloAnnotation};
@@ -12357,6 +12362,118 @@ impl EtsVolume {
             .ok_or_else(|| BioFormatsError::Format("cellSens ETS tile byte count overflows".into()))
     }
 
+    fn compressed_codec(&self) -> Option<LossyCodec> {
+        match self.compression {
+            ETS_JPEG => Some(LossyCodec::Jpeg {
+                color_space: if self.rgb_channels() == 1 {
+                    JpegColorSpace::Gray
+                } else {
+                    JpegColorSpace::Unknown
+                },
+                subsampling: None,
+            }),
+            ETS_JPEG_2000 => Some(LossyCodec::Jpeg2000 {
+                container: Jpeg2000Container::Unknown,
+            }),
+            _ => None,
+        }
+    }
+
+    fn compressed_support(
+        &self,
+        plane_index: u32,
+        actual_resolution: usize,
+        reported_level: u32,
+    ) -> Result<CompressedExtractionSupport> {
+        let Some(codec) = self.compressed_codec() else {
+            return Ok(CompressedExtractionSupport::NotSupported {
+                reason: format!(
+                    "cellSens ETS compression code {} is not a supported JPEG/JPEG2000 compressed tile codec",
+                    self.compression
+                ),
+            });
+        };
+        let level = self
+            .levels
+            .get(actual_resolution)
+            .ok_or(BioFormatsError::PlaneOutOfRange(reported_level))?;
+        if self.tile_x == 0 || self.tile_y == 0 || level.cols == 0 || level.rows == 0 {
+            return Ok(CompressedExtractionSupport::NotSupported {
+                reason: "cellSens ETS tile grid is empty or has zero-sized tiles".into(),
+            });
+        }
+        if self.tile_origin_x.unwrap_or(0) != 0 || self.tile_origin_y.unwrap_or(0) != 0 {
+            return Ok(CompressedExtractionSupport::NotSupported {
+                reason: "cellSens ETS tile origin crop prevents clean one-to-one compressed tile extraction".into(),
+            });
+        }
+        let (z, c, t) = self.plane_coords(actual_resolution, plane_index)?;
+        if !self.plane_chunks_are_clean(actual_resolution, z, c, t)? {
+            return Ok(CompressedExtractionSupport::NotSupported {
+                reason: "cellSens ETS requested plane has missing chunks or invalid chunk offsets/byte counts".into(),
+            });
+        }
+        Ok(CompressedExtractionSupport::Supported(
+            CompressedLevelInfo {
+                plane_index,
+                level: reported_level,
+                width: u64::from(level.size_x),
+                height: u64::from(level.size_y),
+                tile_width: self.tile_x,
+                tile_height: self.tile_y,
+                tiles_across: u64::from(level.cols),
+                tiles_down: u64::from(level.rows),
+                codec,
+                modes: vec![CompressedTileMode::OriginalBytes],
+                constraints: vec![CompressedExtractionConstraint::EdgeTilesMayBePartial],
+            },
+        ))
+    }
+
+    fn plane_chunks_are_clean(&self, resolution: usize, z: i32, c: i32, t: i32) -> Result<bool> {
+        let level = self
+            .levels
+            .get(resolution)
+            .ok_or(BioFormatsError::PlaneOutOfRange(resolution as u32))?;
+        let file_len = std::fs::metadata(&self.path)
+            .map_err(BioFormatsError::Io)?
+            .len();
+        for row in 0..level.rows {
+            for col in 0..level.cols {
+                let Some(index) = self.find_tile(resolution, row as i32, col as i32, z, c, t)
+                else {
+                    return Ok(false);
+                };
+                let (_, offset, n_bytes) = self.tiles[index];
+                if n_bytes == 0
+                    || offset
+                        .checked_add(u64::from(n_bytes))
+                        .is_none_or(|end| end > file_len)
+                {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    fn plane_coords(&self, resolution: usize, plane_index: u32) -> Result<(i32, i32, i32)> {
+        let level = self
+            .levels
+            .get(resolution)
+            .ok_or(BioFormatsError::PlaneOutOfRange(resolution as u32))?;
+        let n_c = (level.size_c / self.rgb_channels().max(1)).max(1);
+        let n_z = level.size_z.max(1);
+        let count = n_c * n_z * level.size_t.max(1);
+        if plane_index >= count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        let c = (plane_index % n_c) as i32;
+        let z = ((plane_index / n_c) % n_z) as i32;
+        let t = (plane_index / (n_c * n_z)) as i32;
+        Ok((z, c, t))
+    }
+
     /// Build the tile coordinate for (resolution, row, col, z, c, t) and look up
     /// its index in the tile map. Mirrors `decodeTile` coordinate construction
     /// (CellSensReader.java:1114-1141).
@@ -12396,6 +12513,84 @@ impl EtsVolume {
             coord[ndim - 1] = resolution as i32;
         }
         self.tiles.iter().position(|(co, _, _)| co == &coord)
+    }
+
+    fn compressed_tile(
+        &self,
+        plane_index: u32,
+        actual_resolution: usize,
+        reported_level: u32,
+        col: u64,
+        row: u64,
+        preferred_modes: &[CompressedTileMode],
+    ) -> Result<CompressedTile> {
+        if !mode_allowed(preferred_modes, CompressedTileMode::OriginalBytes) {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "requested compressed tile modes are not available for cellSens ETS chunks".into(),
+            ));
+        }
+        let codec = self.compressed_codec().ok_or_else(|| {
+            BioFormatsError::UnsupportedFormat(format!(
+                "cellSens ETS compression code {} is not a supported JPEG/JPEG2000 compressed tile codec",
+                self.compression
+            ))
+        })?;
+        let level = self
+            .levels
+            .get(actual_resolution)
+            .ok_or(BioFormatsError::PlaneOutOfRange(reported_level))?;
+        if col >= u64::from(level.cols) || row >= u64::from(level.rows) {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        if self.tile_origin_x.unwrap_or(0) != 0 || self.tile_origin_y.unwrap_or(0) != 0 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "cellSens ETS tile origin crop prevents clean one-to-one compressed tile extraction"
+                    .into(),
+            ));
+        }
+        let (z, c, t) = self.plane_coords(actual_resolution, plane_index)?;
+        let Some(index) = self.find_tile(actual_resolution, row as i32, col as i32, z, c, t) else {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "cellSens ETS requested compressed tile is missing from the chunk table".into(),
+            ));
+        };
+        let (_, offset, n_bytes) = self.tiles[index];
+        let file_len = std::fs::metadata(&self.path)
+            .map_err(BioFormatsError::Io)?
+            .len();
+        if n_bytes == 0
+            || offset
+                .checked_add(u64::from(n_bytes))
+                .is_none_or(|end| end > file_len)
+        {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "cellSens ETS requested compressed tile has an invalid offset/byte count".into(),
+            ));
+        }
+
+        let origin_x = col * u64::from(self.tile_x);
+        let origin_y = row * u64::from(self.tile_y);
+        let width = (u64::from(level.size_x).saturating_sub(origin_x)).min(u64::from(self.tile_x));
+        let height = (u64::from(level.size_y).saturating_sub(origin_y)).min(u64::from(self.tile_y));
+        Ok(CompressedTile {
+            plane_index,
+            level: reported_level,
+            col,
+            row,
+            origin_x,
+            origin_y,
+            width: u32::try_from(width).unwrap_or(self.tile_x),
+            height: u32::try_from(height).unwrap_or(self.tile_y),
+            nominal_tile_width: self.tile_x,
+            nominal_tile_height: self.tile_y,
+            codec,
+            mode: CompressedTileMode::OriginalBytes,
+            bytes: CompressedBytes::FileRange {
+                path: self.path.clone(),
+                offset,
+                length: u64::from(n_bytes),
+            },
+        })
     }
 
     /// Decode one tile at (resolution,row,col,z,c,t), returning exactly
@@ -14602,6 +14797,54 @@ impl FormatReader for CellSensReader {
                 let (tx, ty) = ((meta.size_x - tw) / 2, (meta.size_y - th) / 2);
                 self.open_bytes_region(p, tx, ty, tw, th)
             }
+        }
+    }
+
+    fn compressed_level_info(
+        &self,
+        plane_index: u32,
+        level: u32,
+    ) -> Result<CompressedExtractionSupport> {
+        if level != 0 {
+            return Ok(CompressedExtractionSupport::NotSupported {
+                reason: "cellSens exposes ETS pyramid resolutions as flattened series; only level 0 is valid for the current series".into(),
+            });
+        }
+        match self.target {
+            CellSensTarget::Ets { volume, resolution } => {
+                self.ets[volume].compressed_support(plane_index, resolution, level)
+            }
+            CellSensTarget::Tiff(_) => Ok(CompressedExtractionSupport::NotSupported {
+                reason: "cellSens embedded TIFF overview is not an ETS tiled chunk series".into(),
+            }),
+        }
+    }
+
+    fn read_compressed_tile(
+        &mut self,
+        plane_index: u32,
+        level: u32,
+        col: u64,
+        row: u64,
+        preferred_modes: &[CompressedTileMode],
+    ) -> Result<CompressedTile> {
+        if level != 0 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "cellSens exposes ETS pyramid resolutions as flattened series; only level 0 is valid for the current series".into(),
+            ));
+        }
+        match self.target {
+            CellSensTarget::Ets { volume, resolution } => self.ets[volume].compressed_tile(
+                plane_index,
+                resolution,
+                level,
+                col,
+                row,
+                preferred_modes,
+            ),
+            CellSensTarget::Tiff(_) => Err(BioFormatsError::UnsupportedFormat(
+                "cellSens embedded TIFF overview is not an ETS tiled chunk series".into(),
+            )),
         }
     }
 
@@ -20626,6 +20869,28 @@ EndClass: 0
         n_bytes: u32,
         payload_len: usize,
     ) -> Vec<u8> {
+        build_synthetic_ets_with_compression(
+            n_dimensions,
+            pixel_type_code,
+            size_c,
+            ETS_RAW,
+            tile_x,
+            tile_y,
+            n_bytes,
+            payload_len,
+        )
+    }
+
+    fn build_synthetic_ets_with_compression(
+        n_dimensions: u32,
+        pixel_type_code: i32,
+        size_c: u32,
+        compression: i32,
+        tile_x: u32,
+        tile_y: u32,
+        n_bytes: u32,
+        payload_len: usize,
+    ) -> Vec<u8> {
         let additional_header_offset = 64usize;
         let used_chunk_offset = 256usize;
         let entry_len = 4 + n_dimensions as usize * 4 + 8 + 4 + 4;
@@ -20642,7 +20907,7 @@ EndClass: 0
         let base = additional_header_offset + 8;
         bytes[base..base + 4].copy_from_slice(&pixel_type_code.to_le_bytes());
         bytes[base + 4..base + 8].copy_from_slice(&size_c.to_le_bytes());
-        bytes[base + 12..base + 16].copy_from_slice(&ETS_RAW.to_le_bytes());
+        bytes[base + 12..base + 16].copy_from_slice(&compression.to_le_bytes());
         bytes[base + 20..base + 24].copy_from_slice(&tile_x.to_le_bytes());
         bytes[base + 24..base + 28].copy_from_slice(&tile_y.to_le_bytes());
 
@@ -20658,6 +20923,72 @@ EndClass: 0
             *b = i as u8;
         }
         bytes
+    }
+
+    #[test]
+    fn cellsens_ets_exposes_clean_jpeg_chunk_as_compressed_file_range() {
+        let path = temp_flim2_path("compressed-jpeg.ets");
+        let payload = [0xff, 0xd8, 0xff, 0xd9, 0xaa, 0xbb];
+        let mut bytes = build_synthetic_ets_with_compression(
+            2,
+            ETS_PT_UCHAR,
+            1,
+            ETS_JPEG,
+            4,
+            3,
+            payload.len() as u32,
+            payload.len(),
+        );
+        let payload_offset = bytes.len() - payload.len();
+        bytes[payload_offset..].copy_from_slice(&payload);
+        std::fs::write(&path, bytes).unwrap();
+
+        let mut reader = CellSensReader::new();
+        reader.set_id(&path).unwrap();
+        let support = reader.compressed_level_info(0, 0).unwrap();
+        let CompressedExtractionSupport::Supported(info) = support else {
+            panic!("expected supported compressed ETS chunks");
+        };
+        assert_eq!(info.tile_width, 4);
+        assert_eq!(info.tile_height, 3);
+        assert_eq!(info.tiles_across, 1);
+        assert_eq!(info.tiles_down, 1);
+        assert_eq!(info.modes, vec![CompressedTileMode::OriginalBytes]);
+
+        let tile = reader.read_compressed_tile(0, 0, 0, 0, &[]).unwrap();
+        assert_eq!(tile.width, 4);
+        assert_eq!(tile.height, 3);
+        assert_eq!(tile.codec, info.codec);
+        match tile.bytes {
+            CompressedBytes::FileRange {
+                path: tile_path,
+                offset,
+                length,
+            } => {
+                assert_eq!(tile_path, path);
+                assert_eq!(offset as usize, payload_offset);
+                assert_eq!(length, payload.len() as u64);
+            }
+            other => panic!("expected file range, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn cellsens_ets_raw_chunks_are_not_reported_as_lossy_compressed_tiles() {
+        let path = temp_flim2_path("compressed-raw.ets");
+        std::fs::write(&path, build_synthetic_ets(2, ETS_PT_UCHAR, 1, 1, 1, 1, 1)).unwrap();
+
+        let mut reader = CellSensReader::new();
+        reader.set_id(&path).unwrap();
+        let support = reader.compressed_level_info(0, 0).unwrap();
+        assert!(
+            matches!(support, CompressedExtractionSupport::NotSupported { ref reason } if reason.contains("not a supported JPEG/JPEG2000")),
+            "{support:?}"
+        );
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

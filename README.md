@@ -8,9 +8,9 @@ The internal Metakit table reader used for Volocity is translated from
 [`ome/ome-metakit`](https://github.com/ome/ome-metakit) at commit
 `b8b3a629a6dd9bf422949f6b175b9e310ba6e252`.
 
-Current status: the tracked Java-to-Rust translation audit is complete; every
-translated reader/writer row has passed two clean audits. Real-file and Java
-parity coverage continue to expand as public fixtures become available.
+
+* 2026-07-12: For now assumed to be a feature complete translation, tested on real data. API added to also enable extraction of embedded tile raw data (e.g., to avoid lossy conversion)
+
 
 ## This is an LLM-mediated faithful (hopefully) translation, not the original code! 
 
@@ -354,6 +354,83 @@ let tile = reader.open_bytes_region(
 // Pyramid levels (where supported, e.g. tiled TIFF)
 println!("{} resolution levels", reader.resolution_count());
 reader.set_resolution(1)?; // switch to half-resolution
+```
+
+### Lossless access to compressed source blocks
+
+Some formats store each tile or frame as an already-compressed JPEG,
+JPEG 2000, or JPEG-XR payload. For those readers, `ImageReader` can expose the
+original compressed bytes without decoding pixels and re-encoding them. Readers
+that cannot provide a clean source block return `NotSupported`.
+
+```rust
+use bioformats::{
+    CompressedBytes, CompressedExtractionSupport, CompressedTileMode, ImageReader,
+};
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom, Write};
+
+let mut reader = ImageReader::open(path)?;
+
+match reader.compressed_level_info(/*plane*/ 0, /*level*/ 0)? {
+    CompressedExtractionSupport::Supported(info) => {
+        println!(
+            "{}x{} source blocks, codec {:?}",
+            info.tiles_across, info.tiles_down, info.codec
+        );
+    }
+    CompressedExtractionSupport::NotSupported { reason } => {
+        println!("compressed source extraction is not available: {reason}");
+    }
+}
+
+let tile = reader.read_compressed_tile(
+    /*plane*/ 0,
+    /*level*/ 0,
+    /*col*/ 0,
+    /*row*/ 0,
+    &[CompressedTileMode::OriginalBytes],
+)?;
+
+let mut out = File::create("crop.jpg")?;
+match tile.bytes {
+    CompressedBytes::Owned(bytes) => out.write_all(&bytes)?,
+    CompressedBytes::FileRange { path, offset, length } => {
+        let mut input = File::open(path)?;
+        input.seek(SeekFrom::Start(offset))?;
+        let mut bytes = vec![0; length as usize];
+        input.read_exact(&mut bytes)?;
+        out.write_all(&bytes)?;
+    }
+    CompressedBytes::FileRanges { ranges } => {
+        for range in ranges {
+            let mut input = File::open(range.path)?;
+            input.seek(SeekFrom::Start(range.offset))?;
+            let mut bytes = vec![0; range.length as usize];
+            input.read_exact(&mut bytes)?;
+            out.write_all(&bytes)?;
+        }
+    }
+}
+```
+
+`CompressedTileMode::OriginalBytes` means the returned payload is the exact
+source compressed stream. `CompressedTileMode::DerivedLosslessJpeg` is used when
+the reader can build a standalone JPEG stream from source JPEG tables and tile
+bytes without pixel-domain decode/recompress.
+
+Current implementations include TIFF/OME-TIFF and TIFF wrappers such as SVS,
+NDPI and SCN, DICOM encapsulated JPEG/JPEG 2000, AVI Motion-JPEG, QuickTime
+plain JPEG samples, Norpix SEQ JPEG frames, Zeiss CZI JPEG/JPEG-XR subblocks,
+Nikon ND2 JPEG 2000 frames, and cellSens/ETS JPEG/JPEG 2000 chunks. OME-Zarr
+explicitly reports `NotSupported` because its chunks are array chunks rather
+than source JPEG/JPEG 2000/JPEG-XR tiles.
+
+There is also a complete example that extracts one compressed JPEG tile without
+loss:
+
+```bash
+cargo run --example lossless_jpeg_crop -- <input> <output.jpg> [plane] [level] [col] [row]
 ```
 
 ### `ImageMetadata`

@@ -35,6 +35,7 @@ use serde_json::Value;
 use zarrs::array::{Array, ArraySubset};
 use zarrs::filesystem::FilesystemStore;
 
+use crate::common::compressed::{CompressedExtractionSupport, CompressedTile, CompressedTileMode};
 use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata};
 use crate::common::ome_metadata::{
@@ -1017,6 +1018,30 @@ impl FormatReader for OmeZarrReader {
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
         self.open_bytes(plane_index)
+    }
+
+    fn compressed_level_info(
+        &self,
+        _plane_index: u32,
+        _level: u32,
+    ) -> Result<CompressedExtractionSupport> {
+        Ok(CompressedExtractionSupport::NotSupported {
+            reason: "OME-Zarr chunks are array chunks, not source JPEG/JPEG2000/JPEG-XR tiles compatible with the LossyCodec compressed extraction API".into(),
+        })
+    }
+
+    fn read_compressed_tile(
+        &mut self,
+        _plane_index: u32,
+        _level: u32,
+        _col: u64,
+        _row: u64,
+        _preferred_modes: &[CompressedTileMode],
+    ) -> Result<CompressedTile> {
+        Err(BioFormatsError::UnsupportedFormat(
+            "OME-Zarr chunks are not compatible with the LossyCodec compressed extraction API"
+                .into(),
+        ))
     }
 
     fn ome_metadata(&self) -> Option<OmeMetadata> {
