@@ -9,18 +9,25 @@
 mod inner {
     use std::path::{Path, PathBuf};
 
+    use openslide_pure_rs::compressed as os_compressed;
     use openslide_pure_rs::OpenSlide;
 
+    use crate::common::compressed::{
+        CompressedBytes, CompressedExtractionConstraint, CompressedExtractionSupport,
+        CompressedFileRange, CompressedLevelInfo, CompressedTile, CompressedTileMode,
+        Jpeg2000Container, JpegColorSpace, JpegSubsampling, LossyCodec,
+    };
     use crate::common::error::{BioFormatsError, Result};
     use crate::common::metadata::{DimensionOrder, ImageMetadata};
     use crate::common::pixel_type::PixelType;
     use crate::common::reader::FormatReader;
 
-    /// Extensions supported by OpenSlide that bioformats-rs doesn't already cover well.
+    /// Extensions delegated to OpenSlide because bioformats-rs has no more
+    /// complete native reader for them. Do not add broad OpenSlide formats
+    /// here (for example BIF, CZI, DICOM, NDPI, SCN, SVS, TIFF, VMS); those are
+    /// handled by native readers with fuller Bio-Formats metadata semantics.
     const OPENSLIDE_EXTENSIONS: &[&str] = &[
         "mrxs", // 3DHISTECH Pannoramic
-        "vms",  // Hamamatsu VMS
-        "bif",  // Ventana BIF
     ];
 
     pub struct OpenSlideReader {
@@ -44,6 +51,101 @@ mod inner {
 
         fn slide(&self) -> Result<&OpenSlide> {
             self.slide.as_ref().ok_or(BioFormatsError::NotInitialized)
+        }
+    }
+
+    fn to_os_mode(mode: CompressedTileMode) -> os_compressed::CompressedTileMode {
+        match mode {
+            CompressedTileMode::OriginalBytes => os_compressed::CompressedTileMode::OriginalBytes,
+            CompressedTileMode::DerivedLosslessJpeg => {
+                os_compressed::CompressedTileMode::DerivedLosslessJpeg
+            }
+        }
+    }
+
+    fn from_os_mode(mode: os_compressed::CompressedTileMode) -> CompressedTileMode {
+        match mode {
+            os_compressed::CompressedTileMode::OriginalBytes => CompressedTileMode::OriginalBytes,
+            os_compressed::CompressedTileMode::DerivedLosslessJpeg => {
+                CompressedTileMode::DerivedLosslessJpeg
+            }
+        }
+    }
+
+    fn from_os_codec(codec: os_compressed::LossyCodec) -> LossyCodec {
+        match codec {
+            os_compressed::LossyCodec::Jpeg {
+                color_space,
+                subsampling,
+            } => LossyCodec::Jpeg {
+                color_space: match color_space {
+                    os_compressed::JpegColorSpace::Rgb => JpegColorSpace::Rgb,
+                    os_compressed::JpegColorSpace::YCbCr => JpegColorSpace::YCbCr,
+                    os_compressed::JpegColorSpace::Gray => JpegColorSpace::Gray,
+                    os_compressed::JpegColorSpace::Unknown => JpegColorSpace::Unknown,
+                },
+                subsampling: subsampling.map(|s| match s {
+                    os_compressed::JpegSubsampling::Cs444 => JpegSubsampling::Cs444,
+                    os_compressed::JpegSubsampling::Cs422 => JpegSubsampling::Cs422,
+                    os_compressed::JpegSubsampling::Cs420 => JpegSubsampling::Cs420,
+                    os_compressed::JpegSubsampling::Other {
+                        horizontal,
+                        vertical,
+                    } => JpegSubsampling::Other {
+                        horizontal,
+                        vertical,
+                    },
+                }),
+            },
+            os_compressed::LossyCodec::Jpeg2000 { container } => LossyCodec::Jpeg2000 {
+                container: match container {
+                    os_compressed::Jpeg2000Container::Codestream => Jpeg2000Container::Codestream,
+                    os_compressed::Jpeg2000Container::Jp2 => Jpeg2000Container::Jp2,
+                    os_compressed::Jpeg2000Container::Unknown => Jpeg2000Container::Unknown,
+                },
+            },
+            os_compressed::LossyCodec::JpegXr => LossyCodec::JpegXr,
+        }
+    }
+
+    fn from_os_constraint(
+        constraint: os_compressed::CompressedExtractionConstraint,
+    ) -> CompressedExtractionConstraint {
+        match constraint {
+            os_compressed::CompressedExtractionConstraint::RequiresCustomZarrCodec => {
+                CompressedExtractionConstraint::RequiresCustomZarrCodec
+            }
+            os_compressed::CompressedExtractionConstraint::EdgeTilesMayBePartial => {
+                CompressedExtractionConstraint::EdgeTilesMayBePartial
+            }
+            os_compressed::CompressedExtractionConstraint::FragmentedSource => {
+                CompressedExtractionConstraint::FragmentedSource
+            }
+        }
+    }
+
+    fn from_os_bytes(bytes: os_compressed::CompressedBytes) -> CompressedBytes {
+        match bytes {
+            os_compressed::CompressedBytes::Owned(data) => CompressedBytes::Owned(data),
+            os_compressed::CompressedBytes::FileRange {
+                path,
+                offset,
+                length,
+            } => CompressedBytes::FileRange {
+                path,
+                offset,
+                length,
+            },
+            os_compressed::CompressedBytes::FileRanges { ranges } => CompressedBytes::FileRanges {
+                ranges: ranges
+                    .into_iter()
+                    .map(|range| CompressedFileRange {
+                        path: range.path,
+                        offset: range.offset,
+                        length: range.length,
+                    })
+                    .collect(),
+            },
         }
     }
 
@@ -208,6 +310,79 @@ mod inner {
             self.open_bytes_region(plane_index, tx, ty, tw, th)
         }
 
+        fn compressed_level_info(
+            &self,
+            plane_index: u32,
+            level: u32,
+        ) -> Result<CompressedExtractionSupport> {
+            if plane_index != 0 {
+                return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+            }
+            let slide = self.slide()?;
+            match slide.compressed_level_info(level).map_err(|e| {
+                BioFormatsError::Format(format!("OpenSlide compressed_level_info: {}", e))
+            })? {
+                os_compressed::CompressedExtractionSupport::Supported(info) => Ok(
+                    CompressedExtractionSupport::Supported(CompressedLevelInfo {
+                        plane_index,
+                        level: info.level,
+                        width: info.width,
+                        height: info.height,
+                        tile_width: info.tile_width,
+                        tile_height: info.tile_height,
+                        tiles_across: info.tiles_across,
+                        tiles_down: info.tiles_down,
+                        codec: from_os_codec(info.codec),
+                        modes: info.modes.into_iter().map(from_os_mode).collect(),
+                        constraints: info
+                            .constraints
+                            .into_iter()
+                            .map(from_os_constraint)
+                            .collect(),
+                    }),
+                ),
+                os_compressed::CompressedExtractionSupport::NotSupported { reason } => {
+                    Ok(CompressedExtractionSupport::NotSupported { reason })
+                }
+            }
+        }
+
+        fn read_compressed_tile(
+            &mut self,
+            plane_index: u32,
+            level: u32,
+            col: u64,
+            row: u64,
+            preferred_modes: &[CompressedTileMode],
+        ) -> Result<CompressedTile> {
+            if plane_index != 0 {
+                return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+            }
+            let slide = self.slide()?;
+            let os_preferred_modes: Vec<_> =
+                preferred_modes.iter().copied().map(to_os_mode).collect();
+            let tile = slide
+                .read_compressed_tile(level, col, row, &os_preferred_modes)
+                .map_err(|e| {
+                    BioFormatsError::Format(format!("OpenSlide read_compressed_tile: {}", e))
+                })?;
+            Ok(CompressedTile {
+                plane_index,
+                level: tile.level,
+                col: tile.col,
+                row: tile.row,
+                origin_x: tile.origin_x,
+                origin_y: tile.origin_y,
+                width: tile.width,
+                height: tile.height,
+                nominal_tile_width: tile.nominal_tile_width,
+                nominal_tile_height: tile.nominal_tile_height,
+                codec: from_os_codec(tile.codec),
+                mode: from_os_mode(tile.mode),
+                bytes: from_os_bytes(tile.bytes),
+            })
+        }
+
         fn resolution_count(&self) -> usize {
             self.resolution_dims.len()
         }
@@ -246,6 +421,36 @@ mod inner {
 
             assert_eq!(reader.metadata().size_x, 0);
             assert_eq!(reader.metadata().size_y, 0);
+        }
+
+        #[test]
+        fn detection_is_limited_to_formats_without_native_readers() {
+            let reader = OpenSlideReader::new();
+
+            assert!(reader.is_this_type_by_name(std::path::Path::new("slide.mrxs")));
+            assert!(!reader.is_this_type_by_name(std::path::Path::new("slide.bif")));
+            assert!(!reader.is_this_type_by_name(std::path::Path::new("slide.vms")));
+            assert!(!reader.is_this_type_by_name(std::path::Path::new("slide.scn")));
+            assert!(!reader.is_this_type_by_name(std::path::Path::new("slide.svs")));
+            assert!(!reader.is_this_type_by_name(std::path::Path::new("slide.czi")));
+            assert!(!reader.is_this_type_by_name(std::path::Path::new("slide.dcm")));
+            assert!(!reader.is_this_type_by_name(std::path::Path::new("slide.tif")));
+        }
+
+        #[test]
+        fn compressed_extraction_requires_initialized_slide() {
+            let mut reader = OpenSlideReader::new();
+
+            assert!(reader.compressed_level_info(0, 0).is_err());
+            assert!(reader.read_compressed_tile(0, 0, 0, 0, &[]).is_err());
+        }
+
+        #[test]
+        fn compressed_extraction_rejects_nonzero_plane() {
+            let mut reader = OpenSlideReader::new();
+
+            assert!(reader.compressed_level_info(1, 0).is_err());
+            assert!(reader.read_compressed_tile(1, 0, 0, 0, &[]).is_err());
         }
     }
 }

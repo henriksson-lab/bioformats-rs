@@ -262,9 +262,18 @@ impl<R: Read + Seek> TiffParser<R> {
             if !visited.insert(offset) {
                 break;
             }
-            let (ifd, next) = self.read_ifd_ndpi64(offset, file_len)?;
-            ifds.push(ifd);
-            offset = next;
+            match self.read_ifd_ndpi64(offset, file_len) {
+                Ok((ifd, next)) => {
+                    ifds.push(ifd);
+                    offset = next;
+                }
+                // Match the standard IFD walk and Java's best-effort behavior:
+                // NDPI files can carry garbage after the useful fake-64-bit IFD
+                // chain. Keep the readable prefix instead of letting a corrupt
+                // trailing IFD exhaust the value-array parse budget.
+                Err(_) if !ifds.is_empty() => break,
+                Err(e) => return Err(e),
+            }
             if ifds.len() > 100_000 {
                 break; // runaway guard
             }
@@ -984,6 +993,34 @@ mod tests {
             .expect("duplicate-tag NDPI IFD should parse");
 
         assert_eq!(ifds[0].get(256).and_then(IfdValue::as_u32), Some(1));
+    }
+
+    #[test]
+    fn read_ifds_ndpi64_tolerates_corrupt_trailing_ifd() {
+        // Java keeps the readable IFD prefix for NDPI files whose fake-64-bit
+        // chain wanders into malformed trailing data. This is the same policy
+        // needed for real slides where the trailing garbage can otherwise burn
+        // the out-of-line value parse budget.
+        let second_ifd = 42u64;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"II");
+        bytes.extend_from_slice(&42u16.to_le_bytes());
+        bytes.extend_from_slice(&16u64.to_le_bytes());
+        bytes.resize(16, 0);
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        long_entry(&mut bytes, 256, 188_160);
+        bytes.extend_from_slice(&second_ifd.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.resize(second_ifd as usize, 0);
+        bytes.extend_from_slice(&u16::MAX.to_le_bytes());
+
+        let mut parser = parse(bytes);
+        let ifds = parser
+            .read_ifds_ndpi64()
+            .expect("corrupt trailing NDPI IFD should be tolerated");
+
+        assert_eq!(ifds.len(), 1);
+        assert_eq!(ifds[0].get(256).and_then(IfdValue::as_u32), Some(188_160));
     }
 
     #[test]

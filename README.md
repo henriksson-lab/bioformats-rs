@@ -9,6 +9,7 @@ The internal Metakit table reader used for Volocity is translated from
 `b8b3a629a6dd9bf422949f6b175b9e310ba6e252`.
 
 
+* 2026-07-15: Translated jpegxr, fixing a bug in it. Now using jpegxr-pure-rs instead as dependency
 * 2026-07-12: For now assumed to be a feature complete translation, tested on real data. API added to also enable extraction of embedded tile raw data (e.g., to avoid lossy conversion)
 
 
@@ -320,7 +321,7 @@ real fixtures, or the wrapped upstream library.
 |--------|-----------|------------|------|
 | MetaImage (ITK) | `.mha` `.mhd` | Synthetic round-trip plus optional real fixture. | ITK/MetaIO volume. |
 | OME-Zarr / NGFF | `.zarr` | Synthetic NGFF/plain-Zarr tests. | Ported from the separate `ome/ZarrReader`. |
-| OpenSlide | `.mrxs` `.vms` `.bif` | Covered by OpenSlide and optional local feature tests. | Wraps the OpenSlide library. |
+| OpenSlide | `.mrxs` | Covered by OpenSlide and optional local feature tests. | Wraps the OpenSlide library only as a fallback for MRXS. Overlapping OpenSlide formats such as BIF, CZI, DICOM, NDPI, SCN, SVS, TIFF, and VMS/VMU are intentionally handled by native bioformats-rs readers first because they provide fuller Bio-Formats metadata and format semantics. |
 | SimFCS | `.b64` `.r64` `.i64` | Synthetic raw-frame tests. | Globals SimFCS raw FLIM frames. |
 | Norpix StreamPix | `.seq` | Synthetic header, timestamp, and pixel tests. | Bio-Formats' `SEQReader` is unrelated Image-Pro Sequence. |
 | Bruker MicroCT | `.ctf` | Needs a real fixture before claiming support. | Bio-Formats' translated MicroCT reader is the separate `.vff` reader. |
@@ -595,6 +596,8 @@ bench/compare_subset.sh test/tubhiswt_C0.ome.tif testdata/nd2/BF007.nd2
 The reported timing excludes process startup inside each harness. RSS is measured
 around the whole harness process, so Java RSS includes JVM overhead.
 
+Original benchmark baseline: Java Bio-Formats/Open Microscopy tooling via `bioformats_package.jar` and public Open Microscopy images; this README/scripts do not currently state an exact jar version.
+
 #### Open Microscopy Corpus Screening
 
 Latest sampled real-data speed/RSS screening command:
@@ -603,10 +606,19 @@ Latest sampled real-data speed/RSS screening command:
 BIOFORMATS_RS_OME_IMAGES_WARMUP=0 BIOFORMATS_RS_OME_IMAGES_MEASURE=1 BIOFORMATS_RS_OME_IMAGES_TIMEOUT=30 scripts/run_ome_images_conformance.sh --bench-only
 ```
 
+2026-07-14 rerun note: the benchmark subcrate rebuild is currently blocked by
+workspace metadata, so the rerun used the already-built Java and Rust subset
+harnesses directly over the generated Open Microscopy manifest. Across 83 sampled
+files, 74 Java/Rust rows were comparable; the arithmetic mean Java/Rust speedup
+was 44.43x and the arithmetic mean Rust/Java RSS ratio was 0.15. The raw rerun
+rows are recorded in the presentation tracker as `benchmarks/bioformats-rs.tsv`.
+
 The full sweep output is `bench/target/ome-images-subset.csv`. The ICS rows
 below use the post-fix focused rerun in `bench/target/ics-after-region.csv`.
 TIFF-region-fast-path follow-up rows use focused reruns under
 `bench/target/*-region-fastpath.{csv,md}`.
+The Zeiss-CZI row uses the post-JPEG-XR-decoder focused rerun in
+`bench/target/czi-jpegxr-rerun.md`.
 The HDF5-backed BDV, CellH5, and Imaris-IMS rows use the focused benchmark
 output in `bench/target/hdf5-readers-0310.md`; the HDF5 dependency is crates.io
 `hdf5-pure-rust` 0.3.10 with its `lz4` feature enabled.
@@ -658,7 +670,7 @@ below `1.0x` mean Rust was slower or used more RSS for that comparable row.
 | TIFF | 2 | 2 | 5920.4 | 29.3 | 201.81x | 193596 | 9280 | 19.93x | Focused TIFF-region fast-path rerun. |
 | Trestle | 2 | 2 | 1261.7 | 71.0 | 16.64x | 216484 | 11520 | 18.10x | - |
 | Vectra-QPTIFF | 2 | 2 | 1047.8 | 63.0 | 15.73x | 177832 | 12000 | 14.78x | - |
-| Zeiss-CZI | 2 | 2 | 793.8 | 14.2 | 54.51x | 134988 | 13784 | 9.77x | - |
+| Zeiss-CZI | 2 | 2 | 37.6 | 5.0 | 7.49x | 240840 | 13876 | 17.29x | Focused post-JPEG-XR-decoder rerun on the two sampled Open Microscopy CZI files. |
 | Zeiss-LSM | 1 | 1 | 519.2 | 34.4 | 15.11x | 116740 | 9920 | 11.77x | Focused TIFF-region fast-path rerun on `testdata/lsm/colocsample1b.lsm`. |
 | gateway_tests | 2 | 2 | 697.8 | 17.2 | 40.48x | 196864 | 11840 | 8.00x | - |
 

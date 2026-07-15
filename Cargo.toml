@@ -1,6 +1,6 @@
 [package]
 name = "bioformats"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2021"
 description = "Pure Rust translation of Bio-Formats — read/write scientific image formats"
 license = "GPL-2.0-or-later"
@@ -16,6 +16,7 @@ include = [
     "/src/**/*.txt",
     "/src/metakit/tests/data/test.mk",
     "/tests/**/*.rs",
+    "/examples/lossless_jpeg_crop.rs",
     "/benches/read_ome_tiff.rs",
     "/README.md",
     "/bioformats_bug.txt",
@@ -24,6 +25,7 @@ include = [
 
 [workspace]
 resolver = "2"
+members = ["."]
 exclude = ["bench"]
 
 [dependencies]
@@ -46,7 +48,7 @@ jpeg2k       = { version = "0.10", default-features = false, features = ["openjp
 openjp2      = { version = "0.6", optional = true }
 serde         = { version = "1", features = ["derive"] }
 bincode       = "1"
-jpegxr        = { version = "0.3", optional = true }
+jpegxr = { package = "jpegxr-pure-rs", version = "0.1", optional = true }
 openslide-pure-rs = { version = "0.1", optional = true }
 mdbtools      = { package = "mdbtools-pure-rs", version = "0.1" }
 bzip2 = "0.6"

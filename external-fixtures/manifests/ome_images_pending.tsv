@@ -48,6 +48,7 @@ MetaXpress	/big/henriksson/ome_images/MetaXpress/idr0006/plate 11001_Plate_136/p
 Metamorph	/big/henriksson/ome_images/Metamorph/zenodo-13642395/test_timelapse_20240816.nd	present	358	.nd
 Metamorph	/big/henriksson/ome_images/Metamorph/zenodo-13642395/test_timelapse_20240816_s1_t1.TIF	present	2104744	.tif
 Micro-Manager	/big/henriksson/ome_images/Micro-Manager/1.4.23/jens/fucci_GFP-geminin_RFP-cdt1_2_MMStack_Pos0.ome.tif	present	435040571	.ome.tif
+Micro-Manager	/big/henriksson/ome_images/Micro-Manager/1.4.16/serge/Pos0/img_000000000_00-BF0_000.tif	present	8409863	.tif
 ND2	/big/henriksson/ome_images/ND2/aryeh/4_2_1_cont_NoMR001.nd2	present	331821144	.nd2
 ND2	/big/henriksson/ome_images/ND2/aryeh/4_con_2_1_cot002.nd2	present	788786722	.nd2
 NIfTI	/big/henriksson/ome_images/NIfTI/NIH/103.1.sirp.xml	present	190325	.xml
@@ -63,15 +64,16 @@ PNG	/big/henriksson/ome_images/PNG/user-1/dataset-user-1/user-1 01 TEST.png	pres
 PNG	/big/henriksson/ome_images/PNG/user-1/dataset-user-1/user-1 02 TEST.png	present	8721	.png
 PerkinElmer-Columbus	/big/henriksson/ome_images/PerkinElmer-Columbus/idr0019/22_lines_HC_EGF_200145913/002002-1.tif	present	1839988	.tif
 PerkinElmer-Columbus	/big/henriksson/ome_images/PerkinElmer-Columbus/idr0019/22_lines_HC_EGF_200145913/002002-10.tif	present	1948588	.tif
-PerkinElmer-Operetta	/big/henriksson/ome_images/PerkinElmer-Operetta/omer/006P_M3/006P_M3_overview.png	present	1538108	.png
-PerkinElmer-Operetta	/big/henriksson/ome_images/PerkinElmer-Operetta/omer/006P_M3/006P_M3_overview_fields.png	present	1540829	.png
+PerkinElmer-Operetta	/big/henriksson/ome_images/PerkinElmer-Operetta/59548/59548__2013-04-03T09_16_35-Measurement1/Assaylayout/Unnamed.xml	present	178904	.xml
+PerkinElmer-Operetta	/big/henriksson/ome_images/PerkinElmer-Operetta/59548/59548__2013-04-03T09_16_35-Measurement1/Images/Index.ref.xml	present	1808132	.xml
 SDT	/big/henriksson/ome_images/SDT/gh-4198/FocalCheck_A1_20x_8xzoom_800nm.sdt	present	30039135	.sdt
 SPC-FIFO	/big/henriksson/ome_images/SPC-FIFO/biofisika/conv-256x256.spc	present	32888548	.spc
 SVS	/big/henriksson/ome_images/SVS/77917.svs	present	704041277	.svs
 SVS	/big/henriksson/ome_images/SVS/77928.svs	present	609174117	.svs
 ScanR	/big/henriksson/ome_images/ScanR/idr0009/0307-10--2007-05-30/experiment_descriptor.xml	present	51477	.xml
-TIFF	/big/henriksson/ome_images/TIFF/condensation/A1.pattern1.tif	present	6749329	.tif
-TIFF	/big/henriksson/ome_images/TIFF/condensation/A1.pattern2.tif	present	6749329	.tif
+ScanR	/big/henriksson/ome_images/ScanR/idr0009/0307-10--2007-05-30/data/--W00002--P00001--Z00000--T00000--nucleus-dapi.tif	present	2752878	.tif
+TIFF	/big/henriksson/ome_images/TIFF/cellprofiler/fruit-fly-cells/POS002.pattern/01_POS002_Z00_T00_D.TIF	present	1008766	.tif
+TIFF	/big/henriksson/ome_images/TIFF/cellprofiler/fruit-fly-cells/POS002.pattern/01_POS002_Z00_T00_F.TIF	present	1008766	.tif
 Trestle	/big/henriksson/ome_images/Trestle/openslide/CMU-1/CMU-1.tif	present	163649046	.tif
 Trestle	/big/henriksson/ome_images/Trestle/openslide/CMU-2/CMU-2.tif	present	314982018	.tif
 Vectra-QPTIFF	/big/henriksson/ome_images/Vectra-QPTIFF/perkinelmer/PKI_fields/HandEcompressed_[11004,54205]_2x2component_data.tif	present	116848824	.tif

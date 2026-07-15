@@ -538,143 +538,27 @@ pub fn compress_jpeg2000(
 /// Requires the `jpegxr` feature flag: `cargo build --features jpegxr`
 #[cfg(feature = "jpegxr")]
 pub fn decompress_jpegxr(data: &[u8]) -> Result<Vec<u8>> {
-    use std::io::Cursor;
-    let cursor = Cursor::new(data);
-    let mut decoder = jpegxr::ImageDecode::with_reader(cursor)
-        .map_err(|e| BioFormatsError::Codec(format!("JPEG-XR: {e}")))?;
-    let (width, height) = decoder
-        .get_size()
-        .map_err(|e| BioFormatsError::Codec(format!("JPEG-XR size: {e}")))?;
-    let format = decoder
-        .get_pixel_format()
-        .map_err(|e| BioFormatsError::Codec(format!("JPEG-XR format: {e}")))?;
-
-    let layout = jpegxr_layout(format)?;
-    let row_bytes = layout
-        .row_bytes(width as usize)
-        .ok_or_else(|| BioFormatsError::Codec("JPEG-XR decoded row is too large".into()))?;
-    let stride = (row_bytes + 3) & !3; // 4-byte aligned
-    let mut buf = vec![0u8; stride * height as usize];
-    decoder
-        .copy_all(&mut buf, stride)
-        .map_err(|e| BioFormatsError::Codec(format!("JPEG-XR decode: {e}")))?;
-
-    // Remove stride padding if needed
-    if stride != row_bytes {
-        let mut out = Vec::with_capacity(row_bytes * height as usize);
-        for y in 0..height as usize {
-            out.extend_from_slice(&buf[y * stride..y * stride + row_bytes]);
-        }
-        normalize_jpegxr_output(&mut out, layout);
-        Ok(out)
-    } else {
-        normalize_jpegxr_output(&mut buf, layout);
-        Ok(buf)
-    }
+    let image = jpegxr::decode_bytes(data).map_err(|e| BioFormatsError::Codec(e.to_string()))?;
+    let layout = jpegxr_layout_from_format(image.pixel_format());
+    let mut out = image.into_pixels();
+    normalize_jpegxr_output(&mut out, layout);
+    Ok(out)
 }
 
 #[cfg(feature = "jpegxr")]
-fn jpegxr_layout(format: jpegxr::PixelFormat) -> Result<JpegxrPixelLayout> {
-    use jpegxr::PixelFormat::*;
-
-    let layout = match format {
-        PixelFormatBlackWhite => JpegxrPixelLayout::Other { bits_per_pixel: 1 },
-        PixelFormat8bppGray => JpegxrPixelLayout::Other { bits_per_pixel: 8 },
-        PixelFormat16bppRGB555
-        | PixelFormat16bppRGB565
-        | PixelFormat16bppGray
-        | PixelFormat16bppGrayFixedPoint
-        | PixelFormat16bppGrayHalf
-        | PixelFormat16bppYCC422
-        | PixelFormat16bpp48bppYCC444FixedPoint => JpegxrPixelLayout::Other { bits_per_pixel: 16 },
-        PixelFormat24bppBGR => JpegxrPixelLayout::Bgr8,
-        PixelFormat24bppRGB | PixelFormat24bpp3Channels | PixelFormat24bppYCC444 => {
-            JpegxrPixelLayout::Other { bits_per_pixel: 24 }
+fn jpegxr_layout_from_format(format: jpegxr::PixelFormat) -> JpegxrPixelLayout {
+    if format.channel_order() == jpegxr::ChannelOrder::Bgr {
+        match (format.bits_per_pixel(), format.has_alpha()) {
+            (24, _) => JpegxrPixelLayout::Bgr8,
+            (32, true) => JpegxrPixelLayout::Bgra8,
+            (32, false) => JpegxrPixelLayout::Bgrx8,
+            (bits_per_pixel, _) => JpegxrPixelLayout::Other { bits_per_pixel },
         }
-        PixelFormat32bppBGR => JpegxrPixelLayout::Bgrx8,
-        PixelFormat32bppBGRA | PixelFormat32bppPBGRA => JpegxrPixelLayout::Bgra8,
-        PixelFormat32bppGrayFloat
-        | PixelFormat32bppRGB
-        | PixelFormat32bppRGBA
-        | PixelFormat32bppPRGBA
-        | PixelFormat32bppRGB101010
-        | PixelFormat32bpp
-        | PixelFormat32bppRGBE
-        | PixelFormat32bppGrayFixedPoint
-        | PixelFormat32bpp4Channels
-        | PixelFormat32bpp3ChannelsAlpha
-        | PixelFormat32bppYCC422
-        | PixelFormat32bppYCC444Alpha
-        | PixelFormat32bppCMYKDIRECT => JpegxrPixelLayout::Other { bits_per_pixel: 32 },
-        PixelFormat40bpp5Channels
-        | PixelFormat40bppCMYKAlpha
-        | PixelFormat40bpp4ChannelsAlpha
-        | PixelFormat40bppYCC444Alpha
-        | PixelFormat40bppCMYKDIRECTAlpha => JpegxrPixelLayout::Other { bits_per_pixel: 40 },
-        PixelFormat48bppRGBFixedPoint
-        | PixelFormat48bppRGB
-        | PixelFormat48bppRGBHalf
-        | PixelFormat48bpp6Channels
-        | PixelFormat48bpp3Channels
-        | PixelFormat48bpp5ChannelsAlpha
-        | PixelFormat48bppYCC444
-        | PixelFormat48bppYCC422Alpha => JpegxrPixelLayout::Other { bits_per_pixel: 48 },
-        PixelFormat56bpp7Channels | PixelFormat56bpp6ChannelsAlpha => {
-            JpegxrPixelLayout::Other { bits_per_pixel: 56 }
+    } else {
+        JpegxrPixelLayout::Other {
+            bits_per_pixel: format.bits_per_pixel(),
         }
-        PixelFormat64bppRGBA
-        | PixelFormat64bppPRGBA
-        | PixelFormat64bppRGBAFixedPoint
-        | PixelFormat64bppRGBFixedPoint
-        | PixelFormat64bppRGBAHalf
-        | PixelFormat64bppRGBHalf
-        | PixelFormat64bppCMYK
-        | PixelFormat64bpp8Channels
-        | PixelFormat64bpp4Channels
-        | PixelFormat64bpp7ChannelsAlpha
-        | PixelFormat64bpp3ChannelsAlpha
-        | PixelFormat64bppYCC444Alpha
-        | PixelFormat64bppYCC444AlphaFixedPoint
-        | PixelFormat64bppCMYKDIRECT => JpegxrPixelLayout::Other { bits_per_pixel: 64 },
-        PixelFormat72bpp8ChannelsAlpha => JpegxrPixelLayout::Other { bits_per_pixel: 72 },
-        PixelFormat80bpp5Channels
-        | PixelFormat80bppCMYKAlpha
-        | PixelFormat80bpp4ChannelsAlpha
-        | PixelFormat80bppCMYKDIRECTAlpha => JpegxrPixelLayout::Other { bits_per_pixel: 80 },
-        PixelFormat96bppRGBFixedPoint
-        | PixelFormat96bppRGBFloat
-        | PixelFormat96bpp6Channels
-        | PixelFormat96bpp5ChannelsAlpha => JpegxrPixelLayout::Other { bits_per_pixel: 96 },
-        PixelFormat112bpp7Channels | PixelFormat112bpp6ChannelsAlpha => JpegxrPixelLayout::Other {
-            bits_per_pixel: 112,
-        },
-        PixelFormat128bppRGBAFloat
-        | PixelFormat128bppPRGBAFloat
-        | PixelFormat128bppRGBFloat
-        | PixelFormat128bppRGBAFixedPoint
-        | PixelFormat128bppRGBFixedPoint
-        | PixelFormat128bpp8Channels
-        | PixelFormat128bpp7ChannelsAlpha => JpegxrPixelLayout::Other {
-            bits_per_pixel: 128,
-        },
-        PixelFormat144bpp8ChannelsAlpha => JpegxrPixelLayout::Other {
-            bits_per_pixel: 144,
-        },
-        PixelFormat12bppYCC420 => JpegxrPixelLayout::Other { bits_per_pixel: 12 },
-        PixelFormat20bppYCC422 | PixelFormat20bppYCC420Alpha => {
-            JpegxrPixelLayout::Other { bits_per_pixel: 20 }
-        }
-        PixelFormat24bppYCC422Alpha => JpegxrPixelLayout::Other { bits_per_pixel: 24 },
-        PixelFormat30bppYCC444 | PixelFormat30bppYCC422Alpha => {
-            JpegxrPixelLayout::Other { bits_per_pixel: 30 }
-        }
-        PixelFormatDontCare => {
-            return Err(BioFormatsError::UnsupportedFormat(format!(
-                "JPEG-XR pixel format {format:?} does not declare a usable byte depth"
-            )));
-        }
-    };
-    Ok(layout)
+    }
 }
 
 /// Placeholder for JPEG-XR when the feature is not enabled.

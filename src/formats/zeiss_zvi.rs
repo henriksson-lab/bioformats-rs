@@ -565,11 +565,10 @@ fn parse_zvi_item(data: &[u8], stream_len: usize) -> Result<Option<ParsedItem>> 
             "ZVI: invalid non-positive image dimensions {size_x}x{size_y}"
         )));
     }
-    if !matches!(bpp, 1 | 2 | 3 | 6) {
-        return Err(BioFormatsError::UnsupportedFormat(format!(
-            "ZVI: unsupported bytes-per-pixel value {bpp}"
-        )));
-    }
+    // Java only uses this field to initialize the global bpp once. Later item
+    // streams still carry a 4-byte field here, but Bio-Formats skips it without
+    // validation; some real Zeiss stacked/mosaic files contain non-bpp values in
+    // those later streams.
     // Java skips exactly one 4-byte field here (ZeissZVIReader.java:311) before
     // reading `valid`. Our pixel-data offset = filePointer - 4 depends on this
     // being a single skip; a second skip would push the offset 4 bytes too far.
@@ -596,17 +595,14 @@ fn parse_zvi_item(data: &[u8], stream_len: usize) -> Result<Option<ParsedItem>> 
         // bytes short of the declared size: ZeissZVIReader.openBytes reads into
         // a pre-zeroed buffer via readPlane, so a stream that ends a few bytes
         // early (seen in real Zeiss exports) simply leaves the tail zero rather
-        // than failing. open_bytes mirrors this by zero-padding.
-        let plane_bytes = (size_x as usize)
-            .checked_mul(size_y as usize)
-            .and_then(|px| px.checked_mul(bpp as usize))
-            .ok_or_else(|| BioFormatsError::Format("ZVI plane size overflows".into()))?;
+        // than failing. open_bytes mirrors this by zero-padding and uses the
+        // global bpp chosen from the first valid image stream; later item streams
+        // may contain non-bpp values in the same field.
         if data_offset > stream_len {
             return Err(BioFormatsError::InvalidData(
                 "ZVI: pixel data offset is past end of stream".into(),
             ));
         }
-        let _ = plane_bytes;
     }
 
     Ok(Some(ParsedItem {
@@ -765,6 +761,12 @@ fn parse_zvi(
 
         // bpp / sizeX / sizeY are taken from the first valid image stream.
         if bpp == 0 {
+            if !matches!(item.bpp, 1 | 2 | 3 | 6) {
+                return Err(BioFormatsError::UnsupportedFormat(format!(
+                    "ZVI: unsupported bytes-per-pixel value {}",
+                    item.bpp
+                )));
+            }
             bpp = item.bpp;
         }
         if size_x == 0 {
@@ -1329,7 +1331,15 @@ mod tests {
     /// Build one ZVI item ("/Image/Item(N)/CONTENTS") stream carrying the given
     /// z/c/t/tile indices and a single uncompressed 1x1 UINT8 pixel value. The
     /// byte layout matches `parse_zvi_item` (and the Java reference).
-    fn build_item_with_pad(z: i32, c: i32, t: i32, tile: i32, pixel: u8, pad: i32) -> Vec<u8> {
+    fn build_item_with_bpp(
+        z: i32,
+        c: i32,
+        t: i32,
+        tile: i32,
+        pixel: u8,
+        pad: i32,
+        bpp: i32,
+    ) -> Vec<u8> {
         let mut item: Vec<u8> = Vec::new();
         // 11 leading VT_EMPTY tags (type 0, 2 bytes each).
         item.extend_from_slice(&[0u8; 22]);
@@ -1353,11 +1363,15 @@ mod tests {
         item.extend_from_slice(&1i32.to_le_bytes()); // sizeX
         item.extend_from_slice(&1i32.to_le_bytes()); // sizeY
         item.extend_from_slice(&[0u8; 4]); // skip(4)
-        item.extend_from_slice(&1i32.to_le_bytes()); // bpp -> UINT8
+        item.extend_from_slice(&bpp.to_le_bytes()); // bpp field
         item.extend_from_slice(&[0u8; 4]); // skip(4) before valid
         item.extend_from_slice(&2i32.to_le_bytes()); // valid=2 -> uncompressed
         item.extend_from_slice(&[pixel, 0, 0, 0]); // check / first-pixel region
         item
+    }
+
+    fn build_item_with_pad(z: i32, c: i32, t: i32, tile: i32, pixel: u8, pad: i32) -> Vec<u8> {
+        build_item_with_bpp(z, c, t, tile, pixel, pad, 1)
     }
 
     fn build_item(z: i32, c: i32, t: i32, tile: i32, pixel: u8) -> Vec<u8> {
@@ -1449,6 +1463,33 @@ mod tests {
         reader.set_id(&path).unwrap();
         assert_eq!(reader.series_count(), 1);
         assert_eq!(reader.open_bytes(0).unwrap(), vec![99]);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn zvi_validates_only_first_item_bpp_like_java() {
+        let path = temp_path("later_item_bogus_bpp");
+        {
+            let mut comp = cfb::create(&path).unwrap();
+            comp.create_storage_all("/Image/Item(1)").unwrap();
+            comp.create_storage_all("/Image/Item(2)").unwrap();
+            comp.create_stream("/Image/Item(1)/CONTENTS")
+                .unwrap()
+                .write_all(&build_item_with_bpp(0, 0, 0, 0, 11, 1100, 1))
+                .unwrap();
+            comp.create_stream("/Image/Item(2)/CONTENTS")
+                .unwrap()
+                .write_all(&build_item_with_bpp(0, 0, 0, 1, 22, 1100, 2_687_024))
+                .unwrap();
+        }
+
+        let mut reader = ZeissZviReader::new();
+        reader.set_id(&path).unwrap();
+        assert_eq!(reader.series_count(), 2);
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![11]);
+        reader.set_series(1).unwrap();
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![22]);
 
         let _ = std::fs::remove_file(path);
     }

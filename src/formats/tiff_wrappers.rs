@@ -250,7 +250,15 @@ pub(crate) fn ndpi_has_hamamatsu_tags(path: &Path) -> bool {
     let Ok(file) = std::fs::File::open(path) else {
         return false;
     };
-    ndpi_has_hamamatsu_tags_in_stream(file)
+    let use_64bit = file
+        .metadata()
+        .map(|m| m.len() >= (1u64 << 32))
+        .unwrap_or(false);
+    if use_64bit {
+        ndpi_has_hamamatsu_tags_in_large_file(file)
+    } else {
+        ndpi_has_hamamatsu_tags_in_stream(file)
+    }
 }
 
 fn ndpi_has_hamamatsu_tags_in_stream<R: std::io::Read + std::io::Seek>(stream: R) -> bool {
@@ -264,6 +272,20 @@ fn ndpi_has_hamamatsu_tags_in_stream<R: std::io::Read + std::io::Seek>(stream: R
         Err(_) => return false,
     };
     ifd.get(NDPI_MARKER_TAG).is_some() || ifd.get(NDPI_METADATA_TAG).is_some()
+}
+
+fn ndpi_has_hamamatsu_tags_in_large_file<R: std::io::Read + std::io::Seek>(stream: R) -> bool {
+    let mut parser = match crate::tiff::parser::TiffParser::new(stream) {
+        Ok(parser) => parser,
+        Err(_) => return false,
+    };
+    let ifds = match parser.read_ifds_ndpi64() {
+        Ok(ifds) => ifds,
+        Err(_) => return false,
+    };
+    ifds.first()
+        .map(|ifd| ifd.get(NDPI_MARKER_TAG).is_some() || ifd.get(NDPI_METADATA_TAG).is_some())
+        .unwrap_or(false)
 }
 
 impl NdpiReader {
