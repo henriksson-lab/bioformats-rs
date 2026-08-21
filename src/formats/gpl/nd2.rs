@@ -3997,18 +3997,29 @@ impl FormatReader for Nd2Reader {
                 nd2_xml_old_jp2_valid_position_names(&xml),
             );
             has_spectral_loop |= !nd2_xml_loop_container_counts(&xml, "SpectLoop").is_empty();
-            if let Some((w, h)) = rect_sensor_extent(&xml) {
-                size_x = w;
-                size_y = h;
-                let c = nd2_u32_value(&xml, "uiComp").unwrap_or(0);
-                if c > 0 {
-                    size_c = c;
+            // Only a fallback for files where ImageAttributesLV didn't already
+            // establish dimensions: Java's ND2Reader never reads
+            // GrabberCameraSettings/CustomDataVar chunks for uiWidth/uiHeight/
+            // uiComp/pixel-type at all, and this chunk's camera-hardware
+            // `rectSensorUser`/`uiComp`/bpp fields describe the physical sensor
+            // readout, not the logical multi-channel experiment structure, so
+            // they must never override values already found from
+            // ImageAttributesLV (matches the size_x==0/size_y==0/size_c==1
+            // guards on the sibling fallbacks below).
+            if size_x == 0 {
+                if let Some((w, h)) = rect_sensor_extent(&xml) {
+                    size_x = w;
+                    size_y = h;
+                    let c = nd2_u32_value(&xml, "uiComp").unwrap_or(0);
+                    if c > 0 {
+                        size_c = c;
+                    }
+                    if let Some(b) = nd2_bpp_value(&xml) {
+                        bpp = b;
+                    }
+                    storage_bpp = nd2_storage_bpp_value(&xml);
+                    break;
                 }
-                if let Some(b) = nd2_bpp_value(&xml) {
-                    bpp = b;
-                }
-                storage_bpp = nd2_storage_bpp_value(&xml);
-                break;
             }
             if size_x == 0 {
                 if let Some(w) = nd2_u32_value(&xml, "uiCamPxlCountX").filter(|&w| w > 0) {
