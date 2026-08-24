@@ -17091,15 +17091,18 @@ impl FormatReader for CellSensReader {
     fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
         match self.target {
             CellSensTarget::Tiff(ts) => {
-                // The inner TIFF reader returns the overview chunky/interleaved
-                // (or fails on a JPEGTables-abbreviated JPEG strip, which we decode
-                // ourselves). Java reports the overview as non-interleaved (planar),
-                // so the FULL plane must be de-interleaved to match — the inner
-                // reader does NOT do this, which is why a raw `open_bytes` diverged
-                // everywhere except the very first pixels.
-                let full = match self.decode_overview_jpeg_full(ts, p)? {
-                    Some(f) => f,
-                    None => self.inner.open_bytes(p)?,
+                // decode_overview_jpeg_full manually JPEG-decodes the strip via
+                // `jpeg_decoder` (bypassing the inner TIFF reader) and always
+                // returns chunky/interleaved RGB, so that path still needs one
+                // de-interleave pass to match Java's non-interleaved (planar)
+                // report for the overview. The inner reader's own `open_bytes`
+                // (used when decode_overview_jpeg_full returns None, i.e. plain
+                // IFDs) already planarizes chunky RGB itself for any spp>1 source
+                // — get_stripped_samples/get_tiled_samples always split_channels
+                // — so re-de-interleaving that output would scramble it.
+                let (full, needs_deinterleave) = match self.decode_overview_jpeg_full(ts, p)? {
+                    Some(f) => (f, true),
+                    None => (self.inner.open_bytes(p)?, false),
                 };
                 let meta = self.metadata();
                 let spp = if meta.is_rgb {
@@ -17109,7 +17112,8 @@ impl FormatReader for CellSensReader {
                 };
                 let sample = meta.pixel_type.bytes_per_sample();
                 let plane = (meta.size_x as usize) * (meta.size_y as usize);
-                if spp > 1 && sample > 0 && full.len() == plane * spp * sample {
+                if needs_deinterleave && spp > 1 && sample > 0 && full.len() == plane * spp * sample
+                {
                     Ok(deinterleave_to_planar(&full, plane, spp, sample))
                 } else {
                     Ok(full)
@@ -17138,10 +17142,14 @@ impl FormatReader for CellSensReader {
     fn open_bytes_region(&mut self, p: u32, x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>> {
         match self.target {
             CellSensTarget::Tiff(ts) => {
-                // Source the requested chunky/interleaved region: either by cropping
-                // our manually decoded JPEG overview (the inner reader can't merge
-                // the JPEGTables tag), or via the inner reader for plain IFDs.
-                let buf = match self.decode_overview_jpeg_full(ts, p)? {
+                // Source the requested region: either by cropping our manually
+                // decoded JPEG overview (the inner reader can't merge the
+                // JPEGTables tag — that decode always yields chunky/interleaved
+                // RGB and still needs de-interleaving below), or via the inner
+                // reader for plain IFDs, which already planarizes chunky RGB
+                // itself for any spp>1 source and must NOT be de-interleaved
+                // again (see open_bytes for the same reasoning).
+                let (buf, needs_deinterleave) = match self.decode_overview_jpeg_full(ts, p)? {
                     Some(full) => {
                         let meta = self.metadata();
                         let spp = if meta.is_rgb {
@@ -17150,7 +17158,7 @@ impl FormatReader for CellSensReader {
                             1
                         };
                         let pixel = spp * meta.pixel_type.bytes_per_sample();
-                        crop_chunky(
+                        let cropped = crop_chunky(
                             &full,
                             meta.size_x as usize,
                             x as usize,
@@ -17158,10 +17166,14 @@ impl FormatReader for CellSensReader {
                             w as usize,
                             h as usize,
                             pixel,
-                        )
+                        );
+                        (cropped, true)
                     }
-                    None => self.inner.open_bytes_region(p, x, y, w, h)?,
+                    None => (self.inner.open_bytes_region(p, x, y, w, h)?, false),
                 };
+                if !needs_deinterleave {
+                    return Ok(buf);
+                }
                 // Java reports the overview as non-interleaved (planar). The region
                 // buffer is interleaved RGB; de-interleave to match.
                 let meta = self.metadata();
@@ -23009,6 +23021,44 @@ theUnknownAnnotation70ListSize: 0
         file.write_all(&data).unwrap();
     }
 
+    /// Writes a single-strip, uncompressed, chunky (PlanarConfiguration=1) RGB
+    /// TIFF page — the shape that hits `TiffReader::get_stripped_samples`'s
+    /// direct/fast path, which planarizes chunky RGB itself (`split_channels`)
+    /// before returning. `chunky_rgb` must be `width*height*3` bytes in
+    /// row-major RGBRGB... order (the on-disk layout for PlanarConfiguration=1).
+    fn write_rgb_chunky_uncompressed_tiff(
+        path: &Path,
+        width: u32,
+        height: u32,
+        chunky_rgb: &[u8],
+    ) {
+        assert_eq!(chunky_rgb.len(), (width * height * 3) as usize);
+        let mut entries = vec![
+            long_entry(tag::IMAGE_WIDTH, width),
+            long_entry(tag::IMAGE_LENGTH, height),
+            short_entry(tag::BITS_PER_SAMPLE, 8),
+            short_entry(tag::COMPRESSION, 1),
+            short_entry(tag::PHOTOMETRIC_INTERPRETATION, 2),
+            short_entry(tag::SAMPLES_PER_PIXEL, 3),
+            long_entry(tag::ROWS_PER_STRIP, height),
+            long_entry(tag::STRIP_BYTE_COUNTS, chunky_rgb.len() as u32),
+            short_entry(tag::PLANAR_CONFIGURATION, 1),
+        ];
+        let strip_offset = 8 + ifd_table_len(entries.len() + 1) + ifd_extra_len(&entries);
+        entries.push(long_entry(tag::STRIP_OFFSETS, strip_offset as u32));
+
+        let mut data = Vec::new();
+        data.extend_from_slice(b"II");
+        data.extend_from_slice(&42u16.to_le_bytes());
+        data.extend_from_slice(&8u32.to_le_bytes());
+        write_test_ifd(&mut data, &entries, 8, 0);
+        data.resize(strip_offset, 0);
+        data.extend_from_slice(chunky_rgb);
+
+        let mut file = File::create(path).unwrap();
+        file.write_all(&data).unwrap();
+    }
+
     fn write_one_pixel_tiff_with_description(path: &Path, value: u8, description: &str) {
         let mut entries = vec![
             long_entry(tag::IMAGE_WIDTH, 1),
@@ -25501,6 +25551,56 @@ RecordingDate=2024-01-02 03:04:05.678\n",
         assert_eq!(meta.size_y, 1);
         assert_eq!(meta.image_count, 1);
         assert_eq!(reader.open_bytes(0).unwrap(), vec![0x5a]);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Regression test: `CellSensReader::open_bytes`/`open_bytes_region` for an
+    /// embedded, uncompressed, chunky RGB TIFF page (no ETS companion) must
+    /// NOT de-interleave a second time. The inner `TiffReader` already
+    /// planarizes chunky RGB itself via `get_stripped_samples`'s fast path
+    /// (`split_channels`), so re-applying `deinterleave_to_planar` on top of
+    /// already-planar bytes scrambled the output into a repeating, desaturated
+    /// tiled pattern. Only the manually JPEG-decoded overview path (see
+    /// `decode_overview_jpeg_full`) returns genuinely chunky bytes that still
+    /// need one de-interleave pass.
+    #[cfg(feature = "gpl")]
+    #[test]
+    fn cellsens_vsi_uncompressed_chunky_rgb_tiff_is_not_double_deinterleaved() {
+        let path = temp_flim2_path("uncompressed-rgb.vsi");
+        // 2x2 RGB, on-disk chunky (RGBRGB...) order, distinct per-pixel/channel
+        // values so any mis-grouping during (de)interleaving is detectable.
+        #[rustfmt::skip]
+        let chunky_rgb: [u8; 12] = [
+            10, 20, 30,   11, 21, 31,
+            12, 22, 32,   13, 23, 33,
+        ];
+        write_rgb_chunky_uncompressed_tiff(&path, 2, 2, &chunky_rgb);
+
+        let mut reader = CellSensReader::new();
+        reader.set_id(&path).unwrap();
+        assert_eq!(reader.series_count(), 1);
+        let meta = reader.metadata();
+        assert_eq!((meta.size_x, meta.size_y, meta.size_c), (2, 2, 3));
+        assert!(meta.is_rgb);
+        assert!(!meta.is_interleaved, "Java reports the overview as planar");
+
+        #[rustfmt::skip]
+        let expected_planar: [u8; 12] = [
+            10, 11, 12, 13, // R plane
+            20, 21, 22, 23, // G plane
+            30, 31, 32, 33, // B plane
+        ];
+        assert_eq!(reader.open_bytes(0).unwrap(), expected_planar);
+        assert_eq!(
+            reader.open_bytes_region(0, 0, 0, 2, 2).unwrap(),
+            expected_planar
+        );
+
+        // A sub-region must also stay correctly planar per-channel, not just
+        // the full-plane case.
+        let region = reader.open_bytes_region(0, 1, 0, 1, 2).unwrap();
+        assert_eq!(region, vec![11, 13, 21, 23, 31, 33]);
 
         let _ = std::fs::remove_file(path);
     }
