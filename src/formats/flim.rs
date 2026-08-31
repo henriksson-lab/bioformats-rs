@@ -249,7 +249,7 @@ fn apply_sdt_incr(buf: &mut [u8], incr: u16) {
         return;
     }
     let incr = incr as i32;
-    for chunk in buf.chunks_exact_mut(2) {
+    for chunk in buf.as_chunks_mut::<2>().0 {
         let s = i16::from_le_bytes([chunk[0], chunk[1]]);
         let result: i16 = if s > 0 {
             (s as i32 / incr) as i16
@@ -2540,7 +2540,9 @@ mod sdt_tests {
         assert!(reader.metadata().is_interleaved);
         let plane = reader.open_bytes(2).unwrap();
         let values: Vec<u16> = plane
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|b| u16::from_le_bytes([b[0], b[1]]))
             .collect();
         assert_eq!(values, vec![12, 22, 32, 42]);
@@ -2569,14 +2571,18 @@ mod sdt_tests {
 
         let plane = reader.open_bytes(1).unwrap();
         let values: Vec<u16> = plane
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|b| u16::from_le_bytes([b[0], b[1]]))
             .collect();
         assert_eq!(values, vec![11, 21, 31, 111, 121, 131]);
 
         let region = reader.open_bytes_region(1, 1, 1, 2, 1).unwrap();
         let region_values: Vec<u16> = region
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|b| u16::from_le_bytes([b[0], b[1]]))
             .collect();
         assert_eq!(region_values, vec![121, 131]);
@@ -2608,14 +2614,18 @@ mod sdt_tests {
 
         let plane = reader.open_bytes(1).unwrap();
         let values: Vec<u16> = plane
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|b| u16::from_le_bytes([b[0], b[1]]))
             .collect();
         assert_eq!(values, vec![11, 21, 31, 111, 121, 131]);
 
         let region = reader.open_bytes_region(1, 1, 1, 2, 1).unwrap();
         let region_values: Vec<u16> = region
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|b| u16::from_le_bytes([b[0], b[1]]))
             .collect();
         assert_eq!(region_values, vec![121, 131]);
@@ -2754,7 +2764,9 @@ mod sdt_tests {
 
         let plane = reader.open_bytes(0).unwrap();
         let values: Vec<u16> = plane
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|b| u16::from_le_bytes([b[0], b[1]]))
             .collect();
         assert_eq!(values, vec![7, 11, 13]);
@@ -2808,7 +2820,9 @@ mod sdt_tests {
 
         let plane = reader.open_bytes(0).unwrap();
         let values: Vec<u16> = plane
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|b| u16::from_le_bytes([b[0], b[1]]))
             .collect();
         assert_eq!(values, vec![17, 19, 23, 29]);
@@ -3139,14 +3153,18 @@ mod sdt_tests {
 
         let plane = reader.open_bytes(4).unwrap();
         let values: Vec<u16> = plane
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|b| u16::from_le_bytes([b[0], b[1]]))
             .collect();
         assert_eq!(values, vec![24, 34, 44, 124, 134, 144]);
 
         let region = reader.open_bytes_region(4, 1, 1, 2, 1).unwrap();
         let region_values: Vec<u16> = region
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|b| u16::from_le_bytes([b[0], b[1]]))
             .collect();
         assert_eq!(region_values, vec![134, 144]);
@@ -3278,7 +3296,9 @@ mod sdt_tests {
 
         let plane = reader.open_bytes(2).unwrap();
         let values: Vec<u16> = plane
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|b| u16::from_le_bytes([b[0], b[1]]))
             .collect();
         assert_eq!(values, vec![102, 112, 122, 132]);
@@ -3944,7 +3964,12 @@ fn liflim_convert12_to_16_lsb(image: &[u8]) -> Vec<u8> {
     if image16.len() / 4 != image.len() / 3 {
         return Vec::new();
     }
-    for (chunk, out) in image.chunks_exact(3).zip(image16.chunks_exact_mut(4)) {
+    for (chunk, out) in image
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .zip(image16.as_chunks_mut::<4>().0)
+    {
         out[0] = chunk[0];
         out[1] = chunk[1] & 0x0f;
         out[2] = ((chunk[1] & 0xf0) >> 4) | ((chunk[2] & 0x0f) << 4);
@@ -3958,7 +3983,12 @@ fn liflim_convert12_to_16_msb(image: &[u8]) -> Vec<u8> {
     if image16.len() / 4 != image.len() / 3 {
         return Vec::new();
     }
-    for (chunk, out) in image.chunks_exact(3).zip(image16.chunks_exact_mut(4)) {
+    for (chunk, out) in image
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .zip(image16.as_chunks_mut::<4>().0)
+    {
         out[0] = ((chunk[0] & 0x0f) << 4) | ((chunk[1] & 0xf0) >> 4);
         out[1] = (chunk[0] & 0xf0) >> 4;
         out[2] = chunk[2];

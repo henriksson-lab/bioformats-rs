@@ -41,5 +41,52 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      - name: Build
+      - name: Build (default features)
         run: cargo build --workspace
+
+      - name: Build (no default features)
+        run: cargo build --workspace --no-default-features
+
+      # jpegxr, zarr and tissuefaxs are on by default; openslide is not, and
+      # comes from a git dependency, so --all-features is what actually
+      # exercises it.
+      - name: Build (all features)
+        run: cargo build --workspace --all-features --all-targets
+
+  lint:
+    name: Lint (rustfmt + clippy)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt
+          rustup default stable
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-lint-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-lint-
+            ${{ runner.os }}-cargo-
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      # The lints that the Java translation parity rule deliberately trips are
+      # allowed in [lints.clippy] in Cargo.toml, with the reason for each.
+      # Everything else has to stay clean.
+      - name: Clippy (default features)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Clippy (all features)
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings

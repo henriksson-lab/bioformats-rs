@@ -233,7 +233,7 @@ fn parse_leica_instrument_metadata(
 ) -> LeiInstrumentMetadata {
     let mut keys: Vec<i32> = ifd.keys().copied().collect();
     keys.sort_unstable();
-    let sequential = keys.iter().any(|&key| key == SEQ_SCANNERSET);
+    let sequential = keys.contains(&SEQ_SCANNERSET);
 
     let mut instrument = LeiInstrumentMetadata {
         channel_detector_refs: vec![None; effective_size_c],
@@ -287,9 +287,7 @@ fn parse_leica_instrument_metadata(
         active_detectors.push(detector.clone());
         let detector_index = active_detectors.len() - 1;
         if detector_index == 0 {
-            for detector_ref in &mut instrument.channel_detector_refs {
-                *detector_ref = Some(detector_index);
-            }
+            instrument.channel_detector_refs.fill(Some(detector_index));
         }
         instrument.channel_detector_refs[next_channel] = Some(detector_index);
         next_channel += 1;

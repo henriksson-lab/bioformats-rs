@@ -8,14 +8,14 @@
 //! `bioformats_package.jar`) to read the file back and confirm:
 //!
 //!   1. CORE metadata  — sizeX/Y, pixelType and imageCount always; plus
-//!                       sizeZ/C/T and dimensionOrder for formats that carry
-//!                       explicit dimension metadata (OME-TIFF / OME-XML).
+//!      sizeZ/C/T and dimensionOrder for formats that carry
+//!      explicit dimension metadata (OME-TIFF / OME-XML).
 //!   2. PIXELS         — CRC32 of the bounded top-left region of each plane.
-//!                       For lossless formats we recompute the CRC of the same
-//!                       region from our known source pattern *in Java's
-//!                       reported layout* (interleave + endianness) and require
-//!                       a bitwise match. For JPEG (lossy) we compare Java's raw
-//!                       bytes against our source within a documented tolerance.
+//!      For lossless formats we recompute the CRC of the same
+//!      region from our known source pattern *in Java's
+//!      reported layout* (interleave + endianness) and require
+//!      a bitwise match. For JPEG (lossy) we compare Java's raw
+//!      bytes against our source within a documented tolerance.
 //!
 //! Proving Java reads OUR files with the SAME metadata + pixels demonstrates the
 //! writers emit correct, interoperable files. A genuine divergence is a real

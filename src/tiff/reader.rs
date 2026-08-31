@@ -158,6 +158,12 @@ pub struct TiffReader {
     synthetic_jpeg2000_ifds: HashMap<usize, u32>,
 }
 
+impl Default for TiffReader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TiffReader {
     pub fn new() -> Self {
         TiffReader {
@@ -368,7 +374,7 @@ impl TiffReader {
                 size_c: if is_rgb { u32::from(samples) } else { 1 },
                 size_t: 1,
                 pixel_type: info.pixel_type,
-                bits_per_pixel: (info.bits_per_sample) as u16,
+                bits_per_pixel: (info.bits_per_sample),
                 image_count: 1,
                 dimension_order: DimensionOrder::XYCZT,
                 is_rgb,
@@ -774,7 +780,7 @@ impl TiffReader {
                     size_c,
                     size_t: image_count,
                     pixel_type: info.pixel_type,
-                    bits_per_pixel: (info.bits_per_sample) as u16,
+                    bits_per_pixel: (info.bits_per_sample),
                     image_count,
                     dimension_order: crate::common::metadata::DimensionOrder::XYCZT,
                     is_rgb,
@@ -1479,7 +1485,7 @@ impl TiffReader {
             size_c,
             size_t: 1,
             pixel_type: info.pixel_type,
-            bits_per_pixel: (info.bits_per_sample) as u16,
+            bits_per_pixel: (info.bits_per_sample),
             image_count: 1,
             dimension_order: crate::common::metadata::DimensionOrder::XYZTC,
             is_rgb,
@@ -1786,7 +1792,7 @@ impl TiffReader {
         let ifd = file
             .ifds
             .get(ifd_index)
-            .ok_or_else(|| BioFormatsError::PlaneOutOfRange(ifd_index as u32))?;
+            .ok_or(BioFormatsError::PlaneOutOfRange(ifd_index as u32))?;
         let little_endian = file.parser.little_endian;
         let mut info = Self::ifd_info(ifd, little_endian)?;
         if let Some(&reduce) = self.synthetic_jpeg2000_ifds.get(&ifd_index) {
@@ -2179,7 +2185,7 @@ impl TiffReader {
             && info.strip_offsets.len() == 1
             && info.strip_byte_counts.len() == 1
             && info.rows_per_strip >= info.height
-            && (info.strip_byte_counts[0] as u64) <= MAX_STRIP_READ
+            && info.strip_byte_counts[0] <= MAX_STRIP_READ
         {
             let offset = info.strip_offsets[0];
             let byte_count = info.strip_byte_counts[0] as usize;
@@ -3501,7 +3507,7 @@ fn jpeg2000_codestream_offset(data: &[u8]) -> Option<usize> {
 
 fn jpeg2000_resolution_levels_from_bytes(data: &[u8]) -> Option<u8> {
     let mut pos = jpeg2000_codestream_offset(data)?;
-    if data.get(pos..pos + 2)? != &[0xff, 0x4f] {
+    if data.get(pos..pos + 2)? != [0xff, 0x4f] {
         return None;
     }
     pos += 2;
@@ -4146,9 +4152,7 @@ fn start_tag_positions(xml: &str, local_name: &str) -> Vec<usize> {
 }
 
 fn is_ome_xml_description(xml: &str) -> bool {
-    start_tag_positions(xml.trim_start(), "OME")
-        .first()
-        .is_some()
+    !start_tag_positions(xml.trim_start(), "OME").is_empty()
 }
 
 fn ome_root_uuid(xml: &str) -> Option<String> {
@@ -4178,7 +4182,7 @@ fn check_comment_imagej(comment: &str) -> bool {
 ///   - `Frame Interval` / TimeIncrement (seconds, from `finterval=`)
 ///   - `X Origin` / `Y Origin`        (plane stage origin, from `xorigin=`/`yorigin=`)
 ///   - `Color mode`         (from `mode=`)
-/// plus any other `key=value` token as an original-metadata entry.
+///     plus any other `key=value` token as an original-metadata entry.
 ///
 /// Java keys are preserved verbatim so downstream consumers match the reference.
 /// Dimension sizes (channels/slices/frames/images) are intentionally NOT applied:

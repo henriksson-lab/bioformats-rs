@@ -441,7 +441,7 @@ impl OmeZarrReader {
 
         // Natural-order the group keys (root "" sorts first).
         let mut keys: Vec<String> = groups.keys().cloned().collect();
-        keys.sort_by(|a, b| natural_key(a).cmp(&natural_key(b)));
+        keys.sort_by_key(|a| natural_key(a));
 
         let mut series = Vec::new();
         for key in &keys {
@@ -528,7 +528,7 @@ fn build_plain_zarr_series(store: &Arc<FilesystemStore>, root: &Path) -> Result<
 fn collect_plain_array_paths(root: &Path) -> Vec<String> {
     let mut out = Vec::new();
     collect_plain_array_paths_rec(root, "", &mut out);
-    out.sort_by(|a, b| natural_key(a).cmp(&natural_key(b)));
+    out.sort_by_key(|a| natural_key(a));
     out
 }
 
@@ -611,7 +611,7 @@ fn build_series(
         let logical = ['t', 'c', 'z', 'y', 'x'];
         let mut axis_index = [None; 5];
         for (li, lc) in logical.iter().enumerate() {
-            axis_index[li] = names.iter().position(|n| n.chars().next() == Some(*lc));
+            axis_index[li] = names.iter().position(|n| n.starts_with(*lc));
         }
 
         let datasets = ms
@@ -841,7 +841,7 @@ fn elements_to_le_bytes<T, F>(elems: &[T], to_le: F) -> Vec<u8>
 where
     F: Fn(&T) -> Vec<u8>,
 {
-    let mut out = Vec::with_capacity(elems.len() * std::mem::size_of::<T>());
+    let mut out = Vec::with_capacity(std::mem::size_of_val(elems));
     for e in elems {
         out.extend_from_slice(&to_le(e));
     }
@@ -982,7 +982,6 @@ impl FormatReader for OmeZarrReader {
         let bytes = match level.pixel_type {
             PixelType::Uint8 | PixelType::Bit => array
                 .retrieve_array_subset::<Vec<u8>>(&subset)
-                .map(|v| v)
                 .map_err(read_err)?,
             PixelType::Int8 => array
                 .retrieve_array_subset::<Vec<i8>>(&subset)

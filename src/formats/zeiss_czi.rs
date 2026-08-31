@@ -1309,7 +1309,7 @@ fn parse_czi_channel_color(color: &str) -> Option<i32> {
 ///      emission/excitation wavelengths.
 ///   2. `DisplaySetting/Channels` provides the channel `Name` (overriding),
 ///      colour, and dye wavelength overrides, indexed positionally.
-/// The unrelated `Experiment/.../Channels` setup blocks are *not* counted.
+///      The unrelated `Experiment/.../Channels` setup blocks are *not* counted.
 fn build_czi_channels(xml: &str) -> Vec<crate::common::ome_metadata::OmeChannel> {
     use crate::common::ome_metadata::OmeChannel;
 
@@ -1896,7 +1896,7 @@ impl ZeissCziReader {
                     && (!multi_pt || want_pt == Some(e.pixel_type))
                     // PALM: a series exposes only the subblock matching its stored
                     // tile size (ZeissCZIReader:1155-1172).
-                    && series.palm_size.map_or(true, |(sx, sy)| {
+                    && series.palm_size.is_none_or(|(sx, sy)| {
                         e.dim_stored_size("X").max(0) as u32 == sx
                             && e.dim_stored_size("Y").max(0) as u32 == sy
                     })
@@ -1944,7 +1944,7 @@ impl ZeissCziReader {
         let max_bytes = tile_w * tile_h * pixel_bytes;
         match decompress_subblock(&compressed, entry.compression, tile_w, tile_h, max_bytes) {
             Ok(decoded) => Ok(decoded),
-            Err(err) if entry.compression == 4 && compressed.len() == max_bytes => Ok(compressed),
+            Err(_err) if entry.compression == 4 && compressed.len() == max_bytes => Ok(compressed),
             Err(_err) if entry.compression == 4 => Ok(vec![0; max_bytes]),
             Err(err) => Err(err),
         }

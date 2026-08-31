@@ -1947,7 +1947,9 @@ fn parse_tillvision_fragment_pairs(value: &str) -> Option<Vec<(usize, usize)>> {
     }
     Some(
         values
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| (pair[0], pair[1]))
             .collect(),
     )
@@ -2511,7 +2513,7 @@ fn normalize_tillvision_acquisition_datetime(date: &str, start: Option<&str>) ->
 fn parse_tillvision_date(date: &str) -> Option<(u32, u32, u32)> {
     let parts = date
         .trim()
-        .split(|ch: char| matches!(ch, '/' | '-' | '.'))
+        .split(['/', '-', '.'])
         .filter(|part| !part.trim().is_empty())
         .collect::<Vec<_>>();
     if parts.len() != 3 {
@@ -2580,9 +2582,9 @@ enum TillVisionTimeUnit {
     Seconds,
 }
 
-fn find_tillvision_exposure_value<'a>(
-    values: &'a HashMap<String, String>,
-) -> Option<(&'a str, &'a str, TillVisionTimeUnit)> {
+fn find_tillvision_exposure_value(
+    values: &HashMap<String, String>,
+) -> Option<(&str, &str, TillVisionTimeUnit)> {
     for (key, value) in values {
         let normalized = normalize_tillvision_key(key);
         if !normalized.contains("exposure") {
@@ -2640,9 +2642,9 @@ fn find_tillvision_physical_size_value<'a>(
     })
 }
 
-fn find_tillvision_time_increment_value<'a>(
-    values: &'a HashMap<String, String>,
-) -> Option<(&'a str, &'a str, TillVisionTimeUnit)> {
+fn find_tillvision_time_increment_value(
+    values: &HashMap<String, String>,
+) -> Option<(&str, &str, TillVisionTimeUnit)> {
     for (key, value) in values {
         let normalized = normalize_tillvision_key(key);
         let compact = compact_tillvision_key(&normalized);

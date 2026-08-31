@@ -1073,7 +1073,6 @@ fn parse_ims(path: &Path) -> Result<ImsParse> {
 }
 
 /// Read an integer attribute (string- or numeric-encoded) from an HDF5 group.
-
 fn insert_optional_float(
     meta_map: &mut HashMap<String, MetadataValue>,
     key: &str,
@@ -2835,7 +2834,7 @@ fn imaris_child_dataset(
     }
     for dataset in parent.datasets().ok()? {
         let base = imaris_hdf_basename(dataset.name());
-        if names.iter().any(|name| *name == base) {
+        if names.contains(&base) {
             return Some((base.to_string(), dataset));
         }
     }
@@ -2862,7 +2861,7 @@ fn ims_level_dims(
     let shape = ds.shape().map_err(|e| {
         BioFormatsError::Format(format!("Imaris: cannot read shape for {path}: {e}"))
     })?;
-    if shape.len() != 3 || shape.iter().any(|&d| d == 0) {
+    if shape.len() != 3 || shape.contains(&0) {
         return Err(BioFormatsError::UnsupportedFormat(format!(
             "Imaris: unsupported Data shape {shape:?} for {path}"
         )));
@@ -3112,7 +3111,7 @@ impl FormatReader for ImarisHdfReader {
         if need_load {
             let file = self.file.as_ref().ok_or(BioFormatsError::NotInitialized)?;
             let (_data_path, ds) =
-                ims_data_dataset(&file, &self.path_prefix, res, t, c).ok_or_else(|| {
+                ims_data_dataset(file, &self.path_prefix, res, t, c).ok_or_else(|| {
                 BioFormatsError::UnsupportedFormat(format!(
                     "Imaris: missing DataSet/ResolutionLevel {res}/TimePoint {t}/Channel {c}/Data or DataSet/ResolutionLevel_{res}/TimePoint_{t}/Channel_{c}/Data"
                 ))
@@ -3188,7 +3187,7 @@ impl FormatReader for ImarisHdfReader {
 
         let file = self.file.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         let (_data_path, ds) =
-            ims_data_dataset(&file, &self.path_prefix, res, t, c).ok_or_else(|| {
+            ims_data_dataset(file, &self.path_prefix, res, t, c).ok_or_else(|| {
             BioFormatsError::UnsupportedFormat(format!(
                 "Imaris: missing DataSet/ResolutionLevel {res}/TimePoint {t}/Channel {c}/Data or DataSet/ResolutionLevel_{res}/TimePoint_{t}/Channel_{c}/Data"
             ))

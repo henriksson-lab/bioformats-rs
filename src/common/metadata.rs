@@ -54,20 +54,15 @@ pub struct ModuloAnnotation {
 }
 
 /// Dimension ordering of the image planes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum DimensionOrder {
     XYCTZ,
+    #[default]
     XYCZT,
     XYTCZ,
     XYTZC,
     XYZCT,
     XYZTC,
-}
-
-impl Default for DimensionOrder {
-    fn default() -> Self {
-        DimensionOrder::XYCZT
-    }
 }
 
 /// A typed metadata value.

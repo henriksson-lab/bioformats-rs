@@ -118,7 +118,7 @@ pub fn parse_lavision_stage(xml: &str) -> Option<LaVisionStageMetadata> {
 
     if let Some(tag) = find_element(xml, "<TileConfiguration") {
         if let Some(body) = attribute(tag, "TileConfiguration") {
-            meta.tiles = parse_tile_configuration(&body);
+            meta.tiles = parse_tile_configuration(body);
         }
     }
 

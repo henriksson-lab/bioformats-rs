@@ -87,7 +87,7 @@ impl ImageReader {
 
     /// Open the file with reader options that must be set before initialization.
     pub fn open_with_options(path: &Path, options: ImageReaderOptions) -> Result<Self> {
-        let inner = open_reader_with_options(path, options.clone())?;
+        let inner = open_reader_with_options(path, options)?;
         Ok(ImageReader {
             inner: Some(inner),
             options,
@@ -1466,6 +1466,7 @@ mod tests {
     use crate::common::reader::FormatReader;
     use crate::ImageWriter;
     use std::io::Write;
+    use std::path::Path;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1501,7 +1502,7 @@ mod tests {
         std::fs::write(path, bytes).unwrap();
     }
 
-    fn write_dicom(path: &PathBuf, width: u32, height: u32) {
+    fn write_dicom(path: &Path, width: u32, height: u32) {
         let meta = ImageMetadata {
             size_x: width,
             size_y: height,
@@ -1517,7 +1518,7 @@ mod tests {
         ImageWriter::save(path, &meta, &[pixels]).unwrap();
     }
 
-    fn write_gray_tiff(path: &PathBuf, width: u32, height: u32) {
+    fn write_gray_tiff(path: &Path, width: u32, height: u32) {
         let meta = ImageMetadata {
             size_x: width,
             size_y: height,
@@ -2980,7 +2981,8 @@ mod tests {
         meta.pixel_type = crate::common::pixel_type::PixelType::Uint8;
         meta.image_count = 1;
         let pixels = vec![10u8, 20, 30, 40];
-        crate::writer_registry::ImageWriter::save(&tiff_src, &meta, &[pixels.clone()]).unwrap();
+        crate::writer_registry::ImageWriter::save(&tiff_src, &meta, std::slice::from_ref(&pixels))
+            .unwrap();
         let tiff_bytes = std::fs::read(&tiff_src).unwrap();
         let _ = std::fs::remove_file(&tiff_src);
 

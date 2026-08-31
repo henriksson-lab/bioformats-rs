@@ -46,9 +46,10 @@ pub mod writer_registry;
 
 pub use crate::cache::{CacheStrategy, CachedReader};
 pub use crate::common::compressed::{
-    CompressedBytes, CompressedExtractionConstraint, CompressedExtractionSupport,
-    CompressedFileRange, CompressedLevelInfo, CompressedTile, CompressedTileMode,
-    Jpeg2000Container, JpegColorSpace, JpegSubsampling, LossyCodec,
+    ColorChannel, CompressedBytes, CompressedExtractionConstraint, CompressedExtractionSupport,
+    CompressedFileRange, CompressedLevelInfo, CompressedPlane, CompressedPlaneBytes,
+    CompressedTile, CompressedTileMode, Jpeg2000Container, JpegColorSpace, JpegPlaneInfo,
+    JpegSubsampling, LossyCodec,
 };
 pub use crate::common::ome_metadata::{
     create_lsid, OmeAnnotation, OmeChannel, OmeDataset, OmeDetector, OmeDichroic, OmeExperiment,

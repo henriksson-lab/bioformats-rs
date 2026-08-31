@@ -708,12 +708,12 @@ pub fn get_nodes<'a>(root: &'a XmlNode, name: &str) -> Vec<&'a XmlNode> {
 }
 
 /// Mirror of LMSMetadataExtractor.getImageDescription.
-fn get_image_description<'a>(root: &'a XmlNode) -> Option<&'a XmlNode> {
+fn get_image_description(root: &XmlNode) -> Option<&XmlNode> {
     first_descendant(root, "ImageDescription")
 }
 
 /// Mirror of LMSMetadataExtractor.getChannelDescriptionNodes.
-fn get_channel_description_nodes<'a>(root: &'a XmlNode) -> Vec<&'a XmlNode> {
+fn get_channel_description_nodes(root: &XmlNode) -> Vec<&XmlNode> {
     let Some(image_description) = get_image_description(root) else {
         return Vec::new();
     };
@@ -724,7 +724,7 @@ fn get_channel_description_nodes<'a>(root: &'a XmlNode) -> Vec<&'a XmlNode> {
 }
 
 /// Mirror of LMSMetadataExtractor.getDimensionDescriptionNodes.
-fn get_dimension_description_nodes<'a>(root: &'a XmlNode) -> Vec<&'a XmlNode> {
+fn get_dimension_description_nodes(root: &XmlNode) -> Vec<&XmlNode> {
     let Some(image_description) = get_image_description(root) else {
         return Vec::new();
     };
@@ -1190,8 +1190,7 @@ impl ImageBuffer {
 
     /// Mirror of MetadataTempBuffer.sortDimensions.
     fn sort_dimensions(&mut self) {
-        self.dimensions
-            .sort_by(|a, b| a.bytes_inc.cmp(&b.bytes_inc));
+        self.dimensions.sort_by_key(|a| a.bytes_inc);
 
         // Move X and Y to the start in bytesInc order.
         let x_index = self
@@ -1257,8 +1256,7 @@ impl ImageBuffer {
 
     /// Mirror of MetadataTempBuffer.addMissingDimensions.
     pub fn add_missing_dimensions(&mut self) {
-        self.dimensions
-            .sort_by(|a, b| a.bytes_inc.cmp(&b.bytes_inc));
+        self.dimensions.sort_by_key(|a| a.bytes_inc);
         let last = match self.dimensions.last() {
             Some(d) => (d.bytes_inc, d.old_physical_size),
             None => (0, false),
@@ -2915,12 +2913,10 @@ fn emit_lms_channel_lasers(extractor: &LmsMetadataExtractor, meta: &mut ImageMet
 
     // noNames detection (channelNames[index]).
     let mut no_names = true;
-    for name in &buffer.channel_names {
-        if let Some(name) = name {
-            if !name.is_empty() {
-                no_names = false;
-                break;
-            }
+    for name in buffer.channel_names.iter().flatten() {
+        if !name.is_empty() {
+            no_names = false;
+            break;
         }
     }
     if !no_names && !frap.is_empty() {

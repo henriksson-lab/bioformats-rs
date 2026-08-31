@@ -714,11 +714,10 @@ impl FormatReader for PcoB16Reader {
         }
         let n_bytes = meta.size_x as usize * meta.size_y as usize * 2;
         let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        let mut f = std::fs::File::open(path).map_err(|e| BioFormatsError::Io(e))?;
-        f.seek(SeekFrom::Start(216))
-            .map_err(|e| BioFormatsError::Io(e))?;
+        let mut f = std::fs::File::open(path).map_err(BioFormatsError::Io)?;
+        f.seek(SeekFrom::Start(216)).map_err(BioFormatsError::Io)?;
         let mut buf = vec![0u8; n_bytes];
-        f.read_exact(&mut buf).map_err(|e| BioFormatsError::Io(e))?;
+        f.read_exact(&mut buf).map_err(BioFormatsError::Io)?;
         Ok(buf)
     }
 
@@ -2478,7 +2477,7 @@ impl FormatReader for IpwReader {
             size_c,
             size_t,
             pixel_type: first_meta.pixel_type,
-            bits_per_pixel: (first_meta.bits_per_pixel).into(),
+            bits_per_pixel: (first_meta.bits_per_pixel),
             image_count,
             dimension_order: if first_meta.is_rgb {
                 DimensionOrder::XYCZT
@@ -3309,13 +3308,13 @@ impl NikonReader {
             .ifd_indices
             .get(no)
             .copied()
-            .ok_or_else(|| BioFormatsError::PlaneOutOfRange(no as u32))?;
+            .ok_or(BioFormatsError::PlaneOutOfRange(no as u32))?;
         let ifd = self
             .inner
             .ifd(ifd_index)
-            .ok_or_else(|| BioFormatsError::PlaneOutOfRange(no as u32))?;
+            .ok_or(BioFormatsError::PlaneOutOfRange(no as u32))?;
         let bps = ifd.bits_per_sample();
-        let mut data_size = *bps.first().unwrap_or(&16) as u16;
+        let mut data_size = *bps.first().unwrap_or(&16);
         let byte_counts = ifd.get_vec_u64(tag::STRIP_BYTE_COUNTS);
         let offsets = ifd.get_vec_u64(tag::STRIP_OFFSETS);
         let compression = ifd.compression();
@@ -3486,7 +3485,7 @@ impl FormatReader for NikonReader {
         } else {
             PixelType::Uint16
         };
-        meta.bits_per_pixel = (bits_per_sample) as u16;
+        meta.bits_per_pixel = bits_per_sample;
         meta.size_z = 1;
         meta.size_c = if is_rgb { samples as u32 } else { 1 };
         meta.is_rgb = is_rgb;

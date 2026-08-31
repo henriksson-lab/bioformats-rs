@@ -192,7 +192,9 @@ fn parse_lut_data(
         return value.iter().map(|&v| u16::from(v)).collect();
     }
     value
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|chunk| {
             if little_endian {
                 u16::from_le_bytes([chunk[0], chunk[1]])
@@ -758,7 +760,7 @@ fn read_element_length_after_tag(
         };
         Ok((vr, length))
     } else {
-        Ok(([b'?', b'?'], read_u32(r, little_endian)? as u64))
+        Ok((*b"??", read_u32(r, little_endian)? as u64))
     }
 }
 
@@ -853,7 +855,9 @@ fn skip_undefined_length_sequence(
 
 fn parse_basic_offset_table(value: &[u8]) -> Vec<u32> {
     value
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
         .collect()
 }
@@ -1095,7 +1099,7 @@ fn parse_dicom(path: &Path) -> Result<DicomAttrs> {
             } else {
                 read_u32_be(&mut r).map_err(BioFormatsError::Io)? as u64
             };
-            ([b'?', b'?'], length)
+            (*b"??", length)
         };
 
         // Undefined length (0xFFFFFFFF) — only safe to handle for pixel data
@@ -1235,12 +1239,12 @@ fn parse_dicom(path: &Path) -> Result<DicomAttrs> {
             (0x0008, 0x0033) => attrs.content_time = Some(ascii_trim(&value)), // Content Time
             (0x0008, 0x002A) => {
                 let stamp = ascii_trim(&value);
-                if stamp.len() >= 8 && attrs.extra.get("AcquisitionDate").is_none() {
+                if stamp.len() >= 8 && !attrs.extra.contains_key("AcquisitionDate") {
                     attrs
                         .extra
                         .insert("AcquisitionDate".into(), stamp[0..8].to_string());
                 }
-                if stamp.len() > 8 && attrs.extra.get("AcquisitionTime").is_none() {
+                if stamp.len() > 8 && !attrs.extra.contains_key("AcquisitionTime") {
                     attrs
                         .extra
                         .insert("AcquisitionTime".into(), stamp[8..].to_string());
@@ -1956,7 +1960,9 @@ fn normalize_native_pixels(
             .map(|&v| u16::from(v) & mask)
             .collect()
     } else {
-        src.chunks_exact(2)
+        src.as_chunks::<2>()
+            .0
+            .iter()
             .take(sample_count)
             .map(|chunk| {
                 let raw = if meta.is_little_endian {
@@ -2030,7 +2036,7 @@ fn invert_monochrome1(
             if max_pixel_range == -1 || (center_pixel_value as i64) < (max_pixel_range as i64) / 2 {
                 max_pixel_value = default_max_value(meta);
             }
-            for px in buf.chunks_exact_mut(2) {
+            for px in buf.as_chunks_mut::<2>().0 {
                 let value = if meta.is_little_endian {
                     u16::from_le_bytes([px[0], px[1]]) as i64
                 } else {
@@ -3360,7 +3366,7 @@ fn dicom_writer_bits(meta: &ImageMetadata) -> (u16, u16) {
         PixelType::Bit => 1,
         _ => (meta.pixel_type.bytes_per_sample() * 8) as u16,
     };
-    let requested = u16::from(meta.bits_per_pixel);
+    let requested = meta.bits_per_pixel;
     let stored = if requested == 0 || requested > allocated || (requested == 8 && allocated != 8) {
         allocated
     } else {

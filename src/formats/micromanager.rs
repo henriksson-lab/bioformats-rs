@@ -585,7 +585,7 @@ fn parse_position(meta_path: &Path) -> Result<Position> {
         size_c: channels,
         size_t: frames,
         pixel_type,
-        bits_per_pixel: (bits).into(),
+        bits_per_pixel: (bits),
         image_count,
         dimension_order,
         is_rgb: is_rgb_summary,

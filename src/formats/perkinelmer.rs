@@ -353,7 +353,7 @@ fn pe_parse_htm(m: &mut PeMeta, content: &str) {
     // Split on HTML tags and surrounding whitespace, similar to Java's
     // HTML_REGEX. Tokens containing '<' are blanked.
     let mut tokens: Vec<String> = Vec::new();
-    for part in content.split(|c| c == '<' || c == '>') {
+    for part in content.split(['<', '>']) {
         let trimmed = part.trim();
         tokens.push(trimmed.to_string());
     }
@@ -529,7 +529,7 @@ fn pe_iso8601_to_unix_millis(iso: &str) -> Option<i64> {
     let doy = (153 * mp + 2) / 5 + day - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     let days = era * 146097 + doe - 719468;
-    Some(((days * 86400 + hh * 3600 + mm * 60 + ss) * 1000) as i64)
+    Some((days * 86400 + hh * 3600 + mm * 60 + ss) * 1000)
 }
 
 fn parse_pe_dataset(id: &Path) -> Result<(PeMeta, Vec<PixelsFile>, usize, bool)> {

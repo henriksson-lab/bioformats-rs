@@ -483,7 +483,9 @@ impl<R: Read + Seek> TiffParser<R> {
                 IfdValue::Ascii(text)
             }
             3 => IfdValue::Short(
-                data.chunks_exact(2)
+                data.as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|c| {
                         if le {
                             u16::from_le_bytes([c[0], c[1]])
@@ -494,7 +496,9 @@ impl<R: Read + Seek> TiffParser<R> {
                     .collect(),
             ),
             4 | 13 => IfdValue::Long(
-                data.chunks_exact(4)
+                data.as_chunks::<4>()
+                    .0
+                    .iter()
                     .map(|c| {
                         if le {
                             u32::from_le_bytes([c[0], c[1], c[2], c[3]])
@@ -505,7 +509,9 @@ impl<R: Read + Seek> TiffParser<R> {
                     .collect(),
             ),
             5 => IfdValue::Rational(
-                data.chunks_exact(8)
+                data.as_chunks::<8>()
+                    .0
+                    .iter()
                     .map(|c| {
                         let n = if le {
                             u32::from_le_bytes([c[0], c[1], c[2], c[3]])
@@ -524,7 +530,9 @@ impl<R: Read + Seek> TiffParser<R> {
             6 => IfdValue::SByte(data.iter().map(|&b| b as i8).collect()),
             7 => IfdValue::Undefined(data.to_vec()),
             8 => IfdValue::SShort(
-                data.chunks_exact(2)
+                data.as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|c| {
                         if le {
                             i16::from_le_bytes([c[0], c[1]])
@@ -535,7 +543,9 @@ impl<R: Read + Seek> TiffParser<R> {
                     .collect(),
             ),
             9 => IfdValue::SLong(
-                data.chunks_exact(4)
+                data.as_chunks::<4>()
+                    .0
+                    .iter()
                     .map(|c| {
                         if le {
                             i32::from_le_bytes([c[0], c[1], c[2], c[3]])
@@ -546,7 +556,9 @@ impl<R: Read + Seek> TiffParser<R> {
                     .collect(),
             ),
             10 => IfdValue::SRational(
-                data.chunks_exact(8)
+                data.as_chunks::<8>()
+                    .0
+                    .iter()
                     .map(|c| {
                         let n = if le {
                             u32::from_le_bytes([c[0], c[1], c[2], c[3]])
@@ -563,7 +575,9 @@ impl<R: Read + Seek> TiffParser<R> {
                     .collect(),
             ),
             11 => IfdValue::Float(
-                data.chunks_exact(4)
+                data.as_chunks::<4>()
+                    .0
+                    .iter()
                     .map(|c| {
                         f32::from_bits(if le {
                             u32::from_le_bytes([c[0], c[1], c[2], c[3]])
@@ -574,7 +588,9 @@ impl<R: Read + Seek> TiffParser<R> {
                     .collect(),
             ),
             12 => IfdValue::Double(
-                data.chunks_exact(8)
+                data.as_chunks::<8>()
+                    .0
+                    .iter()
                     .map(|c| {
                         f64::from_bits(if le {
                             u64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]])
@@ -585,7 +601,9 @@ impl<R: Read + Seek> TiffParser<R> {
                     .collect(),
             ),
             16 | 18 => IfdValue::Long8(
-                data.chunks_exact(8)
+                data.as_chunks::<8>()
+                    .0
+                    .iter()
                     .map(|c| {
                         if le {
                             u64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]])
@@ -596,7 +614,9 @@ impl<R: Read + Seek> TiffParser<R> {
                     .collect(),
             ),
             17 => IfdValue::SLong8(
-                data.chunks_exact(8)
+                data.as_chunks::<8>()
+                    .0
+                    .iter()
                     .map(|c| {
                         if le {
                             i64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]])

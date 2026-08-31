@@ -2038,7 +2038,7 @@ impl MetamorphReader {
         // Parse UIC2/UIC3 for the Z/C/T structure (Java MetamorphReader).
         let uic_dims = {
             let f = File::open(path).ok();
-            let parsed = f.and_then(|file| {
+            f.and_then(|file| {
                 let buf = BufReader::new(file);
                 TiffParser::new(buf).ok().and_then(|mut parser| {
                     parser
@@ -2046,8 +2046,7 @@ impl MetamorphReader {
                         .ok()
                         .and_then(|(ifd, _)| read_uic_dims(path, &ifd, mm_planes))
                 })
-            });
-            parsed
+            })
         };
 
         let rgb_channels = if tiff_meta.is_rgb { 3 } else { 1 };

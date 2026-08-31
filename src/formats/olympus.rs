@@ -90,13 +90,17 @@ fn normalize_cfb_path(path: &str) -> String {
 fn decode_text(bytes: &[u8]) -> String {
     if bytes.len() >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE {
         let u16s: Vec<u16> = bytes[2..]
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect();
         String::from_utf16_lossy(&u16s)
     } else if bytes.iter().take(64).filter(|&&b| b == 0).count() > 8 {
         let u16s: Vec<u16> = bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect();
         String::from_utf16_lossy(&u16s)
@@ -514,8 +518,8 @@ impl Fv1000Reader {
 
         // ---- Axis N Parameters Common: AxisCode / MaxSize ----
         let mut code = vec![String::new(); NUM_DIMENSIONS];
-        let mut size = vec![1u32; NUM_DIMENSIONS];
-        let mut pixel_size = vec![None; NUM_DIMENSIONS];
+        let mut size = [1u32; NUM_DIMENSIONS];
+        let mut pixel_size = [None; NUM_DIMENSIONS];
         for i in 0..NUM_DIMENSIONS {
             if let Some(common) = f.table(&format!("Axis {i} Parameters Common")) {
                 code[i] = common.get("AxisCode").cloned().unwrap_or_default();
@@ -926,7 +930,7 @@ impl Fv1000Reader {
             size_c,
             size_t,
             pixel_type,
-            bits_per_pixel: (bits).into(),
+            bits_per_pixel: (bits),
             image_count: image_count as u32,
             dimension_order,
             is_rgb,
@@ -962,7 +966,7 @@ impl Fv1000Reader {
                 green: Vec::with_capacity(65_536),
                 blue: Vec::with_capacity(65_536),
             };
-            for entry in buffer.chunks_exact(4) {
+            for entry in buffer.as_chunks::<4>().0 {
                 lut.red.push((entry[2] as u16) * 257);
                 lut.green.push((entry[1] as u16) * 257);
                 lut.blue.push((entry[0] as u16) * 257);
@@ -1873,13 +1877,9 @@ impl OlympusTileReader {
             if self.helper_reader.is_none() {
                 // Choose the helper by tile suffix (Java OIRReader/CellSensReader).
                 if check_suffix(&tile_file, "oir") {
-                    self.helper_reader = Some(TileHelper::Oir(Box::new(
-                        crate::formats::flim2::OirReader::new(),
-                    )));
+                    self.helper_reader = Some(TileHelper::Oir(Box::default()));
                 } else if check_suffix(&tile_file, "vsi") {
-                    self.helper_reader = Some(TileHelper::CellSens(Box::new(
-                        crate::formats::flim2::CellSensReader::new(),
-                    )));
+                    self.helper_reader = Some(TileHelper::CellSens(Box::default()));
                 } else {
                     return Err(BioFormatsError::Format(format!(
                         "Unsupported tile file {tile_file}"
@@ -1926,8 +1926,8 @@ impl OlympusTileReader {
                 if rows > 1 {
                     adjust_height -= diff_y / (rows - 1);
                 }
-            } else {
-                self.helper_reader.as_mut().unwrap().set_id(&tile_file)?;
+            } else if let Some(helper) = self.helper_reader.as_mut() {
+                helper.set_id(&tile_file)?;
             }
 
             let helper = self.helper_reader.as_mut().unwrap();
@@ -2660,7 +2660,7 @@ mod tests {
         let total = 48 + xml.len() as u32;
         push_oir_u32(buf, total);
         push_oir_u32(buf, 0);
-        buf.extend(std::iter::repeat(0).take(36));
+        buf.extend(std::iter::repeat_n(0, 36));
         push_oir_u32(buf, xml.len() as u32);
         buf.extend_from_slice(xml.as_bytes());
     }

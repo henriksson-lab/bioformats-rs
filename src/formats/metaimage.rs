@@ -115,7 +115,7 @@ fn parse_mhd(path: &Path) -> Result<MhdHeader> {
             break;
         }
 
-        let trimmed = line.trim_end_matches(|c| c == '\r' || c == '\n');
+        let trimmed = line.trim_end_matches(['\r', '\n']);
         if trimmed.is_empty() {
             continue;
         }
@@ -209,7 +209,7 @@ fn parse_mhd(path: &Path) -> Result<MhdHeader> {
             sizes.len()
         )));
     }
-    if sizes.iter().any(|&size| size == 0) {
+    if sizes.contains(&0) {
         return Err(BioFormatsError::Format(
             "MetaImage: DimSize values must be positive".into(),
         ));

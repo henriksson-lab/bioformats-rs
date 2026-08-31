@@ -72,7 +72,7 @@ impl IcsHeader {
                 break;
             }
 
-            let line = line.trim_end_matches(|c| c == '\r' || c == '\n');
+            let line = line.trim_end_matches(['\r', '\n']);
             if line.eq_ignore_ascii_case("end") {
                 // For ICS2, data immediately follows
                 data_offset = reader.stream_position().map_err(BioFormatsError::Io)?;
@@ -1863,7 +1863,7 @@ impl FormatWriter for IcsWriter {
         // garbage. Java's own ICSWriter emits "\nend\n" (LF) for exactly this
         // reason. The leading `ics_version\t2.0\r\n` line stays CRLF because the v2
         // probe reads a fixed 17 bytes and needs that line to be exactly 17 long.
-        write!(f, "end\n").map_err(BioFormatsError::Io)?;
+        writeln!(f, "end").map_err(BioFormatsError::Io)?;
         let mut pixel_file = if write_ics1_pair {
             Some(File::create(&path).map_err(BioFormatsError::Io)?)
         } else {

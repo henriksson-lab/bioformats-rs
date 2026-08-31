@@ -1,6 +1,6 @@
 [package]
 name = "bioformats"
-version = "0.1.9"
+version = "0.1.10"
 edition = "2021"
 description = "Pure Rust translation of Bio-Formats — read/write scientific image formats"
 license = "GPL-2.0-or-later"
@@ -48,12 +48,53 @@ openjp2      = { package = "openjpeg2-pure-rs", version = "0.1.1" }
 serde         = { version = "1", features = ["derive"] }
 bincode       = "1"
 jpegxr = { package = "jpegxr-pure-rs", version = "0.1", optional = true }
-openslide-pure-rs = { version = "0.1", optional = true }
+openslide-pure-rs = { git = "https://github.com/henriksson-lab/openslide-pure-rs", optional = true }
 mdbtools      = { package = "mdbtools-pure-rs", version = "0.1" }
 bzip2 = "0.6"
 zarrs         = { version = "0.23", features = ["filesystem"], optional = true }
 serde_json    = { version = "1", features = ["preserve_order"] }
-rusqlite      = { version = "0.37", features = ["bundled"], optional = true }
+rusqlite      = { version = "0.40", features = ["bundled"], optional = true }
+
+# Clippy lints that fight the translation parity rule in CLAUDE.md: the code is
+# deliberately shaped like the upstream Java Bio-Formats source so it can be
+# audited line by line. Each of these asks for a Rust idiom that compiles to the
+# same thing but hides the Java structure, so they are allowed rather than fixed.
+[lints.clippy]
+# Java writes `X x = new X(); x.field = ...;`, not a struct literal.
+field_reassign_with_default = "allow"
+# Java indexes with `for (int i = 0; i < n; i++)`; the index is often used for
+# more than one array, or for the bounds arithmetic around it.
+needless_range_loop = "allow"
+explicit_counter_loop = "allow"
+# Signatures mirror Java method signatures argument for argument.
+too_many_arguments = "allow"
+type_complexity = "allow"
+large_enum_variant = "allow"
+only_used_in_recursion = "allow"
+# Java arithmetic spelled out: `x % n == 0`, `(a + b - 1) / b`, `a > b - 1`,
+# explicit min/max pairs and manual overflow guards. These lower identically.
+manual_is_multiple_of = "allow"
+manual_div_ceil = "allow"
+manual_checked_ops = "allow"
+manual_saturating_arithmetic = "allow"
+manual_clamp = "allow"
+manual_range_contains = "allow"
+manual_range_patterns = "allow"
+unnecessary_min_or_max = "allow"
+int_plus_one = "allow"
+identity_op = "allow"
+# Control flow follows the Java nesting so branches line up with the original.
+collapsible_if = "allow"
+collapsible_match = "allow"
+if_same_then_else = "allow"
+# Java's `while (true) { ...; if (...) break; }` loops, several of which have
+# more than one exit and so do not fold into a single `while let`.
+while_let_loop = "allow"
+# Java declares the variable before the branch that assigns it.
+needless_late_init = "allow"
+# Several translated readers keep `mod tests` next to the code it covers rather
+# than at the end of the file; moving them would churn thousands of lines.
+items_after_test_module = "allow"
 
 [features]
 default = ["jpegxr", "zarr", "tissuefaxs"]

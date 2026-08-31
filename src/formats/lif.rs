@@ -489,8 +489,8 @@ impl FormatReader for LifReader {
         if plane_index >= m.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
-        if x.checked_add(w).map_or(true, |end| end > m.size_x)
-            || y.checked_add(h).map_or(true, |end| end > m.size_y)
+        if x.checked_add(w).is_none_or(|end| end > m.size_x)
+            || y.checked_add(h).is_none_or(|end| end > m.size_y)
         {
             return Err(BioFormatsError::Format("LIF region out of bounds".into()));
         }
@@ -1573,7 +1573,9 @@ fn read_i64_file(file: &mut File) -> Result<i64> {
 /// Decode UTF-16LE, stripping trailing/leading NULs (Java `stripString`).
 fn decode_utf16le(bytes: &[u8]) -> String {
     let units: Vec<u16> = bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
         .collect();
     String::from_utf16_lossy(&units)
@@ -2657,12 +2659,10 @@ fn apply_laser_light_source_settings(
 
     // noNames / FRAP logic (Java ~820-836)
     let mut no_names = true;
-    for name in channels_iter_names(acc, effective_c) {
-        if let Some(name) = name {
-            if !name.is_empty() {
-                no_names = false;
-                break;
-            }
+    for name in channels_iter_names(acc, effective_c).flatten() {
+        if !name.is_empty() {
+            no_names = false;
+            break;
         }
     }
     if !no_names && !frap.is_empty() {

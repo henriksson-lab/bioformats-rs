@@ -46,6 +46,13 @@ fn write_compressed_bytes(bytes: CompressedBytes, output: &Path) -> bioformats::
                 written += copy_range(&range.path, range.offset, range.length, &mut out)?;
             }
         }
+        CompressedBytes::Planes { .. } => {
+            return Err(bioformats::error::BioFormatsError::Format(
+                "tile stores one compressed stream per colour plane; \
+                 it cannot be written as a single JPEG file"
+                    .into(),
+            ));
+        }
     }
     Ok(written)
 }

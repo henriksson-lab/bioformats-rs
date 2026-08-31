@@ -473,7 +473,9 @@ fn read_xrm_f32(ole: &mut OleFile, path: &str) -> Result<f32> {
 fn read_xrm_f32_array(ole: &mut OleFile, path: &str) -> Result<Vec<f64>> {
     let data = read_xrm_stream(ole, path)?;
     Ok(data
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|bytes| f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as f64)
         .collect())
 }
@@ -489,7 +491,9 @@ fn read_xrm_string(ole: &mut OleFile, path: &str) -> Result<String> {
 fn read_xrm_date_array(ole: &mut OleFile, path: &str) -> Result<Vec<String>> {
     let data = read_xrm_stream(ole, path)?;
     Ok(data
-        .chunks_exact(40)
+        .as_chunks::<40>()
+        .0
+        .iter()
         .map(|chunk| {
             String::from_utf8_lossy(&chunk[..23])
                 .trim_matches(char::from(0))
@@ -1004,8 +1008,8 @@ fn add_xrm_metadata_list_value(
     let mut index = 2;
     loop {
         let next_key = format!("{key} #{index}");
-        if !metadata.contains_key(&next_key) {
-            metadata.insert(next_key, value);
+        if let std::collections::hash_map::Entry::Vacant(slot) = metadata.entry(next_key) {
+            slot.insert(value);
             return;
         }
         index += 1;

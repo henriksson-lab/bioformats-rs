@@ -1627,7 +1627,7 @@ mod writer_tests {
             image
                 .new_dataset_builder("channel")
                 .shape(&[1, 2, 1, 8, 8])
-                .write::<u8>(&vec![0; 2 * 8 * 8])
+                .write::<u8>(&[0; 2 * 8 * 8])
                 .unwrap();
 
             let mut feature = site.create_group("feature").unwrap();

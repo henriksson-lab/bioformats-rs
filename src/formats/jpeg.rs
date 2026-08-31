@@ -44,7 +44,7 @@ fn load_jpeg(path: &Path) -> Result<(ImageMetadata, Vec<u8>)> {
         // that planar layout so pixel bytes match Java's ImageIOReader.
         let plane = (w as usize) * (h as usize);
         let mut planar = vec![0u8; interleaved.len()];
-        for (i, px) in interleaved.chunks_exact(3).enumerate() {
+        for (i, px) in interleaved.as_chunks::<3>().0.iter().enumerate() {
             planar[i] = px[0];
             planar[plane + i] = px[1];
             planar[2 * plane + i] = px[2];

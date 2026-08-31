@@ -370,7 +370,7 @@ impl CellWorxReader {
                 size_c: channels as u32,
                 size_t: info.n_timepoints,
                 pixel_type,
-                bits_per_pixel: (bits).into(),
+                bits_per_pixel: (bits),
                 image_count,
                 dimension_order: DimensionOrder::XYCZT,
                 is_rgb: false,
@@ -3254,7 +3254,7 @@ fn add_mias_detail_rois(
         Err(_) => return 0,
     };
     let (the_t, the_z) = mias_position_from_analysis_file(detail_file)
-        .map(|(_, t, z, _)| (Some(t as i64), Some(z as i64)))
+        .map(|(_, t, z, _)| (Some(t), Some(z)))
         .unwrap_or((None, None));
     let mut columns: Option<Vec<String>> = None;
     let mut count = 0usize;
@@ -3671,7 +3671,7 @@ impl MiasReader {
                 size_c,
                 size_t: w.size_t,
                 pixel_type,
-                bits_per_pixel: (bits).into(),
+                bits_per_pixel: (bits),
                 image_count,
                 dimension_order: w.dimension_order,
                 is_rgb,

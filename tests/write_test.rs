@@ -107,7 +107,7 @@ fn dicom_writer_derives_16_bit_depth_from_pixel_type_when_default_bits_per_pixel
 
     let data: Vec<u8> = [1u16, 2].into_iter().flat_map(u16::to_le_bytes).collect();
     let path = temp_path("dicom_uint16_default_bpp.dcm");
-    ImageWriter::save(&path, &meta, &[data.clone()]).expect("DICOM write failed");
+    ImageWriter::save(&path, &meta, std::slice::from_ref(&data)).expect("DICOM write failed");
 
     assert_eq!(dicom_u16(&path, 0x0028, 0x0100), 16);
     assert_eq!(dicom_u16(&path, 0x0028, 0x0101), 16);
@@ -227,7 +227,12 @@ fn tiff_round_trip_rgb8() {
     let data: Vec<u8> = (0u8..48).collect(); // 4×4×3
     let readback = round_trip("rgb8.tif", &meta, &data);
     let expected: Vec<u8> = (0..3)
-        .flat_map(|channel| data.chunks_exact(3).map(move |pixel| pixel[channel]))
+        .flat_map(|channel| {
+            data.as_chunks::<3>()
+                .0
+                .iter()
+                .map(move |pixel| pixel[channel])
+        })
         .collect();
     assert_eq!(readback, expected);
 }
@@ -272,7 +277,7 @@ fn pyramid_tiff_reads_reduced_resolution_for_every_plane() {
     meta.size_t = 1;
     meta.image_count = 2;
 
-    let full_planes = vec![vec![10; 16], vec![20; 16]];
+    let full_planes = [vec![10; 16], vec![20; 16]];
     let reduced_planes = vec![vec![11, 12, 13, 14], vec![21, 22, 23, 24]];
 
     let path = temp_path("two_plane_pyramid.tif");
@@ -2388,7 +2393,7 @@ fn jpeg_writer_round_trip_rgb8_with_lossy_tolerance() {
 
     let plane = (meta.size_x * meta.size_y) as usize;
     let mut expected_planar = vec![0u8; interleaved.len()];
-    for (i, px) in interleaved.chunks_exact(3).enumerate() {
+    for (i, px) in interleaved.as_chunks::<3>().0.iter().enumerate() {
         expected_planar[i] = px[0];
         expected_planar[plane + i] = px[1];
         expected_planar[2 * plane + i] = px[2];
@@ -2423,7 +2428,7 @@ fn jpeg2000_writer_round_trip_gray8_lossless() {
 
     let data: Vec<u8> = (0u8..20).map(|v| v.wrapping_mul(11)).collect();
     let path = temp_path("roundtrip_gray.jp2");
-    ImageWriter::save(&path, &meta, &[data.clone()]).unwrap();
+    ImageWriter::save(&path, &meta, std::slice::from_ref(&data)).unwrap();
 
     let mut reader = ImageReader::open(&path).unwrap();
     assert_eq!(reader.metadata().size_x, meta.size_x);
@@ -2447,7 +2452,7 @@ fn jpeg2000_writer_round_trip_rgb8_lossless() {
         1, 2, 3, 4, 5, 6, 20, 21, 22, 23, 24, 25, 100, 101, 102, 103, 104, 105,
     ];
     let path = temp_path("roundtrip_rgb.jp2");
-    ImageWriter::save(&path, &meta, &[data.clone()]).unwrap();
+    ImageWriter::save(&path, &meta, std::slice::from_ref(&data)).unwrap();
 
     let mut reader = ImageReader::open(&path).unwrap();
     assert_eq!(reader.metadata().size_x, meta.size_x);
@@ -2509,7 +2514,7 @@ fn planar_rgb_writer_inputs_are_interleaved_like_java() {
     let planar = vec![10, 40, 20, 50, 30, 60];
 
     let png_path = temp_path("planar_rgb.png");
-    ImageWriter::save(&png_path, &meta, &[planar.clone()]).unwrap();
+    ImageWriter::save(&png_path, &meta, std::slice::from_ref(&planar)).unwrap();
     let mut png_reader = ImageReader::open(&png_path).unwrap();
     assert_eq!(
         png_reader.open_bytes(0).unwrap(),
@@ -2517,7 +2522,7 @@ fn planar_rgb_writer_inputs_are_interleaved_like_java() {
     );
 
     let bmp_path = temp_path("planar_rgb.bmp");
-    ImageWriter::save(&bmp_path, &meta, &[planar.clone()]).unwrap();
+    ImageWriter::save(&bmp_path, &meta, std::slice::from_ref(&planar)).unwrap();
     let mut bmp_reader = ImageReader::open(&bmp_path).unwrap();
     assert_eq!(
         bmp_reader.open_bytes(0).unwrap(),
@@ -2525,12 +2530,12 @@ fn planar_rgb_writer_inputs_are_interleaved_like_java() {
     );
 
     let eps_path = temp_path("planar_rgb.eps");
-    ImageWriter::save(&eps_path, &meta, &[planar.clone()]).unwrap();
+    ImageWriter::save(&eps_path, &meta, std::slice::from_ref(&planar)).unwrap();
     let eps = std::fs::read_to_string(&eps_path).unwrap();
     assert!(eps.contains("0A141E28323C"));
 
     let avi_path = temp_path("planar_rgb.avi");
-    ImageWriter::save(&avi_path, &meta, &[planar.clone()]).unwrap();
+    ImageWriter::save(&avi_path, &meta, std::slice::from_ref(&planar)).unwrap();
     let mut avi_reader = ImageReader::open(&avi_path).unwrap();
     assert_eq!(
         avi_reader.open_bytes(0).unwrap(),
@@ -2562,7 +2567,7 @@ fn bmp_writer_round_trip_odd_width_rgb8() {
         1, 2, 3, 4, 5, 6, 7, 8, 9, 20, 21, 22, 23, 24, 25, 26, 27, 28,
     ];
     let path = temp_path("odd_width_rgb.bmp");
-    ImageWriter::save(&path, &meta, &[interleaved.clone()]).unwrap();
+    ImageWriter::save(&path, &meta, std::slice::from_ref(&interleaved)).unwrap();
 
     let mut reader = ImageReader::open(&path).unwrap();
     assert_eq!(reader.metadata().size_x, 3);

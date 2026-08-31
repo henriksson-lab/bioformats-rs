@@ -745,7 +745,7 @@ fn lookup_table_from_palette(palette: &[u8]) -> LookupTable {
     let mut red = vec![0u16; 256];
     let mut green = vec![0u16; 256];
     let mut blue = vec![0u16; 256];
-    for (i, rgb) in palette.chunks_exact(3).take(256).enumerate() {
+    for (i, rgb) in palette.as_chunks::<3>().0.iter().take(256).enumerate() {
         red[i] = rgb[0] as u16;
         green[i] = rgb[1] as u16;
         blue[i] = rgb[2] as u16;
@@ -1152,7 +1152,9 @@ impl FormatWriter for PngWriter {
                 .ok_or_else(|| BioFormatsError::InvalidData("bad data length".into()))?,
             (PixelType::Uint16, 1) => {
                 let pixels: Vec<u16> = pixel_bytes
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|c| {
                         if meta.is_little_endian {
                             u16::from_le_bytes([c[0], c[1]])
@@ -1167,7 +1169,9 @@ impl FormatWriter for PngWriter {
             }
             (PixelType::Uint16, 3) => {
                 let pixels: Vec<u16> = pixel_bytes
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|c| {
                         if meta.is_little_endian {
                             u16::from_le_bytes([c[0], c[1]])

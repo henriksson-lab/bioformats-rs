@@ -916,7 +916,7 @@ impl DeltavisionReader {
                     match cleaned.trim().parse::<f64>() {
                         Ok(parsed) => {
                             let nd = parsed / 100.0;
-                            if !log.nd_filters.iter().any(|f| *f == Some(nd)) {
+                            if !log.nd_filters.contains(&Some(nd)) {
                                 log.nd_filters.push(Some(nd));
                             }
                         }
@@ -1194,7 +1194,7 @@ impl FormatReader for DeltavisionReader {
         let base_meta = ImageMetadata {
             size_x: num_x,
             size_y: num_y,
-            size_z: size_z,
+            size_z,
             size_c: channels,
             size_t,
             pixel_type,

@@ -442,12 +442,9 @@ impl FormatReader for VisitechReader {
         let mut valid_files = Vec::new();
         let mut offsets = Vec::new();
         for f in &files {
-            match find_pixels_offset(f, true, plane_size, plane_count) {
-                Ok(off) => {
-                    valid_files.push(f.clone());
-                    offsets.push(off);
-                }
-                Err(_) => {}
+            if let Ok(off) = find_pixels_offset(f, true, plane_size, plane_count) {
+                valid_files.push(f.clone());
+                offsets.push(off);
             }
         }
 

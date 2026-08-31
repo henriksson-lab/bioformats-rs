@@ -739,8 +739,8 @@ mod pyramid_tiff_tests {
         d.push(0);
 
         // -- pixel data --
-        d.extend(std::iter::repeat(0xABu8).take(px0_len as usize));
-        d.extend(std::iter::repeat(0xCDu8).take((dims[1] * dims[1]) as usize));
+        d.extend(std::iter::repeat_n(0xABu8, px0_len as usize));
+        d.extend(std::iter::repeat_n(0xCDu8, (dims[1] * dims[1]) as usize));
         d
     }
 

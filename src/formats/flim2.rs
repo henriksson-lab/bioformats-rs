@@ -433,7 +433,7 @@ fn build_flowsight_metadata(
         } else {
             PixelType::Uint16
         },
-        bits_per_pixel: (bits) as u16,
+        bits_per_pixel: (bits),
         is_little_endian: little_endian,
         ..ImageMetadata::default()
     };
@@ -531,8 +531,8 @@ fn decode_flowsight_bitmask_strips(
     let mut offset = 0usize;
 
     for strip in strips {
-        let mut chunks = strip.chunks_exact(2);
-        for pair in &mut chunks {
+        let (pairs, remainder) = strip.as_chunks::<2>();
+        for pair in pairs {
             let value = pair[0];
             let run_length = pair[1] as usize + 1;
             let end = offset.checked_add(run_length).ok_or_else(|| {
@@ -546,7 +546,7 @@ fn decode_flowsight_bitmask_strips(
             out[offset..end].fill(value);
             offset = end;
         }
-        if !chunks.remainder().is_empty() {
+        if !remainder.is_empty() {
             return Err(BioFormatsError::InvalidData(
                 "FlowSight bitmask strip has an odd byte count".into(),
             ));
@@ -2099,7 +2099,7 @@ impl FormatReader for Im3Reader {
                     let mut image = crate::common::ome_metadata::OmeMetadata::from_image_metadata(
                         &dataset.meta,
                     );
-                    ome.images.extend(image.images.drain(..));
+                    ome.images.append(&mut image.images);
                     let _ = ome.add_original_metadata_annotations(&dataset.meta, index);
                 }
                 Some(ome)
@@ -2254,7 +2254,7 @@ fn slidebook7_yaml_u32(text: &str, keys: &[&str]) -> Option<u32> {
             continue;
         };
         let key = key.trim().trim_matches('"').trim_matches('\'');
-        if !keys.iter().any(|candidate| key == *candidate) {
+        if !keys.contains(&key) {
             continue;
         }
         let value = value
@@ -5883,9 +5883,9 @@ impl FormatReader for SlideBook7Reader {
                         ));
                         image.rois.push(roi);
                     }
-                    ome.rois.extend(image.rois.drain(..));
-                    ome.annotations.extend(image.annotations.drain(..));
-                    ome.images.extend(image.images.drain(..));
+                    ome.rois.append(&mut image.rois);
+                    ome.annotations.append(&mut image.annotations);
+                    ome.images.append(&mut image.images);
                     let _ = ome.add_original_metadata_annotations(&series.meta, index);
                 }
                 Some(ome)
@@ -8491,9 +8491,7 @@ impl FormatReader for ImarisReader {
 
     fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
         use crate::common::ome_metadata::{OmeChannel, OmeImage, OmeMetadata};
-        if self.path.is_none() {
-            return None;
-        }
+        self.path.as_ref()?;
         let mut image = OmeImage {
             name: Some(self.image_name.clone()),
             description: Some(self.description.clone()),
@@ -8671,7 +8669,7 @@ impl XlefReader {
         meta.size_t = lms.size_t.max(1);
         meta.dimension_order = lms.dimension_order;
         meta.pixel_type = lms.pixel_type;
-        meta.bits_per_pixel = (lms.bits_per_pixel).into();
+        meta.bits_per_pixel = lms.bits_per_pixel;
         meta.is_rgb = lms.is_rgb;
         meta.is_interleaved = lms.is_interleaved;
         meta.is_indexed = lms.is_indexed;
@@ -9631,13 +9629,13 @@ fn xlef_append_ome_fragment(
         }
     }
 
-    out.images.extend(fragment.images.drain(..));
-    out.instruments.extend(fragment.instruments.drain(..));
-    out.rois.extend(fragment.rois.drain(..));
-    out.annotations.extend(fragment.annotations.drain(..));
-    out.experimenters.extend(fragment.experimenters.drain(..));
-    out.plates.extend(fragment.plates.drain(..));
-    out.screens.extend(fragment.screens.drain(..));
+    out.images.append(&mut fragment.images);
+    out.instruments.append(&mut fragment.instruments);
+    out.rois.append(&mut fragment.rois);
+    out.annotations.append(&mut fragment.annotations);
+    out.experimenters.append(&mut fragment.experimenters);
+    out.plates.append(&mut fragment.plates);
+    out.screens.append(&mut fragment.screens);
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -9898,9 +9896,7 @@ fn xlef_reference_path(parent: &Path, value: &str) -> Option<PathBuf> {
     }
     let path = crate::formats::leica_lms::parse_file_path(parent, cleaned);
     let candidate = path.as_path();
-    if candidate.extension().is_none() {
-        return None;
-    }
+    candidate.extension()?;
     Some(crate::formats::leica_lms::file_exists(candidate).unwrap_or(path))
 }
 
@@ -10030,7 +10026,7 @@ fn xlef_transform_bytes_8_to_16(input: &[u8], output: &mut [u8], output_bits: u8
         )));
     }
     let factor = 1i32 << (output_bits - 8);
-    for (sample, out) in input.iter().zip(output.chunks_exact_mut(2)) {
+    for (sample, out) in input.iter().zip(output.as_chunks_mut::<2>().0) {
         // Java promotes `byte` to signed `int` before multiplying, then stores
         // high byte followed by low byte.
         let value = (*sample as i8 as i32) * factor;
@@ -11585,7 +11581,9 @@ fn xlef_lms_ome_metadata(meta: &ImageMetadata) -> crate::common::ome_metadata::O
 fn xlef_decode_lms_text(data: &[u8]) -> Result<String> {
     if data.starts_with(&[0xff, 0xfe]) {
         let units: Vec<u16> = data[2..]
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
             .collect();
         return String::from_utf16(&units).map_err(|_| {
@@ -11596,7 +11594,9 @@ fn xlef_decode_lms_text(data: &[u8]) -> Result<String> {
     }
     if data.len() >= 4 && data[1] == 0 && data[3] == 0 {
         let units: Vec<u16> = data
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
             .collect();
         return String::from_utf16(&units).map_err(|_| {
@@ -16201,24 +16201,19 @@ impl CellSensReader {
                         _ => false,
                     }
                 });
-                match found {
-                    Some(i) => {
-                        claimed[i] = true;
-                        let p = &pyramids[i];
-                        vol.pyramid_width = p.width;
-                        vol.pyramid_height = p.height;
-                        vol.tile_origin_x = p.tile_origin_x;
-                        vol.tile_origin_y = p.tile_origin_y;
-                        vol.dim_order = p.dim_order;
-                        vol.meta = p.meta.clone();
-                        vol.physical_size_x = p.physical_size_x;
-                        vol.physical_size_y = p.physical_size_y;
-                        vol.compute_levels();
-                        matched.push(vol);
-                    }
-                    // No matching metadata block: this is an orphan ETS file. Drop
-                    // it entirely (CellSensReader.java:1350-1363).
-                    None => {}
+                if let Some(i) = found {
+                    claimed[i] = true;
+                    let p = &pyramids[i];
+                    vol.pyramid_width = p.width;
+                    vol.pyramid_height = p.height;
+                    vol.tile_origin_x = p.tile_origin_x;
+                    vol.tile_origin_y = p.tile_origin_y;
+                    vol.dim_order = p.dim_order;
+                    vol.meta = p.meta.clone();
+                    vol.physical_size_x = p.physical_size_x;
+                    vol.physical_size_y = p.physical_size_y;
+                    vol.compute_levels();
+                    matched.push(vol);
                 }
             }
             volumes = matched;
@@ -18878,7 +18873,7 @@ impl SpcReader {
 
     /// Process a marker word during `openBytes`. (Java: `invalidAndMark(int)`.)
     fn invalid_and_mark(&mut self, block_ptr: i32) {
-        let rout_m = (self.raw_buf[(block_ptr - 2) as usize] as u8) & 0xf0;
+        let rout_m = self.raw_buf[(block_ptr - 2) as usize] & 0xf0;
 
         match rout_m {
             0x10 => {
@@ -18911,7 +18906,7 @@ impl SpcReader {
     /// Process a marker word during the `initFile` geometry pass, recording
     /// frame-clock and end-of-frame positions. (Java: `invalidAndMarkInit(int)`.)
     fn invalid_and_mark_init(&mut self, block_ptr: i32) {
-        let rout_m = (self.raw_buf[(block_ptr - 2) as usize] as u8) & 0xf0;
+        let rout_m = self.raw_buf[(block_ptr - 2) as usize] & 0xf0;
 
         match rout_m {
             0x10 => {
@@ -18957,7 +18952,7 @@ impl SpcReader {
 
     /// Accumulate one photon into the per-timebin histogram. (Java: `photon(int)`.)
     fn photon(&mut self, block_ptr: i32) {
-        let current_channel = ((self.raw_buf[(block_ptr - 2) as usize] as u8 & 0xF0) >> 4) as i32;
+        let current_channel = ((self.raw_buf[(block_ptr - 2) as usize] & 0xF0) >> 4) as i32;
 
         if current_channel == self.channel || self.n_channels == 1 {
             if self.current_pixel < self.n_pixels
@@ -19514,7 +19509,7 @@ mod tests {
         let total = 48 + xml.len() as u32;
         push_oir_u32(buf, total);
         push_oir_u32(buf, 0);
-        buf.extend(std::iter::repeat(0).take(36));
+        buf.extend(std::iter::repeat_n(0, 36));
         push_oir_u32(buf, xml.len() as u32);
         buf.extend_from_slice(xml.as_bytes());
     }
@@ -21248,7 +21243,7 @@ EndClass: 0
             &group.join("ImageData_Ch0_TP0000000.npy"),
             "<u2",
             &[4, 1, 1],
-            &[1u16, 2, 3, 4]
+            [1u16, 2, 3, 4]
                 .into_iter()
                 .flat_map(u16::to_le_bytes)
                 .collect::<Vec<_>>()
@@ -21302,7 +21297,7 @@ EndClass: 0
             &group.join("ImageData_Ch0_TP0000000.npy"),
             "<u2",
             &[4, 1, 1],
-            &[10u16, 11, 12, 13]
+            [10u16, 11, 12, 13]
                 .into_iter()
                 .flat_map(u16::to_le_bytes)
                 .collect::<Vec<_>>()
@@ -21642,7 +21637,7 @@ theUnknownAnnotation70ListSize: 0
             &group.join("ImageData_Ch0_TP0000000.npy"),
             "<u2",
             &[1, 8, 8],
-            &vec![0; 8 * 8 * 2],
+            &[0; 8 * 8 * 2],
         );
 
         let mut reader = SlideBook7Reader::new();

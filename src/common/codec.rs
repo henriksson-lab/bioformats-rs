@@ -624,17 +624,17 @@ impl JpegxrPixelLayout {
 fn normalize_jpegxr_output(buf: &mut [u8], layout: JpegxrPixelLayout) {
     match layout {
         JpegxrPixelLayout::Bgr8 => {
-            for px in buf.chunks_exact_mut(3) {
+            for px in buf.as_chunks_mut::<3>().0 {
                 px.swap(0, 2);
             }
         }
         JpegxrPixelLayout::Bgrx8 => {
-            for px in buf.chunks_exact_mut(4) {
+            for px in buf.as_chunks_mut::<4>().0 {
                 px.swap(0, 2);
             }
         }
         JpegxrPixelLayout::Bgra8 => {
-            for px in buf.chunks_exact_mut(4) {
+            for px in buf.as_chunks_mut::<4>().0 {
                 px.swap(0, 2);
             }
         }
@@ -3210,7 +3210,7 @@ mod tests {
 
         let out = decompress_rpza(&data, 4, 4).expect("RPZA decode");
 
-        assert_eq!(out, vec![255, 0, 0].repeat(16));
+        assert_eq!(out, [255, 0, 0].repeat(16));
     }
 
     #[test]
@@ -3244,7 +3244,7 @@ mod tests {
 
         let out = decompress_rpza(&data, 4, 4).expect("RPZA decode");
 
-        assert_eq!(out, vec![255, 0, 0, 82, 0, 0, 165, 0, 0, 0, 0, 0].repeat(4));
+        assert_eq!(out, [255, 0, 0, 82, 0, 0, 165, 0, 0, 0, 0, 0].repeat(4));
     }
 
     #[test]

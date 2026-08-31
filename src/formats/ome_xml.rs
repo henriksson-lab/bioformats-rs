@@ -462,7 +462,7 @@ fn resolve_companion(base_dir: Option<&Path>, filename: &str) -> Option<PathBuf>
     let trimmed = filename.trim();
     let filename_path = Path::new(trimmed);
     let (candidate, allow_basename_retry) = match base_dir {
-        Some(dir) if filename_path.is_absolute() => (None, true),
+        Some(_dir) if filename_path.is_absolute() => (None, true),
         Some(dir) => (confined_join(dir, trimmed), false),
         None => {
             let path = PathBuf::from(trimmed);
@@ -1226,7 +1226,7 @@ impl crate::common::writer::FormatWriter for OmeXmlWriter {
     fn close(&mut self) -> Result<()> {
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        crate::formats::stack_writer::validate_complete("OME-XML", &meta, self.planes.len())?;
+        crate::formats::stack_writer::validate_complete("OME-XML", meta, self.planes.len())?;
 
         let mut ome = self
             .ome

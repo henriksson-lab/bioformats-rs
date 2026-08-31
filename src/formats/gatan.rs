@@ -883,9 +883,8 @@ fn find_image_data(root: &DmValue) -> Result<DmImage> {
 
     for &idx in &candidates {
         if let Some((_, image_entry)) = entries.get(idx) {
-            match extract_image(image_entry)? {
-                Some(result) => return Ok(result),
-                None => {}
+            if let Some(result) = extract_image(image_entry)? {
+                return Ok(result);
             }
         }
     }

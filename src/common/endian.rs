@@ -71,7 +71,9 @@ pub fn read_f64<R: Read>(r: &mut R, little_endian: bool) -> Result<f64> {
 
 /// Convert a byte slice to u16 array with given endianness.
 pub fn bytes_to_u16_vec(data: &[u8], little_endian: bool) -> Vec<u16> {
-    data.chunks_exact(2)
+    data.as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| {
             let arr = [c[0], c[1]];
             if little_endian {

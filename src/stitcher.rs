@@ -1420,7 +1420,7 @@ impl FilePattern {
             }
         }
         // Match suffix
-        if &name[pos..] != self.suffix {
+        if name[pos..] != self.suffix {
             return None;
         }
         Some(values)

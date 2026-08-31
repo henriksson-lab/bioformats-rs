@@ -367,13 +367,13 @@ fn volocity_native_semantic_summary(probe: &VolocityMetakitProbe) -> Option<Stri
         ];
         let roles = hierarchy_columns
             .iter()
-            .filter_map(|(column_name, role)| {
+            .filter(|&(column_name, _role)| {
                 samples
                     .columns
                     .iter()
                     .any(|column| column.name == *column_name)
-                    .then(|| format!("{role}={column_name}"))
             })
+            .map(|(column_name, role)| format!("{role}={column_name}"))
             .collect::<Vec<_>>();
         if !roles.is_empty() {
             parts.push(format!("sample hierarchy {}", roles.join(", ")));
@@ -1023,10 +1023,10 @@ fn volocity_child_count(samples: &[VolocitySampleRow], parent_id: i32) -> usize 
     samples.iter().filter(|row| row.parent == parent_id).count()
 }
 
-fn volocity_children<'a>(
-    samples: &'a [VolocitySampleRow],
+fn volocity_children(
+    samples: &[VolocitySampleRow],
     parent_id: i32,
-) -> impl Iterator<Item = &'a VolocitySampleRow> {
+) -> impl Iterator<Item = &VolocitySampleRow> {
     samples.iter().filter(move |row| row.parent == parent_id)
 }
 
@@ -2284,7 +2284,7 @@ fn volocity_open_plane(stack: &VolocityStack, no: u32) -> Result<Vec<u8>> {
 
     let mut padding = (zct[2] as usize) * stack.plane_padding;
     let planes_in_file = if plane_size > 0 {
-        (pix_len / plane_size as i64) as i64
+        pix_len / plane_size as i64
     } else {
         0
     };
@@ -2319,7 +2319,7 @@ fn volocity_open_plane(stack: &VolocityStack, no: u32) -> Result<Vec<u8>> {
 
     // RGBA swap (Java lines 207-216): stored ARGB → RGBA.
     if volocity_rgb_channel_count(stack) == 4 {
-        for chunk in buf.chunks_exact_mut(4) {
+        for chunk in buf.as_chunks_mut::<4>().0 {
             let a = chunk[0];
             chunk[0] = chunk[1];
             chunk[1] = chunk[2];

@@ -774,8 +774,10 @@ fn picoquant_ptu_decodes_declared_zlib_histogram_payload() {
     let counts: Vec<u16> = reader
         .open_bytes(0)
         .unwrap()
-        .chunks_exact(2)
-        .map(|px| u16::from_le_bytes(px.try_into().unwrap()))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|px| u16::from_le_bytes(*px))
         .collect();
     assert_eq!(counts, vec![4, 3, 2, 1]);
 
@@ -1081,14 +1083,18 @@ fn picoquant_ptu_decodes_equal_width_indexed_histogram_descriptors() {
     let curve_0: Vec<u16> = reader
         .open_bytes(0)
         .unwrap()
-        .chunks_exact(2)
-        .map(|px| u16::from_le_bytes(px.try_into().unwrap()))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|px| u16::from_le_bytes(*px))
         .collect();
     let curve_1: Vec<u16> = reader
         .open_bytes(1)
         .unwrap()
-        .chunks_exact(2)
-        .map(|px| u16::from_le_bytes(px.try_into().unwrap()))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|px| u16::from_le_bytes(*px))
         .collect();
     assert_eq!(curve_0, vec![11, 12, 13]);
     assert_eq!(curve_1, vec![21, 22, 23]);
@@ -1147,14 +1153,18 @@ fn picoquant_ptu_decodes_indexed_offset_histogram_payload_with_padding() {
     let curve_0: Vec<u16> = reader
         .open_bytes(0)
         .unwrap()
-        .chunks_exact(2)
-        .map(|px| u16::from_le_bytes(px.try_into().unwrap()))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|px| u16::from_le_bytes(*px))
         .collect();
     let curve_1: Vec<u16> = reader
         .open_bytes(1)
         .unwrap()
-        .chunks_exact(2)
-        .map(|px| u16::from_le_bytes(px.try_into().unwrap()))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|px| u16::from_le_bytes(*px))
         .collect();
     assert_eq!(curve_0, vec![101, 102, 103]);
     assert_eq!(curve_1, vec![201, 202, 203]);
@@ -1195,14 +1205,18 @@ fn picoquant_ptu_decodes_histo_result_histogram_payload_with_explicit_curve_coun
     let curve_0: Vec<u16> = reader
         .open_bytes(0)
         .unwrap()
-        .chunks_exact(2)
-        .map(|px| u16::from_le_bytes(px.try_into().unwrap()))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|px| u16::from_le_bytes(*px))
         .collect();
     let curve_1: Vec<u16> = reader
         .open_bytes(1)
         .unwrap()
-        .chunks_exact(2)
-        .map(|px| u16::from_le_bytes(px.try_into().unwrap()))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|px| u16::from_le_bytes(*px))
         .collect();
     assert_eq!(curve_0, vec![1, 2, 3]);
     assert_eq!(curve_1, vec![4, 5, 6]);
@@ -1264,8 +1278,10 @@ fn picoquant_ptu_decodes_headered_histo_result_payload_from_declared_offset() {
     let counts: Vec<u16> = reader
         .open_bytes(0)
         .unwrap()
-        .chunks_exact(2)
-        .map(|px| u16::from_le_bytes(px.try_into().unwrap()))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|px| u16::from_le_bytes(*px))
         .collect();
     assert_eq!(counts, vec![7, 8, 9]);
 

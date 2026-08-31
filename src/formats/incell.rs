@@ -224,14 +224,18 @@ fn incell_decode_xml_file(path: &Path) -> Result<String> {
     }
     if bytes.starts_with(&[0xff, 0xfe]) {
         let units: Vec<u16> = bytes[2..]
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
             .collect();
         return Ok(String::from_utf16_lossy(&units));
     }
     if bytes.starts_with(&[0xfe, 0xff]) {
         let units: Vec<u16> = bytes[2..]
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
             .collect();
         return Ok(String::from_utf16_lossy(&units));
@@ -241,7 +245,7 @@ fn incell_decode_xml_file(path: &Path) -> Result<String> {
     if let Some(start) = ascii_prefix.find("encoding=\"") {
         let rest = &ascii_prefix[start + "encoding=\"".len()..];
         if let Some(end) = rest.find('"') {
-            let label = rest[..end].as_bytes();
+            let label = &rest.as_bytes()[..end];
             if let Some(encoding) = encoding_rs::Encoding::for_label(label) {
                 let (decoded, _, _) = encoding.decode(&bytes);
                 return Ok(decoded.into_owned());
@@ -251,7 +255,7 @@ fn incell_decode_xml_file(path: &Path) -> Result<String> {
     if let Some(start) = ascii_prefix.find("encoding='") {
         let rest = &ascii_prefix[start + "encoding='".len()..];
         if let Some(end) = rest.find('\'') {
-            let label = rest[..end].as_bytes();
+            let label = &rest.as_bytes()[..end];
             if let Some(encoding) = encoding_rs::Encoding::for_label(label) {
                 let (decoded, _, _) = encoding.decode(&bytes);
                 return Ok(decoded.into_owned());
@@ -972,24 +976,22 @@ impl InCellReader {
         'find: for well in &m.image_files {
             for field in well {
                 for tp in field {
-                    for plane in tp {
-                        if let Some(p) = plane {
-                            if let Some(fname) = &p.filename {
-                                if p.is_tiff {
-                                    let mut tr = crate::tiff::TiffReader::new();
-                                    if tr.set_id(fname).is_ok() {
-                                        let tm = tr.metadata();
-                                        size_x = tm.size_x;
-                                        size_y = tm.size_y;
-                                        pixel_type = tm.pixel_type;
-                                        bits = tm.bits_per_pixel;
-                                        little_endian = tm.is_little_endian;
-                                        is_tiff_first = true;
-                                        let _ = tr.close();
-                                        break 'find;
-                                    }
+                    for p in tp.iter().flatten() {
+                        if let Some(fname) = &p.filename {
+                            if p.is_tiff {
+                                let mut tr = crate::tiff::TiffReader::new();
+                                if tr.set_id(fname).is_ok() {
+                                    let tm = tr.metadata();
+                                    size_x = tm.size_x;
+                                    size_y = tm.size_y;
+                                    pixel_type = tm.pixel_type;
+                                    bits = tm.bits_per_pixel;
+                                    little_endian = tm.is_little_endian;
+                                    is_tiff_first = true;
                                     let _ = tr.close();
+                                    break 'find;
                                 }
+                                let _ = tr.close();
                             }
                         }
                     }
@@ -1087,7 +1089,7 @@ impl InCellReader {
                 size_c: series_size_c,
                 size_t: series_size_t,
                 pixel_type,
-                bits_per_pixel: (bits).into(),
+                bits_per_pixel: (bits),
                 image_count: size_z * series_size_c * series_size_t,
                 dimension_order: DimensionOrder::XYZCT,
                 is_rgb: false,

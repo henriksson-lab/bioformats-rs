@@ -545,7 +545,7 @@ mod tests {
 
     fn padded_block(mut bytes: Vec<u8>) -> Vec<u8> {
         let pad = (BLOCK - (bytes.len() % BLOCK)) % BLOCK;
-        bytes.extend(std::iter::repeat(0).take(pad));
+        bytes.extend(std::iter::repeat_n(0, pad));
         bytes
     }
 

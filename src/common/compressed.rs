@@ -29,10 +29,30 @@ pub enum LossyCodec {
         color_space: JpegColorSpace,
         subsampling: Option<JpegSubsampling>,
     },
+    JpegPlanes {
+        planes: Vec<JpegPlaneInfo>,
+    },
     Jpeg2000 {
         container: Jpeg2000Container,
     },
     JpegXr,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JpegPlaneInfo {
+    pub channel: ColorChannel,
+    pub color_space: JpegColorSpace,
+    pub subsampling: Option<JpegSubsampling>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColorChannel {
+    Red,
+    Green,
+    Blue,
+    Alpha,
+    Gray,
+    Unknown(u16),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,6 +105,9 @@ pub enum CompressedBytes {
     FileRanges {
         ranges: Vec<CompressedFileRange>,
     },
+    Planes {
+        planes: Vec<CompressedPlane>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,6 +115,25 @@ pub struct CompressedFileRange {
     pub path: PathBuf,
     pub offset: u64,
     pub length: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompressedPlane {
+    pub channel: ColorChannel,
+    pub bytes: CompressedPlaneBytes,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompressedPlaneBytes {
+    Owned(Vec<u8>),
+    FileRange {
+        path: PathBuf,
+        offset: u64,
+        length: u64,
+    },
+    FileRanges {
+        ranges: Vec<CompressedFileRange>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

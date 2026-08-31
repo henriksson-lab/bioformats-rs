@@ -389,7 +389,7 @@ impl AplReader {
             .unwrap_or(1)
     }
 
-    fn cell<'a>(row: &'a [String], idx: Option<usize>) -> &'a str {
+    fn cell(row: &[String], idx: Option<usize>) -> &str {
         idx.and_then(|i| row.get(i)).map(|s| s.trim()).unwrap_or("")
     }
 
@@ -964,8 +964,8 @@ impl FormatReader for ArfReader {
 ///   - byte 20: endianness flag (`'B'` ⇒ big-endian, otherwise little-endian);
 ///   - then int16 min/max/x/y and the additional-dimension count `n` (`sizeT`),
 ///     33 reserved bytes and 15×64 history strings.
-/// Pixel data starts at offset `HEADER_SIZE` (1024); planes are stored raw and
-/// contiguous.
+///     Pixel data starts at offset `HEADER_SIZE` (1024); planes are stored raw and
+///     contiguous.
 pub struct I2iReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
@@ -5349,7 +5349,7 @@ impl KlbReader {
         for b in block_size.iter_mut() {
             *b = Self::read_u32_from(&mut f, &mut buf32)?;
         }
-        if block_size.iter().any(|&b| b == 0) {
+        if block_size.contains(&0) {
             return Err(BioFormatsError::Format(
                 "KLB header has zero block size".to_string(),
             ));
@@ -5385,8 +5385,10 @@ impl KlbReader {
         f.read_exact(&mut offset_bytes)
             .map_err(BioFormatsError::Io)?;
         let block_offsets: Vec<u64> = offset_bytes
-            .chunks_exact(8)
-            .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| u64::from_le_bytes(*c))
             .collect();
         let payload_len = file_len - header_size;
         let mut prev = 0u64;
@@ -5592,9 +5594,7 @@ impl KlbReader {
             }
         }
 
-        if series[0].1.files[0][0].is_none() {
-            return None;
-        }
+        series[0].1.files[0][0].as_ref()?;
         Some(series)
     }
 
@@ -7290,7 +7290,7 @@ mod pds_tests {
         for row in 0..size_y as usize {
             let start = row * size_x as usize;
             img_samples.extend_from_slice(&pixels[start..start + size_x as usize]);
-            img_samples.extend(std::iter::repeat(0xFFFFu16).take(pad as usize));
+            img_samples.extend(std::iter::repeat_n(0xFFFFu16, pad as usize));
         }
         std::fs::write(&img, le_u16(&img_samples)).unwrap();
 

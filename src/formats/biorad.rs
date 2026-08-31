@@ -1257,7 +1257,7 @@ impl FormatReader for BioRadReader {
         let path = self
             .pic_files
             .get(file_idx)
-            .or_else(|| self.path.as_ref())
+            .or(self.path.as_ref())
             .ok_or(BioFormatsError::NotInitialized)?;
         let offset = HEADER_SIZE + local_plane * plane_bytes as u64;
         let mut f = File::open(path).map_err(BioFormatsError::Io)?;
@@ -1554,7 +1554,7 @@ mod tests {
         // One terminating note, then a 3x256 colour ramp -> one channel LUT.
         let mut trailing = note_record(false, NOTE_TYPE_USER, "x");
         for c in 0..3u8 {
-            trailing.extend(std::iter::repeat(c * 10).take(LUT_LENGTH));
+            trailing.extend(std::iter::repeat_n(c * 10, LUT_LENGTH));
         }
         let bytes = pic_1x1(&trailing);
         let path = tmp_pic("biorad_lut.pic", &bytes);
@@ -1585,7 +1585,7 @@ mod tests {
         // mark the image indexed with a channel-0 LookupTable.
         let mut trailing = note_record(false, NOTE_TYPE_USER, "demo note");
         for c in 0..3u8 {
-            trailing.extend(std::iter::repeat(c + 1).take(LUT_LENGTH));
+            trailing.extend(std::iter::repeat_n(c + 1, LUT_LENGTH));
         }
         let bytes = pic_1x1(&trailing);
         let path = tmp_pic("biorad_full.pic", &bytes);
@@ -1597,7 +1597,7 @@ mod tests {
         assert_eq!(reader.note_strings.len(), 1);
         assert_eq!(reader.note_strings[0].note_type, NOTE_TYPE_USER);
         // used lists the PIC file.
-        assert_eq!(reader.used_files(), &[path.clone()]);
+        assert_eq!(reader.used_files(), std::slice::from_ref(&path));
         // lut populated; eight_bit_lookup_table() returns channel 0's ramp.
         let lut = reader.eight_bit_lookup_table().expect("LUT present");
         assert_eq!(lut[0][0], 1);
@@ -1625,7 +1625,7 @@ mod tests {
 
         let mut trailing0 = note_record(false, NOTE_TYPE_USER, "AXIS_9 11 0 2");
         for c in 0..3u8 {
-            trailing0.extend(std::iter::repeat(c + 1).take(LUT_LENGTH));
+            trailing0.extend(std::iter::repeat_n(c + 1, LUT_LENGTH));
         }
         let mut bytes0 = pic_1x1(&trailing0);
         bytes0[76] = 10;
@@ -1633,7 +1633,7 @@ mod tests {
 
         let mut trailing1 = note_record(false, NOTE_TYPE_USER, "AXIS_9 11 0 2");
         for c in 0..3u8 {
-            trailing1.extend(std::iter::repeat(c + 11).take(LUT_LENGTH));
+            trailing1.extend(std::iter::repeat_n(c + 11, LUT_LENGTH));
         }
         let mut bytes1 = pic_1x1(&trailing1);
         bytes1[76] = 20;

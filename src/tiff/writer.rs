@@ -371,14 +371,14 @@ fn write_plane_strips(
             let start = channel * channel_len;
             let end = start + channel_len;
             let compressed = compress(&data[start..end], compression)?;
-            let offset = w.seek(SeekFrom::Current(0)).map_err(BioFormatsError::Io)?;
+            let offset = w.stream_position().map_err(BioFormatsError::Io)?;
             w.write_all(&compressed).map_err(BioFormatsError::Io)?;
             strips.push((offset, compressed.len() as u64));
         }
         Ok(strips)
     } else {
         let compressed = compress(data, compression)?;
-        let offset = w.seek(SeekFrom::Current(0)).map_err(BioFormatsError::Io)?;
+        let offset = w.stream_position().map_err(BioFormatsError::Io)?;
         w.write_all(&compressed).map_err(BioFormatsError::Io)?;
         Ok(vec![(offset, compressed.len() as u64)])
     }
@@ -500,7 +500,7 @@ impl PyramidOmeTiffWriter {
             let mut level_strips = Vec::new();
             for plane_data in level {
                 let compressed = compress(plane_data, self.compression)?;
-                let offset = w.seek(SeekFrom::Current(0)).map_err(BioFormatsError::Io)?;
+                let offset = w.stream_position().map_err(BioFormatsError::Io)?;
                 w.write_all(&compressed).map_err(BioFormatsError::Io)?;
                 level_strips.push((offset, compressed.len() as u64));
             }
@@ -536,7 +536,7 @@ impl PyramidOmeTiffWriter {
 
             for plane_idx in 0..level_planes {
                 let (strip_offset, strip_byte_count) = strip_info[level_idx][plane_idx];
-                let ifd_offset = w.seek(SeekFrom::Current(0)).map_err(BioFormatsError::Io)?;
+                let ifd_offset = w.stream_position().map_err(BioFormatsError::Io)?;
                 level_offsets.push(ifd_offset);
 
                 // Build out-of-line (extra) data for this sub-IFD.
@@ -674,11 +674,11 @@ impl PyramidOmeTiffWriter {
         }
 
         // Now write the main (level 0) IFDs
-        let first_ifd_offset = w.seek(SeekFrom::Current(0)).map_err(BioFormatsError::Io)?;
+        let first_ifd_offset = w.stream_position().map_err(BioFormatsError::Io)?;
         let mut main_ifd_offsets: Vec<u64> = Vec::new();
 
         for plane_idx in 0..level0_planes {
-            let ifd_start = w.seek(SeekFrom::Current(0)).map_err(BioFormatsError::Io)?;
+            let ifd_start = w.stream_position().map_err(BioFormatsError::Io)?;
             main_ifd_offsets.push(ifd_start);
 
             let (strip_offset, strip_byte_count) = strip_info[0][plane_idx];
@@ -1042,7 +1042,7 @@ impl FormatWriter for TiffWriter {
 
     fn close(&mut self) -> Result<()> {
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        let expected_count = expected_plane_count(&meta)?;
+        let expected_count = expected_plane_count(meta)?;
         if self.planes_written != expected_count {
             return Err(BioFormatsError::Format(format!(
                 "TIFF writer: wrote {} planes, expected {}",
@@ -1148,7 +1148,7 @@ impl FormatWriter for TiffWriter {
                 short_entry(259, comp_tag),
                 short_entry(262, photometric),
                 long_array_entry(273, &strip_offsets, &mut extra)?,
-                short_entry(277, spp as u16),
+                short_entry(277, spp),
                 long_entry(278, meta.size_y), // RowsPerStrip = full image height
                 long_array_entry(279, &strip_byte_counts, &mut extra)?,
                 Entry {
@@ -1218,7 +1218,7 @@ impl FormatWriter for TiffWriter {
 
         // Now write IFDs to the file and patch offsets.
         // Write IFD chain: IFD0 extra0 IFD1 extra1 ...
-        let first_ifd_file_offset = w.seek(SeekFrom::Current(0)).map_err(BioFormatsError::Io)?;
+        let first_ifd_file_offset = w.stream_position().map_err(BioFormatsError::Io)?;
 
         let mut ifd_file_offsets: Vec<u64> = Vec::with_capacity(plane_count);
         let mut cursor = first_ifd_file_offset;
@@ -1834,10 +1834,9 @@ pub fn make_valid_ifd(
     if matches!(pixel_type, PixelType::Float32 | PixelType::Float64) {
         ifd.insert(SAMPLE_FORMAT, IfdValue::Short(vec![3]));
     }
-    if !ifd.contains_key(&COMPRESSION) {
-        // TiffCompression.UNCOMPRESSED == 1
-        ifd.insert(COMPRESSION, IfdValue::Short(vec![1]));
-    }
+    // TiffCompression.UNCOMPRESSED == 1
+    ifd.entry(COMPRESSION)
+        .or_insert_with(|| IfdValue::Short(vec![1]));
 
     // PhotoInterp: BLACK_IS_ZERO=1, RGB_PALETTE=3, RGB=2, Y_CB_CR=6
     let mut pi: u16 = 1;
@@ -1858,24 +1857,20 @@ pub fn make_valid_ifd(
     ifd.insert(PHOTOMETRIC_INTERPRETATION, IfdValue::Short(vec![pi]));
     ifd.insert(SAMPLES_PER_PIXEL, IfdValue::Short(vec![n_channels]));
 
-    if !ifd.contains_key(&X_RESOLUTION) {
-        ifd.insert(X_RESOLUTION, IfdValue::Rational(vec![(1, 1)]));
-    }
-    if !ifd.contains_key(&Y_RESOLUTION) {
-        ifd.insert(Y_RESOLUTION, IfdValue::Rational(vec![(1, 1)]));
-    }
-    if !ifd.contains_key(&SOFTWARE) {
-        ifd.insert(SOFTWARE, IfdValue::Ascii("bioformats-rs".to_string()));
-    }
+    ifd.entry(X_RESOLUTION)
+        .or_insert_with(|| IfdValue::Rational(vec![(1, 1)]));
+    ifd.entry(Y_RESOLUTION)
+        .or_insert_with(|| IfdValue::Rational(vec![(1, 1)]));
+    ifd.entry(SOFTWARE)
+        .or_insert_with(|| IfdValue::Ascii("bioformats-rs".to_string()));
     if !ifd.contains_key(&ROWS_PER_STRIP)
         && !ifd.contains_key(&TILE_WIDTH)
         && !ifd.contains_key(&TILE_LENGTH)
     {
         ifd.insert(ROWS_PER_STRIP, IfdValue::Long(vec![1]));
     }
-    if !ifd.contains_key(&IMAGE_DESCRIPTION) {
-        ifd.insert(IMAGE_DESCRIPTION, IfdValue::Ascii(String::new()));
-    }
+    ifd.entry(IMAGE_DESCRIPTION)
+        .or_insert_with(|| IfdValue::Ascii(String::new()));
 }
 
 /// Read the ImageDescription (tag 270) string from IFD 0 of a TIFF file.

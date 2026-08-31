@@ -160,7 +160,7 @@ fn parse_nrrd_header(path: &Path) -> Result<NrrdHeader> {
             break;
         }
 
-        let trimmed = line.trim_end_matches(|c| c == '\r' || c == '\n');
+        let trimmed = line.trim_end_matches(['\r', '\n']);
 
         // Blank line = start of inline data
         if trimmed.is_empty() {
@@ -182,7 +182,7 @@ fn parse_nrrd_header(path: &Path) -> Result<NrrdHeader> {
         let sep_pos = trimmed.find(':');
         if let Some(sep) = sep_pos {
             let key = trimmed[..sep].trim().to_ascii_lowercase();
-            let val = trimmed[sep + 1..].trim_start_matches(|c| c == '=' || c == ' ');
+            let val = trimmed[sep + 1..].trim_start_matches(['=', ' ']);
             let val = val.trim();
 
             match key.as_str() {
@@ -478,10 +478,7 @@ impl NrrdReader {
 
         let data_sources: Vec<(PathBuf, u64)> = if hdr.data_files.is_empty() {
             vec![(
-                hdr.data_file
-                    .as_ref()
-                    .map(|p| p.clone())
-                    .unwrap_or_else(|| ics_path.clone()),
+                hdr.data_file.clone().unwrap_or_else(|| ics_path.clone()),
                 if hdr.data_file.is_some() {
                     0
                 } else {
@@ -517,8 +514,8 @@ impl NrrdReader {
         let can_slice = axes.axis_x == Some(0)
             && (axes.axis_y == Some(1) || axes.axis_y.is_none())
             && axes.axis_c.is_none()
-            && axes.axis_t.map_or(true, |a| a > axes.axis_z.unwrap_or(1))
-            && axes.axis_z.map_or(true, |a| a >= 2);
+            && axes.axis_t.is_none_or(|a| a > axes.axis_z.unwrap_or(1))
+            && axes.axis_z.is_none_or(|a| a >= 2);
         if can_slice {
             let start = plane_offset;
             let end = start.checked_add(plane_bytes).ok_or_else(|| {

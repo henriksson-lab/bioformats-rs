@@ -723,7 +723,7 @@ impl FormatReader for VeecoReader {
         // surface (.afm and numeric extensions) in a separate decode path.
         ext.eq_ignore_ascii_case("hdf")
             || ext.eq_ignore_ascii_case("afm")
-            || (ext.len() >= 1 && ext.len() <= 3 && ext.chars().all(|c| c.is_ascii_digit()))
+            || (!ext.is_empty() && ext.len() <= 3 && ext.chars().all(|c| c.is_ascii_digit()))
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
@@ -1681,7 +1681,9 @@ impl HitachiReader {
         // UTF-16: try little-endian then big-endian.
         for be in [false, true] {
             let units: Vec<u16> = bytes
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| {
                     if be {
                         u16::from_be_bytes([c[0], c[1]])

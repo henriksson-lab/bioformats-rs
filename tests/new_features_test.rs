@@ -41,7 +41,7 @@ fn minimal_pcx_bytes(
 
     if x_max >= x_min && y_max >= y_min {
         let height = (y_max - y_min + 1) as usize;
-        bytes.extend(std::iter::repeat(0x2A).take(height * bytes_per_line as usize));
+        bytes.extend(std::iter::repeat_n(0x2A, height * bytes_per_line as usize));
     }
     bytes
 }
@@ -59,7 +59,7 @@ fn dicom_round_trip_gray8() {
 
     let data: Vec<u8> = (0u8..64).collect();
     let path = tmp("test.dcm");
-    ImageWriter::save(&path, &meta, &[data.clone()]).expect("DICOM write failed");
+    ImageWriter::save(&path, &meta, std::slice::from_ref(&data)).expect("DICOM write failed");
 
     let mut reader = ImageReader::open(&path).expect("DICOM read failed");
     let rmeta = reader.metadata();
@@ -81,7 +81,7 @@ fn dicom_round_trip_gray16() {
 
     let data: Vec<u8> = (0u16..16).flat_map(|v| v.to_le_bytes()).collect();
     let path = tmp("test16.dcm");
-    ImageWriter::save(&path, &meta, &[data.clone()]).expect("DICOM write failed");
+    ImageWriter::save(&path, &meta, std::slice::from_ref(&data)).expect("DICOM write failed");
 
     let mut reader = ImageReader::open(&path).expect("DICOM read failed");
     let rmeta = reader.metadata();
@@ -189,7 +189,7 @@ fn avi_round_trip_rgb24_preserves_rows_and_channels() {
         255, 0, 0, 0, 255, 0, 0, 0, 255, 10, 20, 30, 40, 50, 60, 70, 80, 90,
     ];
     let path = tmp("rgb24.avi");
-    ImageWriter::save(&path, &meta, &[data.clone()]).expect("AVI write failed");
+    ImageWriter::save(&path, &meta, std::slice::from_ref(&data)).expect("AVI write failed");
 
     let mut reader = ImageReader::open(&path).expect("AVI read failed");
     assert_eq!(reader.metadata().size_x, 3);
@@ -528,7 +528,7 @@ fn ome_xml_round_trip() {
 
     let data: Vec<u8> = (0u8..16).collect();
     let path = tmp("test.ome");
-    ImageWriter::save(&path, &meta, &[data.clone()]).expect("OME-XML write failed");
+    ImageWriter::save(&path, &meta, std::slice::from_ref(&data)).expect("OME-XML write failed");
 
     let mut reader = ImageReader::open(&path).expect("OME-XML read failed");
     let rmeta = reader.metadata();
@@ -611,7 +611,8 @@ fn ome_tiff_round_trip() {
 
     let data: Vec<u8> = (0u16..16).flat_map(|v| v.to_le_bytes()).collect();
     let path = tmp("test.ome.tif");
-    ImageWriter::save_ome_tiff(&path, &meta, &ome, &[data.clone()]).expect("OME-TIFF write failed");
+    ImageWriter::save_ome_tiff(&path, &meta, &ome, std::slice::from_ref(&data))
+        .expect("OME-TIFF write failed");
 
     let mut reader = ImageReader::open(&path).expect("OME-TIFF read failed");
     let rmeta = reader.metadata();

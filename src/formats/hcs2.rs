@@ -1556,7 +1556,7 @@ impl IonpathMibiTiffReader {
             if image_type == "SIMS" {
                 let mass = json.get("channel.mass").and_then(|v| v.as_f64());
                 let target = json.get("channel.target").and_then(|v| v.as_str());
-                let mass_str = mass.map(|m| format_json_double(m)).unwrap_or_default();
+                let mass_str = mass.map(format_json_double).unwrap_or_default();
                 channel_ids.push(mass_str.clone());
                 channel_names.push(match target {
                     Some(t) if t != "null" => t.to_string(),
@@ -2422,10 +2422,10 @@ impl Channel {
     /// Returns the packed RGBA integer (the value OME-XML stores as `Color`).
     fn get_color(&self) -> i32 {
         let color = self.color;
-        let alpha = ((color >> 24) & 0xff) as i64;
-        let red = ((color >> 16) & 0xff) as i64;
-        let green = ((color >> 8) & 0xff) as i64;
-        let blue = (color & 0xff) as i64;
+        let alpha = (color >> 24) & 0xff;
+        let red = (color >> 16) & 0xff;
+        let green = (color >> 8) & 0xff;
+        let blue = color & 0xff;
         // ome.xml.model.primitives.Color packs as (r<<24)|(g<<16)|(b<<8)|a.
         ((red << 24) | (green << 16) | (blue << 8) | alpha) as i32
     }
@@ -3761,10 +3761,10 @@ mod tissuefaxs_impl {
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
         )
         .map_err(|e| {
-            BioFormatsError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("Could not read from database {}: {e}", file.display()),
-            ))
+            BioFormatsError::Io(std::io::Error::other(format!(
+                "Could not read from database {}: {e}",
+                file.display()
+            )))
         })
     }
 
@@ -4113,7 +4113,7 @@ impl HcsAssembly {
                 if buf.len() == nbytes {
                     let mut out = buf;
                     if self.mask_12bit_pixels && bps == 2 {
-                        for px in out.chunks_exact_mut(2) {
+                        for px in out.as_chunks_mut::<2>().0 {
                             let value = if meta.is_little_endian {
                                 u16::from_le_bytes([px[0], px[1]]) & 0x0fff
                             } else {
@@ -4133,7 +4133,7 @@ impl HcsAssembly {
                 let n = buf.len().min(nbytes);
                 out[..n].copy_from_slice(&buf[..n]);
                 if self.mask_12bit_pixels && bps == 2 {
-                    for px in out.chunks_exact_mut(2) {
+                    for px in out.as_chunks_mut::<2>().0 {
                         let value = if meta.is_little_endian {
                             u16::from_le_bytes([px[0], px[1]]) & 0x0fff
                         } else {
@@ -4199,7 +4199,7 @@ impl HcsAssembly {
             }
         }
         if self.mask_12bit_pixels && bps == 2 {
-            for px in out.chunks_exact_mut(2) {
+            for px in out.as_chunks_mut::<2>().0 {
                 let value = if meta.is_little_endian {
                     u16::from_le_bytes([px[0], px[1]]) & 0x0fff
                 } else {
@@ -4259,7 +4259,7 @@ impl HcsAssembly {
                     buf = out;
                 }
                 if self.mask_12bit_pixels && bps == 2 {
-                    for px in buf.chunks_exact_mut(2) {
+                    for px in buf.as_chunks_mut::<2>().0 {
                         let value = if meta.is_little_endian {
                             u16::from_le_bytes([px[0], px[1]]) & 0x0fff
                         } else {
@@ -4491,7 +4491,7 @@ impl HcsAssembly {
                     planes.len()
                 )));
             }
-            for (_plane_index, plane) in planes.iter().take(expected as usize).enumerate() {
+            for plane in planes.iter().take(expected as usize) {
                 for tile in &plane.tiles {
                     let mut tr = crate::tiff::TiffReader::new();
                     if tr.set_id(&tile.filename).is_err() {
@@ -4621,7 +4621,7 @@ fn make_series_meta(
         size_c,
         size_t,
         pixel_type,
-        bits_per_pixel: (bits).into(),
+        bits_per_pixel: (bits),
         image_count: size_z * size_c * size_t,
         dimension_order: order,
         is_rgb: false,
@@ -5362,10 +5362,7 @@ impl FormatReader for TecanReader {
             }
             // Tecan .asc files are tab-separated; also accept spaces.
             let mut cells: Vec<f32> = Vec::new();
-            for cell in line
-                .split(|c: char| c == '\t' || c == ' ')
-                .filter(|s| !s.is_empty())
-            {
+            for cell in line.split(['\t', ' ']).filter(|s| !s.is_empty()) {
                 let value = cell.trim().parse::<f64>().map_err(|_| {
                     BioFormatsError::Format(format!("Tecan: non-numeric cell {cell:?}"))
                 })?;
@@ -7596,6 +7593,10 @@ mod scanr {
                         for c in 0..n_channels {
                             let cname =
                                 h.channel_names.get(c as usize).cloned().unwrap_or_default();
+                            // Java: `for (int i = lastListIndex; i < list.size(); i++)`.
+                            // Assigning `last_list_index` inside the body does not
+                            // move `i`; it only sets where the next channel starts.
+                            #[allow(clippy::mut_range_bound)]
                             for i in last_list_index..list.len() {
                                 let f = &list[i];
                                 let fname = f.file_name().and_then(|n| n.to_str()).unwrap_or("");
@@ -7720,7 +7721,7 @@ mod scanr {
             let well = if n_fields > 0 { i / n_fields } else { 0 };
 
             // Mirror Java's wellNumbers cursor walk (store loop, ~line 650).
-            while h.well_numbers.get(&well_index_cursor).is_none()
+            while !h.well_numbers.contains_key(&well_index_cursor)
                 && well_index_cursor < h.well_numbers.len() as i32
             {
                 well_index_cursor += 1;
@@ -8558,7 +8559,7 @@ mod cellvoyager {
                             .unwrap_or(1.0);
                     }
                 }
-                channel_names.push(read_channel_name(&ch));
+                channel_names.push(read_channel_name(ch));
             }
         }
         if channel_names.is_empty() {
@@ -8610,7 +8611,7 @@ mod cellvoyager {
                 let mut out = Vec::new();
                 for a in areas_el.children("Area") {
                     let area = read_area(
-                        &a,
+                        a,
                         &mut field_index,
                         pixel_width,
                         pixel_height,
@@ -9785,7 +9786,7 @@ mod tests {
         // data TIFF whose name carries the W/P/Z/T blocks and channel name.
         let tiff = data.join("--W00001--P00001--Z00000--T00000--DAPI.tif");
         let meta = test_meta(4, 4);
-        write_tiff(&tiff, &meta, &vec![0u8; 16]);
+        write_tiff(&tiff, &meta, &[0u8; 16]);
 
         let mut reader = ScanrReader::new();
         reader.set_id(&xml_path).unwrap();
@@ -9891,7 +9892,7 @@ mod tests {
 
         let tiff = data.join("--W00001--P00001--Z00000--T00000--DAPI.tif");
         let meta = test_meta(4, 4);
-        write_tiff(&tiff, &meta, &vec![0u8; 16]);
+        write_tiff(&tiff, &meta, &[0u8; 16]);
 
         let mut reader = ScanrReader::new();
         reader.set_id(&xml_path).unwrap();

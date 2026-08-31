@@ -730,7 +730,7 @@ impl NdpiReader {
             meta.size_y = ifd.image_length().unwrap_or(0);
             meta.size_c = if is_rgb { spp as u32 } else { 1 };
             meta.is_rgb = is_rgb;
-            meta.bits_per_pixel = (bps) as u16;
+            meta.bits_per_pixel = bps;
             let sample_format = ifd
                 .get_u16(crate::tiff::ifd::tag::SAMPLE_FORMAT)
                 .unwrap_or(1);
@@ -768,7 +768,7 @@ impl NdpiReader {
             meta.size_c = 1;
             meta.is_rgb = false;
             meta.pixel_type = crate::common::pixel_type::PixelType::Uint16;
-            meta.bits_per_pixel = (bits) as u16;
+            meta.bits_per_pixel = bits;
             meta.image_count = meta.size_z.max(1) * meta.size_t.max(1);
         }
     }
@@ -1536,7 +1536,7 @@ impl LeicaScnReader {
                     img.size_c.max(1)
                 };
                 meta.is_rgb = is_rgb;
-                meta.bits_per_pixel = (bps) as u16;
+                meta.bits_per_pixel = bps;
                 let sample_format = ifd
                     .get_u16(crate::tiff::ifd::tag::SAMPLE_FORMAT)
                     .unwrap_or(1);
@@ -4127,7 +4127,7 @@ impl Default for Nd2Handler {
             core_size_c: 0,
             core_series_count: 1,
             image_metadata_lv_exists: false,
-            core_bits_per_pixel: (None).into(),
+            core_bits_per_pixel: (None),
             // CoreMetadata's default dimensionOrder ("XYCZT" in Bio-Formats).
             core_dimension_order: "XYCZT".to_string(),
             ts: Vec::new(),
@@ -4355,7 +4355,7 @@ impl Nd2Handler {
                     self.parse_key_and_value(v[0], rest, runtype);
                 } else if v.len() > 1 {
                     // metadata.put(v[0] sans braces, v[1]); diagnostic-only.
-                    let _ = v[0].replace('{', " ").replace('}', " ");
+                    let _ = v[0].replace(['{', '}'], " ");
                 }
                 // (v.len() == 1: metadata.put(key, v[0]); diagnostic-only)
             }
@@ -4997,10 +4997,9 @@ fn xml_matching_end_offset(xml: &str, tag: &XmlTag) -> Option<usize> {
             continue;
         }
         if xml[i..].starts_with("<!--") {
-            if let Some(end) = xml[i..].find("-->") {
+            {
+                let end = xml[i..].find("-->")?;
                 i += end + 3;
-            } else {
-                return None;
             }
             continue;
         }
@@ -7092,7 +7091,7 @@ impl MetamorphTiffReader {
 
         let mut unique_z: Vec<f64> = Vec::new();
         for &z in &handler.z_positions {
-            if !unique_z.iter().any(|u| *u == z) {
+            if !unique_z.contains(&z) {
                 unique_z.push(z);
             }
         }
@@ -8216,19 +8215,14 @@ impl ZeissApotomeTiffReader {
                     && !key.starts_with('<')
                 {
                     let sanitized_key = key.to_ascii_lowercase().replace(' ', "_");
-                    if !vendor.contains_key(&format!("zeiss.{}", sanitized_key)) {
-                        if let Ok(f) = val.parse::<f64>() {
-                            vendor.insert(
-                                format!("zeiss.{}", sanitized_key),
-                                crate::common::metadata::MetadataValue::Float(f),
-                            );
-                        } else {
-                            vendor.insert(
-                                format!("zeiss.{}", sanitized_key),
-                                crate::common::metadata::MetadataValue::String(val.to_string()),
-                            );
-                        }
-                    }
+                    vendor
+                        .entry(format!("zeiss.{}", sanitized_key))
+                        .or_insert_with(|| match val.parse::<f64>() {
+                            Ok(f) => crate::common::metadata::MetadataValue::Float(f),
+                            Err(_) => {
+                                crate::common::metadata::MetadataValue::String(val.to_string())
+                            }
+                        });
                 }
             }
         }
@@ -8672,9 +8666,7 @@ impl FluoviewReader {
         ifd: &crate::tiff::ifd::Ifd,
         vendor: &mut std::collections::HashMap<String, crate::common::metadata::MetadataValue>,
     ) -> Option<FluoviewMmHeader> {
-        let Some(value) = ifd.get(Self::MMHEADER) else {
-            return None;
-        };
+        let value = ifd.get(Self::MMHEADER)?;
         let bytes: Vec<u8> = match value {
             crate::tiff::ifd::IfdValue::Short(v) => v.iter().map(|v| *v as u8).collect(),
             crate::tiff::ifd::IfdValue::Byte(v) | crate::tiff::ifd::IfdValue::Undefined(v) => {
@@ -9031,19 +9023,14 @@ impl MolecularDevicesTiffReader {
                     && !key.starts_with('<')
                 {
                     let sanitized_key = key.to_ascii_lowercase().replace(' ', "_");
-                    if !vendor.contains_key(&format!("moldev.{}", sanitized_key)) {
-                        if let Ok(f) = val.parse::<f64>() {
-                            vendor.insert(
-                                format!("moldev.{}", sanitized_key),
-                                crate::common::metadata::MetadataValue::Float(f),
-                            );
-                        } else {
-                            vendor.insert(
-                                format!("moldev.{}", sanitized_key),
-                                crate::common::metadata::MetadataValue::String(val.to_string()),
-                            );
-                        }
-                    }
+                    vendor
+                        .entry(format!("moldev.{}", sanitized_key))
+                        .or_insert_with(|| match val.parse::<f64>() {
+                            Ok(f) => crate::common::metadata::MetadataValue::Float(f),
+                            Err(_) => {
+                                crate::common::metadata::MetadataValue::String(val.to_string())
+                            }
+                        });
                 }
             }
         }
@@ -9193,7 +9180,7 @@ impl MolecularDevicesTiffReader {
                 size_c: channels as u32,
                 size_t: info.n_timepoints,
                 pixel_type,
-                bits_per_pixel: (bits).into(),
+                bits_per_pixel: (bits),
                 image_count,
                 dimension_order: crate::common::metadata::DimensionOrder::XYCZT,
                 is_rgb: false,

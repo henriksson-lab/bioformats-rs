@@ -1597,12 +1597,12 @@ impl FormatWriter for TgaWriter {
         match spp {
             1 => out.extend_from_slice(&pixels),
             3 => {
-                for px in pixels.chunks_exact(3) {
+                for px in pixels.as_chunks::<3>().0 {
                     out.extend_from_slice(&[px[2], px[1], px[0]]);
                 }
             }
             4 => {
-                for px in pixels.chunks_exact(4) {
+                for px in pixels.as_chunks::<4>().0 {
                     out.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
                 }
             }

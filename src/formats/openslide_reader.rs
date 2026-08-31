@@ -13,9 +13,10 @@ mod inner {
     use openslide_pure_rs::OpenSlide;
 
     use crate::common::compressed::{
-        CompressedBytes, CompressedExtractionConstraint, CompressedExtractionSupport,
-        CompressedFileRange, CompressedLevelInfo, CompressedTile, CompressedTileMode,
-        Jpeg2000Container, JpegColorSpace, JpegSubsampling, LossyCodec,
+        ColorChannel, CompressedBytes, CompressedExtractionConstraint, CompressedExtractionSupport,
+        CompressedFileRange, CompressedLevelInfo, CompressedPlane, CompressedPlaneBytes,
+        CompressedTile, CompressedTileMode, Jpeg2000Container, JpegColorSpace, JpegPlaneInfo,
+        JpegSubsampling, LossyCodec,
     };
     use crate::common::error::{BioFormatsError, Result};
     use crate::common::metadata::{DimensionOrder, ImageMetadata};
@@ -72,30 +73,61 @@ mod inner {
         }
     }
 
+    fn from_os_color_space(color_space: os_compressed::JpegColorSpace) -> JpegColorSpace {
+        match color_space {
+            os_compressed::JpegColorSpace::Rgb => JpegColorSpace::Rgb,
+            os_compressed::JpegColorSpace::YCbCr => JpegColorSpace::YCbCr,
+            os_compressed::JpegColorSpace::Gray => JpegColorSpace::Gray,
+            os_compressed::JpegColorSpace::Unknown => JpegColorSpace::Unknown,
+        }
+    }
+
+    fn from_os_subsampling(
+        subsampling: Option<os_compressed::JpegSubsampling>,
+    ) -> Option<JpegSubsampling> {
+        subsampling.map(|s| match s {
+            os_compressed::JpegSubsampling::Cs444 => JpegSubsampling::Cs444,
+            os_compressed::JpegSubsampling::Cs422 => JpegSubsampling::Cs422,
+            os_compressed::JpegSubsampling::Cs420 => JpegSubsampling::Cs420,
+            os_compressed::JpegSubsampling::Other {
+                horizontal,
+                vertical,
+            } => JpegSubsampling::Other {
+                horizontal,
+                vertical,
+            },
+        })
+    }
+
+    fn from_os_channel(channel: os_compressed::ColorChannel) -> ColorChannel {
+        match channel {
+            os_compressed::ColorChannel::Red => ColorChannel::Red,
+            os_compressed::ColorChannel::Green => ColorChannel::Green,
+            os_compressed::ColorChannel::Blue => ColorChannel::Blue,
+            os_compressed::ColorChannel::Alpha => ColorChannel::Alpha,
+            os_compressed::ColorChannel::Gray => ColorChannel::Gray,
+            os_compressed::ColorChannel::Unknown(code) => ColorChannel::Unknown(code),
+        }
+    }
+
     fn from_os_codec(codec: os_compressed::LossyCodec) -> LossyCodec {
         match codec {
             os_compressed::LossyCodec::Jpeg {
                 color_space,
                 subsampling,
             } => LossyCodec::Jpeg {
-                color_space: match color_space {
-                    os_compressed::JpegColorSpace::Rgb => JpegColorSpace::Rgb,
-                    os_compressed::JpegColorSpace::YCbCr => JpegColorSpace::YCbCr,
-                    os_compressed::JpegColorSpace::Gray => JpegColorSpace::Gray,
-                    os_compressed::JpegColorSpace::Unknown => JpegColorSpace::Unknown,
-                },
-                subsampling: subsampling.map(|s| match s {
-                    os_compressed::JpegSubsampling::Cs444 => JpegSubsampling::Cs444,
-                    os_compressed::JpegSubsampling::Cs422 => JpegSubsampling::Cs422,
-                    os_compressed::JpegSubsampling::Cs420 => JpegSubsampling::Cs420,
-                    os_compressed::JpegSubsampling::Other {
-                        horizontal,
-                        vertical,
-                    } => JpegSubsampling::Other {
-                        horizontal,
-                        vertical,
-                    },
-                }),
+                color_space: from_os_color_space(color_space),
+                subsampling: from_os_subsampling(subsampling),
+            },
+            os_compressed::LossyCodec::JpegPlanes { planes } => LossyCodec::JpegPlanes {
+                planes: planes
+                    .into_iter()
+                    .map(|plane| JpegPlaneInfo {
+                        channel: from_os_channel(plane.channel),
+                        color_space: from_os_color_space(plane.color_space),
+                        subsampling: from_os_subsampling(plane.subsampling),
+                    })
+                    .collect(),
             },
             os_compressed::LossyCodec::Jpeg2000 { container } => LossyCodec::Jpeg2000 {
                 container: match container {
@@ -137,15 +169,48 @@ mod inner {
                 length,
             },
             os_compressed::CompressedBytes::FileRanges { ranges } => CompressedBytes::FileRanges {
-                ranges: ranges
+                ranges: from_os_ranges(ranges),
+            },
+            os_compressed::CompressedBytes::Planes { planes } => CompressedBytes::Planes {
+                planes: planes
                     .into_iter()
-                    .map(|range| CompressedFileRange {
-                        path: range.path,
-                        offset: range.offset,
-                        length: range.length,
+                    .map(|plane| CompressedPlane {
+                        channel: from_os_channel(plane.channel),
+                        bytes: from_os_plane_bytes(plane.bytes),
                     })
                     .collect(),
             },
+        }
+    }
+
+    fn from_os_ranges(ranges: Vec<os_compressed::CompressedFileRange>) -> Vec<CompressedFileRange> {
+        ranges
+            .into_iter()
+            .map(|range| CompressedFileRange {
+                path: range.path,
+                offset: range.offset,
+                length: range.length,
+            })
+            .collect()
+    }
+
+    fn from_os_plane_bytes(bytes: os_compressed::CompressedPlaneBytes) -> CompressedPlaneBytes {
+        match bytes {
+            os_compressed::CompressedPlaneBytes::Owned(data) => CompressedPlaneBytes::Owned(data),
+            os_compressed::CompressedPlaneBytes::FileRange {
+                path,
+                offset,
+                length,
+            } => CompressedPlaneBytes::FileRange {
+                path,
+                offset,
+                length,
+            },
+            os_compressed::CompressedPlaneBytes::FileRanges { ranges } => {
+                CompressedPlaneBytes::FileRanges {
+                    ranges: from_os_ranges(ranges),
+                }
+            }
         }
     }
 

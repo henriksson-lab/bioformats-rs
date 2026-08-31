@@ -1062,7 +1062,7 @@ fn decode_quicktime_uncompressed_sample(
                 )));
             }
             let mut decoded = Vec::with_capacity(expected);
-            for px in sample.chunks_exact(4) {
+            for px in sample.as_chunks::<4>().0 {
                 decoded.extend_from_slice(&px[1..4]);
             }
             decoded
@@ -3700,9 +3700,7 @@ impl crate::common::writer::FormatWriter for QtWriter {
                 } else {
                     out.extend_from_slice(src);
                 }
-                for _ in 0..pad {
-                    out.push(0);
-                }
+                out.resize(out.len() + pad as usize, 0);
             }
         }
         debug_assert_eq!(out.len() as i64, 16 + num_bytes);
@@ -5468,7 +5466,7 @@ impl FormatReader for MincReader {
         };
         // unsigned_attr == Some(true) => unsigned; Some(false) => signed;
         // None (no attribute / not MINC-2) => unsigned default.
-        let signed = unsigned_attr.map_or(false, |u| !u);
+        let signed = unsigned_attr.is_some_and(|u| !u);
 
         // Read the raw values via the matching typed reader and re-emit them as
         // little-endian bytes (MINCReader uses isLittleEndian()==isMINC2 for the
@@ -7045,7 +7043,7 @@ fn jpeg2000_codestream_offset(data: &[u8]) -> Option<usize> {
 
 fn jpeg2000_resolution_levels(data: &[u8]) -> Option<u8> {
     let mut pos = jpeg2000_codestream_offset(data)?;
-    if data.get(pos..pos + 2)? != &[0xff, 0x4f] {
+    if data.get(pos..pos + 2)? != [0xff, 0x4f] {
         return None;
     }
     pos += 2;
@@ -8162,7 +8160,10 @@ mod openlab_user_var_tests {
         b.extend_from_slice(&(name.len() as i32).to_be_bytes());
         b.extend_from_slice(name.as_bytes());
         // skipBytes(baseClassVersion * 2 + 1)
-        b.extend(std::iter::repeat(0u8).take(base_class_version as usize * 2 + 1));
+        b.extend(std::iter::repeat_n(
+            0u8,
+            base_class_version as usize * 2 + 1,
+        ));
         b
     }
 
@@ -8176,7 +8177,10 @@ mod openlab_user_var_tests {
         b.push(base_class_version);
         b.extend_from_slice(&(name.len() as i32).to_be_bytes());
         b.extend_from_slice(name.as_bytes());
-        b.extend(std::iter::repeat(0u8).take(base_class_version as usize * 2 + 1));
+        b.extend(std::iter::repeat_n(
+            0u8,
+            base_class_version as usize * 2 + 1,
+        ));
         b
     }
 

@@ -2892,7 +2892,7 @@ fn imspector_msr_tile_count(metadata: &str) -> u32 {
     let mut tile_x = 1u32;
     let mut tile_y = 1u32;
     let values: Vec<&str> = metadata.split("::").collect();
-    for pair in values.chunks_exact(2) {
+    for pair in values.as_chunks::<2>().0 {
         match pair[0] {
             "Stitching X" | "StitchingX" => {
                 if let Ok(value) = pair[1].parse::<u32>() {
@@ -3210,7 +3210,7 @@ fn parse_imspector_msr_stack(bytes: &[u8]) -> Result<Option<Vec<ImspectorStack>>
             }
         }
         let values: Vec<&str> = metadata.split("::").collect();
-        for pair in values.chunks_exact(2) {
+        for pair in values.as_chunks::<2>().0 {
             meta.series_metadata.insert(
                 pair[0].to_string(),
                 MetadataValue::String(pair[1].to_string()),
@@ -6021,12 +6021,12 @@ fn hamamatsu_vms_tile_key_candidates(
     keys
 }
 
-fn hamamatsu_vms_tile_value<'a>(
-    values: &'a HashMap<String, String>,
+fn hamamatsu_vms_tile_value(
+    values: &HashMap<String, String>,
     layer: u32,
     col: u32,
     row: u32,
-) -> Option<&'a String> {
+) -> Option<&String> {
     for prefix in ["imagefile", "imagefilename", "imagename", "imagepath"] {
         let keys = hamamatsu_vms_tile_key_candidates(prefix, layer, col, row, true);
         for key in &keys {
@@ -6057,13 +6057,13 @@ fn hamamatsu_vms_pyramid_key(level: u32, name: &str) -> Vec<String> {
     .collect()
 }
 
-fn hamamatsu_vms_pyramid_tile_value<'a>(
-    values: &'a HashMap<String, String>,
+fn hamamatsu_vms_pyramid_tile_value(
+    values: &HashMap<String, String>,
     level: u32,
     layer: u32,
     col: u32,
     row: u32,
-) -> Option<&'a String> {
+) -> Option<&String> {
     let mut keys = Vec::new();
     for prefix in hamamatsu_vms_pyramid_key(level, "imagefile") {
         keys.extend(hamamatsu_vms_tile_key_candidates(
@@ -6671,7 +6671,7 @@ fn hamamatsu_vms_jpeg_pixels_to_rgb(
 
 fn hamamatsu_vms_cmyk_to_rgb(data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(data.len() / 4 * 3);
-    for pixel in data.chunks_exact(4) {
+    for pixel in data.as_chunks::<4>().0 {
         let c = 255 - u16::from(pixel[0]);
         let m = 255 - u16::from(pixel[1]);
         let y = 255 - u16::from(pixel[2]);
@@ -7408,7 +7408,7 @@ impl FormatReader for HamamatsuVmsReader {
                 })?;
                 let tiles = layers
                     .get(plane_index as usize)
-                    .ok_or_else(|| BioFormatsError::PlaneOutOfRange(plane_index))?;
+                    .ok_or(BioFormatsError::PlaneOutOfRange(plane_index))?;
                 for tile in tiles {
                     let tx2 = tile.x + tile.width;
                     let ty2 = tile.y + tile.height;
@@ -10116,9 +10116,9 @@ fn cellomics_matching_channel_sources(
 ///   - 1 series                -> 1x1 (the lone well is placed at its own row/col)
 ///   - <= 8 rows and <= 12 cols -> 96-well (8x12)
 ///   - otherwise               -> 384-well (16x24)
-/// Each series maps to a WellSample (field index) inside its well. We stamp the
-/// resulting per-series plate placement into the series metadata so that
-/// `ome_metadata` can rebuild the OME Plate/Well/WellSample tree faithfully.
+///     Each series maps to a WellSample (field index) inside its well. We stamp the
+///     resulting per-series plate placement into the series metadata so that
+///     `ome_metadata` can rebuild the OME Plate/Well/WellSample tree faithfully.
 fn cellomics_finalize_plate_metadata(
     metas: &mut [ImageMetadata],
     filename_metadata: &CellomicsFilenameMetadata,

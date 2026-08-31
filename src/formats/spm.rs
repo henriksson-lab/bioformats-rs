@@ -1091,7 +1091,7 @@ impl PicoQuantReader {
             }
             PTU_TAG_WIDE_STRING => {
                 let mut values = Vec::new();
-                for chunk in payload.chunks_exact(2) {
+                for chunk in payload.as_chunks::<2>().0 {
                     let value = u16::from_le_bytes([chunk[0], chunk[1]]);
                     if value == 0 {
                         break;
@@ -1255,7 +1255,7 @@ impl PicoQuantReader {
         let mut frame = 0u32;
         let mut line = 0u32;
 
-        for record in data[data_offset..records_end].chunks_exact(4) {
+        for record in data[data_offset..records_end].as_chunks::<4>().0 {
             let raw = u32::from_le_bytes([record[0], record[1], record[2], record[3]]);
             let (nsync, dtime, channel) = if is_t2 {
                 (u64::from(raw & 0x01ff_ffff), 0, ((raw >> 25) & 0x3f) as u8)
@@ -1469,7 +1469,7 @@ impl FormatReader for PicoQuantReader {
                 }
             })?;
         let height = Self::int_tag(&tags, &["ImgHdr_PixY", "ImgHdr_Lines"])
-            .or_else(|| if histogram_acquisition { Some(1) } else { None })
+            .or(if histogram_acquisition { Some(1) } else { None })
             .ok_or_else(|| {
                 BioFormatsError::UnsupportedFormat(
                     "PicoQuant PTU missing explicit image height".into(),
@@ -4376,9 +4376,9 @@ impl PqBinReader {
 
         // Java multiplies as 32-bit ints; replicate the wrapping product so a
         // forged header cannot match via 64-bit promotion.
-        let product = (size_x as i32)
-            .wrapping_mul(size_y as i32)
-            .wrapping_mul(size_t as i32)
+        let product = size_x
+            .wrapping_mul(size_y)
+            .wrapping_mul(size_t)
             .wrapping_mul(BPP as i32);
         (product as i64 + Self::HEADER_SIZE as i64) == file_length as i64
     }

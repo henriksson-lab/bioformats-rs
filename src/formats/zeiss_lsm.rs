@@ -1894,7 +1894,7 @@ impl FormatReader for ZeissLsmReader {
             size_c: dim_c,
             size_t: dim_t,
             pixel_type,
-            bits_per_pixel: (tiff_meta.bits_per_pixel).into(),
+            bits_per_pixel: (tiff_meta.bits_per_pixel),
             image_count,
             dimension_order: lsm_dimension_order(lsm_info.scan_type, rgb_for_order),
             is_rgb,

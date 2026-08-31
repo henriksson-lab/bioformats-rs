@@ -144,7 +144,7 @@ fn kodak_add_file_info_metadata(data: &[u8], meta: &mut ImageMetadata) {
     }
     let info = String::from_utf8_lossy(&data[data_offset..data_offset + data_length]);
     let collapsed = info
-        .split(|ch| ch == '\r' || ch == '\n')
+        .split(['\r', '\n'])
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>()
         .join(" | ");

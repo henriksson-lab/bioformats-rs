@@ -757,7 +757,7 @@ fn read_iplab_tags(
                 meta_map.insert("LUT type".into(), MetadataValue::String(label));
             }
             b"head" => {
-                for chunk in payload.chunks_exact(22) {
+                for chunk in payload.as_chunks::<22>().0 {
                     let num = if little_endian {
                         i16::from_le_bytes([chunk[0], chunk[1]])
                     } else {
@@ -1618,18 +1618,18 @@ mod seq_tests {
         // Base structural tags (tag, type, count, inline-or-offset value).
         // type: 3 = SHORT, 4 = LONG.
         // We will place pixels and any out-of-line arrays after the IFD.
-        let mut entries: Vec<(u16, u16, u32, Vec<u8>)> = Vec::new();
-
         // Placeholder for StripOffsets — filled once layout is known.
-        entries.push((256, 4, 1, width.to_le_bytes().to_vec())); // ImageWidth
-        entries.push((257, 4, 1, height.to_le_bytes().to_vec())); // ImageLength
-        entries.push((258, 3, 1, vec![8, 0, 0, 0])); // BitsPerSample = 8
-        entries.push((259, 3, 1, vec![1, 0, 0, 0])); // Compression = none
-        entries.push((262, 3, 1, vec![1, 0, 0, 0])); // Photometric = BlackIsZero
-        entries.push((273, 4, 1, vec![0, 0, 0, 0])); // StripOffsets (fixup later)
-        entries.push((277, 3, 1, vec![1, 0, 0, 0])); // SamplesPerPixel = 1
-        entries.push((278, 4, 1, height.to_le_bytes().to_vec())); // RowsPerStrip
-        entries.push((279, 4, 1, (pixels.len() as u32).to_le_bytes().to_vec())); // StripByteCounts
+        let mut entries: Vec<(u16, u16, u32, Vec<u8>)> = vec![
+            (256, 4, 1, width.to_le_bytes().to_vec()),  // ImageWidth
+            (257, 4, 1, height.to_le_bytes().to_vec()), // ImageLength
+            (258, 3, 1, vec![8, 0, 0, 0]),              // BitsPerSample = 8
+            (259, 3, 1, vec![1, 0, 0, 0]),              // Compression = none
+            (262, 3, 1, vec![1, 0, 0, 0]),              // Photometric = BlackIsZero
+            (273, 4, 1, vec![0, 0, 0, 0]),              // StripOffsets (fixup later)
+            (277, 3, 1, vec![1, 0, 0, 0]),              // SamplesPerPixel = 1
+            (278, 4, 1, height.to_le_bytes().to_vec()), // RowsPerStrip
+            (279, 4, 1, (pixels.len() as u32).to_le_bytes().to_vec()), // StripByteCounts
+        ];
 
         for e in extra {
             entries.push(e.clone());

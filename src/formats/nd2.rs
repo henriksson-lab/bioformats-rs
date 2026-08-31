@@ -4,7 +4,7 @@
 //!   - 4 bytes magic: 0xDA 0xCE 0xBE 0x0A
 //!   - 4 bytes name length
 //!   - 8 bytes data length
-//! Followed by the name string and then the data payload.
+//!     Followed by the name string and then the data payload.
 //!
 //! Key chunk names: "ImageAttributesLV!", "ImageMetadataLV!",
 //!                  "ImageDataSeq|0!", "ImageDataSeq|1!", ...
@@ -1303,10 +1303,8 @@ fn nd2_raster_mapping(
     let mut first_slot_filled = vec![false; n_series];
     for (s, table) in placed.into_iter().enumerate() {
         first_slot_filled[s] = table.first().map(|slot| slot.is_some()).unwrap_or(false);
-        for slot in table {
-            if let Some(global_plane) = slot {
-                source_planes[s].push(global_plane);
-            }
+        for global_plane in table.into_iter().flatten() {
+            source_planes[s].push(global_plane);
         }
     }
 

@@ -862,7 +862,9 @@ fn parse_zvi_roi_string(s: &mut Cursor) -> Option<String> {
         let raw = s.read_bytes(strlen - 2)?;
         s.skip(2);
         let utf16: Vec<u16> = raw
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|b| u16::from_le_bytes([b[0], b[1]]))
             .take_while(|&ch| ch != 0)
             .collect();
@@ -1897,12 +1899,12 @@ impl FormatReader for ZeissZviReader {
         let global_index = (self.current_series as u32)
             .checked_mul(image_count)
             .and_then(|base| base.checked_add(plane_index))
-            .ok_or_else(|| BioFormatsError::PlaneOutOfRange(plane_index))?;
+            .ok_or(BioFormatsError::PlaneOutOfRange(plane_index))?;
 
         let plane = self
             .planes
             .get(global_index as usize)
-            .ok_or_else(|| BioFormatsError::PlaneOutOfRange(plane_index))?;
+            .ok_or(BioFormatsError::PlaneOutOfRange(plane_index))?;
         let stream_path = plane.stream_path.clone();
         let plane = ZviPlane {
             stream_path: stream_path.clone(),
@@ -1921,9 +1923,7 @@ impl FormatReader for ZeissZviReader {
             .open_stream(&stream_path)
             .map_err(|e| BioFormatsError::Format(format!("ZVI stream {stream_path}: {e}")))?;
         let mut data = Vec::new();
-        stream
-            .read_to_end(&mut data)
-            .map_err(|e| BioFormatsError::Io(e))?;
+        stream.read_to_end(&mut data).map_err(BioFormatsError::Io)?;
 
         let mut pixels = decode_plane_data(&data, &plane)?;
 
@@ -1997,11 +1997,11 @@ impl FormatReader for ZeissZviReader {
         let global_index = (self.current_series as u32)
             .checked_mul(image_count)
             .and_then(|base| base.checked_add(plane_index))
-            .ok_or_else(|| BioFormatsError::PlaneOutOfRange(plane_index))?;
+            .ok_or(BioFormatsError::PlaneOutOfRange(plane_index))?;
         let plane = self
             .planes
             .get(global_index as usize)
-            .ok_or_else(|| BioFormatsError::PlaneOutOfRange(plane_index))?;
+            .ok_or(BioFormatsError::PlaneOutOfRange(plane_index))?;
 
         if !plane.is_jpeg && !plane.is_zlib {
             let comp = self.comp.as_mut().ok_or(BioFormatsError::NotInitialized)?;

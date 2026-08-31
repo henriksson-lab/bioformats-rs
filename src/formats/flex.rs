@@ -2070,7 +2070,7 @@ impl FormatReader for FlexReader {
                 if let Some(date) = self.acquisition_dates.get(&0) {
                     img.acquisition_date = Some(date.clone());
                 }
-                if self.objective_refs.first().is_some() {
+                if !self.objective_refs.is_empty() {
                     img.objective_ref = Some(0);
                 }
                 self.apply_channel_instrument(img, 0);

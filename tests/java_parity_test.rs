@@ -4,19 +4,19 @@
 //! (`parity/BfParityOracle.java` against `bioformats_package.jar`) and compares
 //! its output to our Rust `ImageReader`, across three axes:
 //!   1. CORE metadata   — sizeX/Y/Z/C/T, pixelType, bitsPerPixel, imageCount,
-//!                        dimensionOrder, rgb/interleaved/indexed/littleEndian.
+//!      dimensionOrder, rgb/interleaved/indexed/littleEndian.
 //!   2. OME metadata    — image name, physical sizes, time increment, per-channel
-//!                        fields, object graph counts, and annotation counts.
+//!      fields, object graph counts, and annotation counts.
 //!   3. PIXELS          — read identically on both sides and compared three ways:
-//!                        a) CRC32 of a bounded top-left 256² region of up to
-//!                           MAX_PLANES planes (deep Z/C/T coverage);
-//!                        b) for SMALL planes (full plane <= FULL_PLANE_MAX),
-//!                           CRC32 of the WHOLE plane (catches corners the crop
-//!                           misses; lossy JPEG-family full-plane CRC-only
-//!                           mismatches are relaxed when raw Java bytes were not
-//!                           emitted for tolerance comparison);
-//!                        c) one NON-ZERO-ORIGIN (centered) 256² region of plane
-//!                           0 (catches tiling/stride/offset bugs).
+//!      a) CRC32 of a bounded top-left 256² region of up to
+//!      MAX_PLANES planes (deep Z/C/T coverage);
+//!      b) for SMALL planes (full plane <= FULL_PLANE_MAX),
+//!      CRC32 of the WHOLE plane (catches corners the crop
+//!      misses; lossy JPEG-family full-plane CRC-only
+//!      mismatches are relaxed when raw Java bytes were not
+//!      emitted for tolerance comparison);
+//!      c) one NON-ZERO-ORIGIN (centered) 256² region of plane
+//!      0 (catches tiling/stride/offset bugs).
 //!
 //! Gating (so plain `cargo test` is unaffected):
 //!   - Skips unless env `BIOFORMATS_RS_JAVA_PARITY=1`.

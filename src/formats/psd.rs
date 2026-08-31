@@ -262,7 +262,9 @@ fn psd_read_unicode_string(payload: &[u8], offset: &mut usize) -> Option<String>
     *offset = end;
 
     let units = bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
         .collect::<Vec<_>>();
     String::from_utf16(&units).ok()
@@ -1079,7 +1081,7 @@ fn load_psd(path: &Path) -> Result<(ImageMetadata, Vec<u8>)> {
             // Vector/large-document layer data: Java rejects this, but we still
             // expose the flattened composite image. Skip the whole layer+mask
             // block and read the image-data section that follows it.
-            r.seek(block_start.saturating_add(block_len.max(0) as usize));
+            r.seek(block_start.saturating_add(block_len.max(0)));
             offset = r.fp();
             return finish_psd(
                 &data,
@@ -1349,7 +1351,7 @@ fn finish_psd(
         size_c: output_channels as u32,
         size_t: 1,
         pixel_type,
-        bits_per_pixel: (depth) as u16,
+        bits_per_pixel: (depth),
         image_count,
         dimension_order: DimensionOrder::XYCZT,
         is_rgb,

@@ -926,7 +926,7 @@ impl BdvReader {
                 let shape = ds.shape().map_err(|e| {
                     BioFormatsError::Format(format!("BDV: cannot read shape {cells_path}: {e}"))
                 })?;
-                if shape.len() != 3 || shape.iter().any(|&d| d == 0) {
+                if shape.len() != 3 || shape.contains(&0) {
                     return Err(BioFormatsError::Format(format!(
                         "BDV: unsupported cells shape {shape:?} for {cells_path}"
                     )));
@@ -1147,7 +1147,7 @@ impl BdvReader {
         let ds_path = self.image_data_path(no)?;
         let bps = self
             .current_metadata()
-            .map(|m| m.pixel_type.bytes_per_sample() as usize)
+            .map(|m| m.pixel_type.bytes_per_sample())
             .ok_or(BioFormatsError::NotInitialized)?;
 
         let file = self.file.as_ref().ok_or(BioFormatsError::NotInitialized)?;
