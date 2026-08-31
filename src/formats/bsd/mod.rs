@@ -1,0 +1,15 @@
+pub mod avi;
+pub mod bdv;
+pub mod bmp;
+pub mod cellh5;
+pub mod dicom;
+pub mod eps;
+pub mod fake;
+pub mod fits;
+pub mod ics;
+pub mod jpeg;
+pub mod micromanager;
+pub mod nrrd;
+pub mod ome_xml;
+pub mod pcx;
+pub mod zip;

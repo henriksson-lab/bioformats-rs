@@ -47,6 +47,11 @@ jobs:
       - name: Build (no default features)
         run: cargo build --workspace --no-default-features
 
+      # The BSD-2-Clause-only configuration documented in CLAUDE.md: everything
+      # ported from upstream's GPL formats-gpl module is compiled out.
+      - name: Build (BSD-only, no gpl)
+        run: cargo build --workspace --no-default-features --features "jpegxr,zarr,tissuefaxs" --all-targets
+
       # jpegxr, zarr and tissuefaxs are on by default; openslide is not, and
       # comes from a git dependency, so --all-features is what actually
       # exercises it.

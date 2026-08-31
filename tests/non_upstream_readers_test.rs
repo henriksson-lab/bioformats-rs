@@ -89,6 +89,7 @@ fn simfcs_requires_whole_frames_and_crops_real_pixels() {
     assert_eq!(reader.open_bytes_region(0, 1, 1, 1, 1).unwrap(), vec![99]);
 }
 
+#[cfg(feature = "gpl")]
 fn norpix_seq_header(
     frames: u32,
     width: u32,
@@ -107,6 +108,7 @@ fn norpix_seq_header(
 }
 
 #[test]
+#[cfg(feature = "gpl")]
 fn norpix_seq_preserves_header_metadata_timestamps_and_pixels() {
     let path = tmp("metadata.seq");
     let mut data = norpix_seq_header(2, 2, 1, 0, 10);
@@ -122,7 +124,7 @@ fn norpix_seq_preserves_header_metadata_timestamps_and_pixels() {
     data.extend_from_slice(&0u16.to_le_bytes());
     std::fs::write(&path, data).unwrap();
 
-    let mut reader = bioformats::formats::norpix::NorpixReader::new();
+    let mut reader = bioformats::formats::gpl::norpix::NorpixReader::new();
     reader.set_id(&path).unwrap();
     let meta = reader.metadata();
     assert_eq!(meta.size_x, 2);
@@ -140,6 +142,7 @@ fn norpix_seq_preserves_header_metadata_timestamps_and_pixels() {
 }
 
 #[test]
+#[cfg(feature = "gpl")]
 fn pco_b16_reads_declared_dimensions_and_pixels() {
     let path = tmp("frame.b16");
     let mut data = vec![0u8; 216];
@@ -150,7 +153,7 @@ fn pco_b16_reads_declared_dimensions_and_pixels() {
     }
     std::fs::write(&path, data).unwrap();
 
-    let mut reader = bioformats::formats::camera2::PcoB16Reader::new();
+    let mut reader = bioformats::formats::gpl::camera2::PcoB16Reader::new();
     reader.set_id(&path).unwrap();
     assert_eq!(reader.metadata().size_x, 2);
     assert_eq!(reader.metadata().size_y, 2);

@@ -1,7 +1,11 @@
+//! Every reader exercised here lives in `src/formats/gpl/`, so the whole
+//! test crate is empty in a BSD-only (`--no-default-features`) build.
+#![cfg(feature = "gpl")]
+
 use bioformats::common::metadata::MetadataValue;
 use bioformats::common::pixel_type::PixelType;
 use bioformats::formats::flim2::XlefReader;
-use bioformats::formats::leica_lms::{image_metadata_from_xlif, XlifDocument};
+use bioformats::formats::gpl::leica_lms::{image_metadata_from_xlif, XlifDocument};
 use bioformats::{FormatReader, ImageReader, OmeShape};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};

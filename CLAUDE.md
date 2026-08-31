@@ -38,6 +38,16 @@ cargo build --features jpegxr        # Enable JPEG-XR codec
 cargo build --features openslide     # Enable OpenSlide-based whole-slide readers
 ```
 
+Licensing split (mirrors upstream Bio-Formats' `formats-bsd`/`formats-gpl` modules):
+```bash
+cargo build --no-default-features --features "jpegxr,zarr,tissuefaxs"   # BSD-2-Clause only: excludes all GPL-derived readers
+```
+The `gpl` feature is on by default (full format coverage, matching this crate's own
+`GPL-2.0-or-later` license). Disabling it excludes every reader ported from upstream's
+GPL `formats-gpl` module from compilation — not just from the registry — so a
+`--no-default-features` build without `gpl` is a genuinely BSD-2-Clause-only binary.
+See `src/formats/gpl/` vs `src/formats/bsd/` below.
+
 Benchmarks: `./bench/run.sh` (requires `java` and `bioformats_package.jar` in repo root).
 
 ## Architecture
@@ -66,15 +76,15 @@ src/
 │   └── compression.rs  # Decompression dispatch
 ├── formats/            # ~67 modules implementing ~182 readers, organized by category:
 │   ├── mod.rs          # Module declarations
-│   ├── czi.rs, nd2.rs, lif.rs, ...  # Major scientific formats
-│   ├── misc.rs, misc4.rs            # Miscellaneous/stub readers
-│   ├── extended.rs                  # Extended format set
-│   ├── hcs2.rs                      # High-content screening
-│   ├── sem.rs                       # Electron microscopy
-│   ├── spm.rs                       # Scanning probe microscopy
-│   ├── camera2.rs                   # Camera/RAW formats
-│   ├── flim2.rs                     # FLIM/flow cytometry
-│   └── tiff_wrappers.rs            # TIFF-based whole-slide formats
+│   ├── gpl/             # Readers ported from upstream's GPL-2.0-or-later `formats-gpl`
+│   │                     # module (czi.rs, nd2.rs, lif.rs, tiff_wrappers.rs, hcs2.rs,
+│   │                     # sem.rs, spm.rs, camera2.rs, ...). Gated behind the `gpl`
+│   │                     # cargo feature (on by default) — see Commands above.
+│   ├── bsd/              # Readers ported from upstream's BSD-2-Clause `formats-bsd`
+│   │                     # module (avi.rs, dicom.rs, ics.rs, jpeg.rs, ...). Always built.
+│   ├── misc.rs, misc4.rs            # Miscellaneous/stub readers (mixed BSD/GPL, gated per-item)
+│   ├── extended.rs                  # Extended format set (mixed BSD/GPL, gated per-item)
+│   └── flim2.rs                     # FLIM/flow cytometry (mixed BSD/GPL, gated per-item)
 ├── registry.rs         # ImageReader: format auto-detection (magic bytes → extension fallback)
 ├── writer_registry.rs  # ImageWriter: 14 format writers (extension-based)
 ├── wrappers.rs         # 5 reader wrappers (ChannelSep/Merge/Fill, DimSwap, MinMax)
@@ -95,10 +105,15 @@ src/
 
 ### Adding a Format
 
-1. Create a new module in `src/formats/` (or add to an existing category module)
+1. Check the reader's license in upstream Bio-Formats (`components/formats-bsd/` vs
+   `components/formats-gpl/` in `java-bioformats/`) and create the new module in
+   `src/formats/bsd/` or `src/formats/gpl/` accordingly (or add to an existing mixed
+   category module in `src/formats/` directly, gating the new GPL item with
+   `#[cfg(feature = "gpl")]` if the file also holds BSD readers).
 2. Implement `FormatReader` and/or `FormatWriter` from `common/`
-3. Register in `src/registry.rs` (`all_readers()` list) and/or `src/writer_registry.rs`
-4. Reader ordering in `all_readers()` matters: magic-byte detectors first, extension-only last
+3. Register in `src/reader_order.rs`/`src/registry.rs` and/or `src/writer_order.rs`; GPL
+   dispatch arms/blocks need `#[cfg(feature = "gpl")]` (see existing arms for the pattern)
+4. Reader ordering matters: magic-byte detectors first, extension-only last
 
 ### Key Design Decisions
 

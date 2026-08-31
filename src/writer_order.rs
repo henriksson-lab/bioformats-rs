@@ -36,33 +36,38 @@ fn java_writer_class_names() -> impl Iterator<Item = &'static str> {
 
 fn java_writer_for_class(class: &str) -> Option<Box<dyn FormatWriter>> {
     Some(match class {
-        "loci.formats.out.OMEXMLWriter" => Box::new(crate::formats::ome_xml::OmeXmlWriter::new()),
+        "loci.formats.out.OMEXMLWriter" => {
+            Box::new(crate::formats::bsd::ome_xml::OmeXmlWriter::new())
+        }
         "loci.formats.out.PyramidOMETiffWriter" => {
             Box::new(crate::tiff::PyramidOmeTiffWriter::new())
         }
         "loci.formats.out.OMETiffWriter" => return None,
         "loci.formats.out.TiffWriter" => Box::new(crate::tiff::TiffWriter::new()),
-        "loci.formats.out.JPEGWriter" => Box::new(crate::formats::jpeg::JpegWriter::new()),
+        "loci.formats.out.JPEGWriter" => Box::new(crate::formats::bsd::jpeg::JpegWriter::new()),
         "loci.formats.out.JPEG2000Writer" => Box::new(crate::formats::misc::Jpeg2000Writer::new()),
         "loci.formats.out.APNGWriter" => Box::new(crate::formats::extended::ApngWriter::new()),
-        "loci.formats.out.AVIWriter" => Box::new(crate::formats::avi::AviWriter::new()),
+        "loci.formats.out.AVIWriter" => Box::new(crate::formats::bsd::avi::AviWriter::new()),
         "loci.formats.out.QTWriter" => Box::new(crate::formats::misc::QtWriter::new()),
-        "loci.formats.out.EPSWriter" => Box::new(crate::formats::eps::EpsWriter::new()),
-        "loci.formats.out.ICSWriter" => Box::new(crate::formats::ics::IcsWriter::new()),
+        "loci.formats.out.EPSWriter" => Box::new(crate::formats::bsd::eps::EpsWriter::new()),
+        "loci.formats.out.ICSWriter" => Box::new(crate::formats::bsd::ics::IcsWriter::new()),
         "loci.formats.out.JavaWriter" => Box::new(crate::formats::java_writer::JavaWriter::new()),
         "loci.formats.out.V3DrawWriter" => Box::new(crate::formats::v3draw::V3DrawWriter::new()),
-        "loci.formats.out.DicomWriter" => Box::new(crate::formats::dicom::DicomWriter::new()),
-        "loci.formats.out.CellH5Writer" => Box::new(crate::formats::cellh5::CellH5Writer::new()),
+        "loci.formats.out.DicomWriter" => Box::new(crate::formats::bsd::dicom::DicomWriter::new()),
+        "loci.formats.out.CellH5Writer" => {
+            Box::new(crate::formats::bsd::cellh5::CellH5Writer::new())
+        }
         _ => return None,
     })
 }
 
 fn append_rust_extra_writers(writers: &mut Vec<Box<dyn FormatWriter>>) {
-    writers.push(Box::new(crate::formats::bmp::BmpWriter::new()));
+    writers.push(Box::new(crate::formats::bsd::bmp::BmpWriter::new()));
     writers.push(Box::new(crate::formats::raster::TgaWriter::new()));
     writers.push(Box::new(crate::formats::raster::PnmWriter::new()));
-    writers.push(Box::new(crate::formats::mrc::MrcWriter::new()));
-    writers.push(Box::new(crate::formats::fits::FitsWriter::new()));
-    writers.push(Box::new(crate::formats::nrrd::NrrdWriter::new()));
+    #[cfg(feature = "gpl")]
+    writers.push(Box::new(crate::formats::gpl::mrc::MrcWriter::new()));
+    writers.push(Box::new(crate::formats::bsd::fits::FitsWriter::new()));
+    writers.push(Box::new(crate::formats::bsd::nrrd::NrrdWriter::new()));
     writers.push(Box::new(crate::formats::metaimage::MetaImageWriter::new()));
 }

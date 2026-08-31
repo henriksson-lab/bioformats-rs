@@ -118,20 +118,20 @@ macro_rules! tiff_wrapper {
 ///
 /// Faithful port of `MetaxpressTiffReader`, which `extends CellWorxReader`. The
 /// HTD parsing and per-well/per-field series assembly are inherited from
-/// `CellWorxReader` (here: [`crate::formats::mias::CellWorxReader`], whose
+/// `CellWorxReader` (here: [`crate::formats::gpl::mias::CellWorxReader`], whose
 /// file-naming already mirrors `MetaxpressTiffReader.getTiffFiles`). MetaXpress
 /// adds only: the `.htd`/`.tif` suffix set, a no-op `parseWellLogFile`
 /// (CellWorx's per-well `scan.log` parsing is skipped), and the use of
 /// `MetamorphReader` rather than `DeltavisionReader` for pixel reads (both route
 /// through the shared TIFF engine here).
 pub struct MetaxpressTiffReader {
-    inner: crate::formats::mias::CellWorxReader,
+    inner: crate::formats::gpl::mias::CellWorxReader,
 }
 
 impl MetaxpressTiffReader {
     pub fn new() -> Self {
         MetaxpressTiffReader {
-            inner: crate::formats::mias::CellWorxReader::new(),
+            inner: crate::formats::gpl::mias::CellWorxReader::new(),
         }
     }
 
@@ -313,7 +313,7 @@ impl FormatReader for MetaxpressTiffReader {
                 // its last path segment (Java: base.substring(lastIndexOf(sep)+1)),
                 // then walk TimePoint/ZStep collecting that well's TIFFs.
                 let mut resolver =
-                    |row: usize, col: usize, dims: &crate::formats::mias::WellResolveDims| {
+                    |row: usize, col: usize, dims: &crate::formats::gpl::mias::WellResolveDims| {
                         let base = format!("{}{}", dims.plate, Self::well_name(row, col));
                         let file_base = Path::new(&base)
                             .file_name()

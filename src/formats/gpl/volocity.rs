@@ -2637,7 +2637,7 @@ mod tests {
 
     #[test]
     fn volocity_detects_bounded_native_metakit_stream() {
-        let bytes = include_bytes!("../metakit/tests/data/test.mk");
+        let bytes = include_bytes!("../../metakit/tests/data/test.mk");
         let reader = VolocityReader::new();
         assert!(reader.is_this_type_by_bytes(bytes));
 
@@ -3053,7 +3053,7 @@ mod tests {
     #[test]
     fn volocity_native_metakit_error_reports_table_shape() {
         let path = temp_dir("native.mvd2");
-        std::fs::write(&path, include_bytes!("../metakit/tests/data/test.mk")).unwrap();
+        std::fs::write(&path, include_bytes!("../../metakit/tests/data/test.mk")).unwrap();
 
         let err = VolocityReader::new().set_id(&path).unwrap_err();
         assert!(matches!(
@@ -3095,7 +3095,7 @@ mod tests {
         std::fs::create_dir_all(&stack_dir).unwrap();
         std::fs::write(stack_dir.join("1.aisf"), b"aisf").unwrap();
         let path = root.join("Library.mvd2");
-        std::fs::write(&path, include_bytes!("../metakit/tests/data/test.mk")).unwrap();
+        std::fs::write(&path, include_bytes!("../../metakit/tests/data/test.mk")).unwrap();
 
         let err = VolocityReader::new().set_id(&path).unwrap_err();
         assert!(matches!(
@@ -3140,7 +3140,7 @@ mod tests {
         assert!(!reader.is_this_type_by_name(&companion));
 
         let mvd2 = library.join("Library.mvd2");
-        std::fs::write(&mvd2, include_bytes!("../metakit/tests/data/test.mk")).unwrap();
+        std::fs::write(&mvd2, include_bytes!("../../metakit/tests/data/test.mk")).unwrap();
         assert!(reader.is_this_type_by_name(&mvd2));
         assert!(reader.is_this_type_by_name(&companion));
 
@@ -3171,7 +3171,7 @@ mod tests {
         let companion = data_dir.join("1.dat");
         std::fs::write(&companion, b"pixels").unwrap();
         let mvd2 = library.join("Library.mvd2");
-        std::fs::write(&mvd2, include_bytes!("../metakit/tests/data/test.mk")).unwrap();
+        std::fs::write(&mvd2, include_bytes!("../../metakit/tests/data/test.mk")).unwrap();
 
         let reader = VolocityReader::new();
         // Java isThisType walks three parents and requires

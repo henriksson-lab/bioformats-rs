@@ -1119,7 +1119,7 @@ fn add_cellworx_populated_planes(ome: &mut OmeMetadata, series: &[ImageMetadata]
 }
 
 fn cellworx_companion_ome_template(path: &Path) -> Option<OmeMetadata> {
-    let mut metamorph = crate::formats::metamorph::MetamorphReader::new();
+    let mut metamorph = crate::formats::gpl::metamorph::MetamorphReader::new();
     if metamorph.set_id(path).is_ok() {
         if let Some(ome) = metamorph.ome_metadata() {
             return Some(ome);

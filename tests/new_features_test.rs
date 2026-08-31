@@ -9,7 +9,7 @@
 //! - MinMaxCalculator wrapper
 //! - FileStitcher with synthetic sequence
 
-use bioformats::formats::ome_xml::OmeXmlWriter;
+use bioformats::formats::bsd::ome_xml::OmeXmlWriter;
 use bioformats::{
     BioFormatsError, ChannelSeparator, DimensionOrder, DimensionSwapper, FormatReader,
     FormatWriter, ImageMetadata, ImageReader, ImageWriter, MinMaxCalculator, PixelType,
@@ -103,7 +103,7 @@ fn pcx_reader_rejects_inverted_bounds() {
     let path = tmp("inverted_bounds.pcx");
     std::fs::write(&path, minimal_pcx_bytes(2, 0, 1, 1, 2)).unwrap();
 
-    let err = bioformats::formats::pcx::PcxReader::new()
+    let err = bioformats::formats::bsd::pcx::PcxReader::new()
         .set_id(&path)
         .expect_err("inverted PCX bounds must be rejected");
 
@@ -123,7 +123,7 @@ fn pcx_reader_accepts_bytes_per_line_equal_to_width() {
     let path = tmp("short_pcx_row.pcx");
     std::fs::write(&path, minimal_pcx_bytes(0, 0, 1, 1, 1)).unwrap();
 
-    let mut reader = bioformats::formats::pcx::PcxReader::new();
+    let mut reader = bioformats::formats::bsd::pcx::PcxReader::new();
     reader.set_id(&path).expect("1x1 PCX must read");
     let meta = reader.metadata();
     assert_eq!(meta.size_x, 1);
@@ -135,7 +135,7 @@ fn pcx_reader_rejects_out_of_bounds_region() {
     let path = tmp("pcx_oob_region.pcx");
     std::fs::write(&path, minimal_pcx_bytes(0, 0, 1, 1, 2)).unwrap();
 
-    let mut reader = bioformats::formats::pcx::PcxReader::new();
+    let mut reader = bioformats::formats::bsd::pcx::PcxReader::new();
     reader.set_id(&path).unwrap();
 
     assert!(reader.open_bytes_region(0, 1, 0, 2, 1).is_err());
@@ -230,7 +230,7 @@ fn avi_writer_rejects_unrepresentable_riff_sizes_before_creating_file() {
 
     let path = tmp("oversized_riff.avi");
     let _ = std::fs::remove_file(&path);
-    let mut writer = bioformats::formats::avi::AviWriter::new();
+    let mut writer = bioformats::formats::bsd::avi::AviWriter::new();
     writer.set_metadata(&meta).unwrap();
     writer.set_id(&path).unwrap();
     let err = writer
@@ -367,7 +367,7 @@ fn avi_reader_accepts_mjpg_compressed_stream_metadata() {
     let bytes = minimal_avi_bytes(b"MJPG", *b"MJPG", b"00dc", &[1, 2, 3, 4], 0, false);
     std::fs::write(&path, bytes).unwrap();
 
-    let mut reader = bioformats::formats::avi::AviReader::new();
+    let mut reader = bioformats::formats::bsd::avi::AviReader::new();
     reader
         .set_id(&path)
         .expect("MJPG AVI metadata should be accepted");
@@ -385,7 +385,7 @@ fn avi_reader_rejects_truncated_uncompressed_frame() {
     let bytes = minimal_avi_bytes(b"DIB ", [0, 0, 0, 0], b"00db", &[77], 0, false);
     std::fs::write(&path, bytes).unwrap();
 
-    let err = bioformats::formats::avi::AviReader::new()
+    let err = bioformats::formats::bsd::avi::AviReader::new()
         .set_id(&path)
         .expect_err("truncated uncompressed frame must be rejected");
 
@@ -401,7 +401,7 @@ fn avi_reader_rejects_out_of_bounds_region() {
     let bytes = minimal_avi_bytes(b"DIB ", [0, 0, 0, 0], b"00db", &[77, 0, 0, 0], 0, false);
     std::fs::write(&path, bytes).unwrap();
 
-    let mut reader = bioformats::formats::avi::AviReader::new();
+    let mut reader = bioformats::formats::bsd::avi::AviReader::new();
     reader.set_id(&path).unwrap();
 
     assert!(reader.open_bytes_region(0, 1, 0, 1, 1).is_err());

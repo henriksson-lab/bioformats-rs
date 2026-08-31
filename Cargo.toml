@@ -3,6 +3,12 @@ name = "bioformats"
 version = "0.1.10"
 edition = "2021"
 description = "Pure Rust translation of Bio-Formats — read/write scientific image formats"
+# Describes the default/full build (matches upstream Bio-Formats' own
+# GPL-2.0-or-later `formats-gpl` module, which this crate's `gpl` feature
+# mirrors and includes by default). Building with `--no-default-features` and
+# leaving `gpl` disabled excludes all GPL-derived reader code and yields a
+# BSD-2-Clause-only binary; see README.md for details. Cargo has no
+# per-feature license field, so that distinction can't be expressed here.
 license = "GPL-2.0-or-later"
 homepage = "https://www.openmicroscopy.org/bio-formats/"
 repository = "https://github.com/henriksson-lab/bioformats-rs"
@@ -97,12 +103,17 @@ needless_late_init = "allow"
 items_after_test_module = "allow"
 
 [features]
-default = ["jpegxr", "zarr", "tissuefaxs"]
+default = ["jpegxr", "zarr", "tissuefaxs", "gpl"]
 jpegxr = ["dep:jpegxr"]
 openslide = ["dep:openslide-pure-rs"]
 zarr = ["dep:zarrs"]
 # TissueFAXS (.aqproj/.tfcyto) reads SQLite project databases.
 tissuefaxs = ["dep:rusqlite"]
+# Readers ported from upstream Bio-Formats' GPL-2.0-or-later `formats-gpl`
+# module. Disabling this (via --no-default-features) excludes all GPL-derived
+# reader source from compilation, leaving only the BSD-2-Clause readers
+# ported from upstream's `formats-bsd` module. See README.md.
+gpl = []
 
 [[bin]]
 name = "bioformats-convert"

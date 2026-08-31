@@ -4,12 +4,16 @@
 //! TIFF is present on disk; the reader must expose the full well/channel grid
 //! parsed from the .HTD and read the one plane that exists. The test is skipped
 //! when the sample data is absent.
+//!
+//! CellWorxReader lives in `src/formats/gpl/`, so this test crate is empty
+//! in a BSD-only (`--no-default-features`) build.
+#![cfg(feature = "gpl")]
 
 use std::path::Path;
 
 use bioformats::common::metadata::MetadataValue;
 use bioformats::common::reader::FormatReader;
-use bioformats::formats::mias::CellWorxReader;
+use bioformats::formats::gpl::mias::CellWorxReader;
 
 const HTD: &str = "testdata/metaxpress/BSF018292-1A.HTD";
 const A01_W1: &str = "testdata/metaxpress/BSF018292-1A_A01_w1.TIF";

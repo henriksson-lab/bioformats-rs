@@ -1396,7 +1396,7 @@ impl FormatReader for Fv1000Reader {
     ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
         let meta = self.meta.as_ref().unwrap();
-        crate::formats::leica::crop_region(&full, meta, x, y, w, h)
+        crate::formats::gpl::leica::crop_region(&full, meta, x, y, w, h)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {

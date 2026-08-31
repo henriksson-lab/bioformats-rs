@@ -244,6 +244,7 @@ macro_rules! placeholder_reader {
 /// per-channel gains, each demosaiced sample is scaled by its channel gain. If
 /// the maker-note is absent, scaling is a no-op (identical to Java's
 /// `whiteBalance == null` case).
+#[cfg(feature = "gpl")]
 pub struct DngReader {
     inner: crate::tiff::TiffReader,
     /// CFA decode state, populated only for Bayer-CFA DNGs.
@@ -251,6 +252,7 @@ pub struct DngReader {
 }
 
 /// State for a Bayer-CFA DNG (raw mosaic that needs demosaicing).
+#[cfg(feature = "gpl")]
 struct DngCfa {
     path: PathBuf,
     meta: ImageMetadata,
@@ -276,6 +278,7 @@ struct DngCfa {
 /// masked to 16 bits) by the channel `index` gain when a 3-entry white-balance
 /// table is present; otherwise returns `val` unchanged. Java casts the product
 /// back to `short`, so we wrap to the low 16 bits identically.
+#[cfg(feature = "gpl")]
 fn adjust_for_white_balance(val: i16, index: usize, wb: &Option<[f64; 3]>) -> i16 {
     match wb {
         Some(w) if index < 3 => ((val as f64 * w[index]) as i64 as u16) as i16,
@@ -284,10 +287,13 @@ fn adjust_for_white_balance(val: i16, index: usize, wb: &Option<[f64; 3]>) -> i1
 }
 
 /// TIFF `PhotometricInterpretation` value for a colour-filter array.
+#[cfg(feature = "gpl")]
 const PHOTO_CFA_ARRAY: u16 = 32803;
 /// Java DNGReader.COLOR_MAP: Canon DNG CFA pattern tag, not TIFF palette tag 320.
+#[cfg(feature = "gpl")]
 const DNG_CFA_COLOR_MAP: u16 = 33422;
 
+#[cfg(feature = "gpl")]
 fn dng_cfa_color_map(ifd: &crate::tiff::ifd::Ifd) -> [i32; 4] {
     // Java default color map {1,0,2,1}; overridden by private COLOR_MAP tag
     // (33422) when all four entries are valid channel indices 0..=2.
@@ -304,6 +310,7 @@ fn dng_cfa_color_map(ifd: &crate::tiff::ifd::Ifd) -> [i32; 4] {
     color_map
 }
 
+#[cfg(feature = "gpl")]
 impl DngReader {
     const CANON_TAG: u16 = 34665;
     const TIFF_EPS_STANDARD: u16 = 37398;
@@ -340,7 +347,7 @@ impl DngReader {
     /// raw bit-packed strips, splits into a planar [R|G|B] short buffer, and
     /// interpolates into an interleaved RGB UINT16 plane.
     fn decode_cfa(cfa: &DngCfa) -> Result<Vec<u8>> {
-        use crate::formats::camera2::cfa as cfahelp;
+        use crate::formats::gpl::camera2::cfa as cfahelp;
 
         let file = std::fs::read(&cfa.path).map_err(BioFormatsError::Io)?;
         let size_x = cfa.meta.size_x as usize;
@@ -429,6 +436,7 @@ impl DngReader {
     }
 }
 
+#[cfg(feature = "gpl")]
 #[cfg(test)]
 mod dng_wb_tests {
     use super::{adjust_for_white_balance, dng_cfa_color_map, DngReader, DNG_CFA_COLOR_MAP};
@@ -562,12 +570,14 @@ mod dng_wb_tests {
     }
 }
 
+#[cfg(feature = "gpl")]
 impl Default for DngReader {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(feature = "gpl")]
 impl FormatReader for DngReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
         let ext = path
@@ -782,6 +792,7 @@ impl FormatReader for DngReader {
 // 2. Akoya/PerkinElmer Phenocycler QPTIFF
 // ---------------------------------------------------------------------------
 /// Akoya/PerkinElmer Phenocycler QPTIFF — TIFF-based (`.qptiff`).
+#[cfg(feature = "gpl")]
 pub struct VectraReader {
     inner: crate::tiff::TiffReader,
     meta: Option<ImageMetadata>,
@@ -791,6 +802,7 @@ pub struct VectraReader {
     flattened_resolutions: bool,
 }
 
+#[cfg(feature = "gpl")]
 impl VectraReader {
     pub fn new() -> Self {
         VectraReader {
@@ -970,14 +982,17 @@ impl VectraReader {
     }
 }
 
+#[cfg(feature = "gpl")]
 impl Default for VectraReader {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(feature = "gpl")]
 const QPTIFF_SOFTWARE_CHECK: &str = "PerkinElmer-QPI";
 
+#[cfg(feature = "gpl")]
 fn qptiff_pixel_type(ifd: &crate::tiff::ifd::Ifd) -> PixelType {
     let bps = ifd.bits_per_sample().first().copied().unwrap_or(8);
     let sample_format = ifd
@@ -997,6 +1012,7 @@ fn qptiff_pixel_type(ifd: &crate::tiff::ifd::Ifd) -> PixelType {
     }
 }
 
+#[cfg(feature = "gpl")]
 fn qptiff_physical_size(ifd: &crate::tiff::ifd::Ifd, tag: u16) -> Option<f64> {
     ifd.get(tag)
         .and_then(|value| value.as_vec_f64().first().copied())
@@ -1004,6 +1020,7 @@ fn qptiff_physical_size(ifd: &crate::tiff::ifd::Ifd, tag: u16) -> Option<f64> {
         .map(|value| 10_000.0 / value)
 }
 
+#[cfg(feature = "gpl")]
 fn qptiff_xml_text(xml: &str, tag: &str) -> Option<String> {
     let open = format!("<{tag}>");
     let close = format!("</{tag}>");
@@ -1013,12 +1030,14 @@ fn qptiff_xml_text(xml: &str, tag: &str) -> Option<String> {
     (!text.is_empty()).then(|| text.to_string())
 }
 
+#[cfg(feature = "gpl")]
 fn qptiff_channel_name(ifd: &crate::tiff::ifd::Ifd) -> Option<String> {
     ifd.get(crate::tiff::ifd::tag::IMAGE_DESCRIPTION)
         .and_then(|value| value.as_str())
         .and_then(|xml| qptiff_xml_text(xml, "Biomarker").or_else(|| qptiff_xml_text(xml, "Name")))
 }
 
+#[cfg(feature = "gpl")]
 #[cfg(test)]
 mod qptiff_tests {
     use super::*;
@@ -1217,6 +1236,7 @@ mod qptiff_tests {
     }
 }
 
+#[cfg(feature = "gpl")]
 fn qptiff_plane_ifds(
     core_index: usize,
     size_c: usize,
@@ -1245,6 +1265,7 @@ fn qptiff_plane_ifds(
     (idx < ifd_count).then_some(idx).into_iter().collect()
 }
 
+#[cfg(feature = "gpl")]
 fn qptiff_image_name(core_index: usize, pyramid_depth: usize, ifd_count: usize) -> String {
     if core_index < pyramid_depth {
         format!("resolution #{}", core_index + 1)
@@ -1257,6 +1278,7 @@ fn qptiff_image_name(core_index: usize, pyramid_depth: usize, ifd_count: usize) 
     }
 }
 
+#[cfg(feature = "gpl")]
 fn qptiff_ifd_value_summary(value: &crate::tiff::ifd::IfdValue) -> Option<MetadataValue> {
     use crate::tiff::ifd::IfdValue;
     match value {
@@ -1294,6 +1316,7 @@ fn qptiff_ifd_value_summary(value: &crate::tiff::ifd::IfdValue) -> Option<Metada
     }
 }
 
+#[cfg(feature = "gpl")]
 fn qptiff_tag_name(tag: u16) -> Option<&'static str> {
     match tag {
         270 => Some("ImageDescription"),
@@ -1309,6 +1332,7 @@ fn qptiff_tag_name(tag: u16) -> Option<&'static str> {
     }
 }
 
+#[cfg(feature = "gpl")]
 fn qptiff_insert_description_metadata(
     metadata: &mut HashMap<String, MetadataValue>,
     ifd_index: usize,
@@ -1357,6 +1381,7 @@ fn qptiff_insert_description_metadata(
     qptiff_insert_vendor_json_metadata(metadata, ifd_index, description);
 }
 
+#[cfg(feature = "gpl")]
 fn qptiff_metadata_key_segment(raw: &str) -> String {
     let key = raw
         .chars()
@@ -1375,6 +1400,7 @@ fn qptiff_metadata_key_segment(raw: &str) -> String {
     }
 }
 
+#[cfg(feature = "gpl")]
 fn qptiff_insert_vendor_json_metadata(
     metadata: &mut HashMap<String, MetadataValue>,
     ifd_index: usize,
@@ -1417,6 +1443,7 @@ fn qptiff_insert_vendor_json_metadata(
     }
 }
 
+#[cfg(feature = "gpl")]
 fn qptiff_insert_vendor_json_graph_metadata(
     metadata: &mut HashMap<String, MetadataValue>,
     ifd_index: usize,
@@ -1434,6 +1461,7 @@ fn qptiff_insert_vendor_json_graph_metadata(
     node_count
 }
 
+#[cfg(feature = "gpl")]
 fn qptiff_walk_vendor_json_graph(
     metadata: &mut HashMap<String, MetadataValue>,
     ifd_index: usize,
@@ -1526,6 +1554,7 @@ fn qptiff_walk_vendor_json_graph(
     }
 }
 
+#[cfg(feature = "gpl")]
 fn qptiff_vendor_json_graph_path(path: &[String]) -> String {
     if path.is_empty() {
         "$".into()
@@ -1534,6 +1563,7 @@ fn qptiff_vendor_json_graph_path(path: &[String]) -> String {
     }
 }
 
+#[cfg(feature = "gpl")]
 fn qptiff_insert_vendor_json_semantic_scalar(
     metadata: &mut HashMap<String, MetadataValue>,
     ifd_index: usize,
@@ -1587,6 +1617,7 @@ fn qptiff_insert_vendor_json_semantic_scalar(
     }
 }
 
+#[cfg(feature = "gpl")]
 fn qptiff_flatten_vendor_json_value(
     metadata: &mut HashMap<String, MetadataValue>,
     ifd_index: usize,
@@ -1676,6 +1707,7 @@ fn qptiff_flatten_vendor_json_value(
     }
 }
 
+#[cfg(feature = "gpl")]
 fn qptiff_enrich_metadata(
     inner: &crate::tiff::TiffReader,
     meta: &mut ImageMetadata,
@@ -1727,6 +1759,7 @@ fn qptiff_enrich_metadata(
     }
 }
 
+#[cfg(feature = "gpl")]
 impl FormatReader for VectraReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
         let ext = path
@@ -1943,10 +1976,14 @@ impl FormatReader for VectraReader {
 /// squared and multiplied by the `MD_SCALE_PIXEL` (33446) rational scale, and
 /// the pixel type becomes 32-bit float. Image count equals the number of IFDs
 /// and is reported as the T dimension.
+#[cfg(feature = "gpl")]
 const MD_FILETAG: u16 = 33445;
+#[cfg(feature = "gpl")]
 const MD_SCALE_PIXEL: u16 = 33446;
+#[cfg(feature = "gpl")]
 const GEL_SQUARE_ROOT: u64 = 2;
 
+#[cfg(feature = "gpl")]
 pub struct GelReader {
     inner: crate::tiff::TiffReader,
     meta: Option<ImageMetadata>,
@@ -1960,6 +1997,7 @@ pub struct GelReader {
     plane_scales: Vec<f64>,
 }
 
+#[cfg(feature = "gpl")]
 impl GelReader {
     pub fn new() -> Self {
         GelReader {
@@ -1973,6 +2011,7 @@ impl GelReader {
     }
 }
 
+#[cfg(feature = "gpl")]
 fn gel_scale_from_ifd(ifd: &crate::tiff::ifd::Ifd) -> f64 {
     ifd.get(MD_SCALE_PIXEL)
         .and_then(|v| match v {
@@ -1989,12 +2028,14 @@ fn gel_scale_from_ifd(ifd: &crate::tiff::ifd::Ifd) -> f64 {
         .unwrap_or(1.0)
 }
 
+#[cfg(feature = "gpl")]
 impl Default for GelReader {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(feature = "gpl")]
 impl FormatReader for GelReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
         let ext = path
@@ -2210,21 +2251,31 @@ impl FormatReader for GelReader {
 // 4. Imspector OBF STED microscopy
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "gpl")]
 const IMSPECTOR_FILE_MAGIC: &[u8; 8] = b"OMAS_BF\n";
+#[cfg(feature = "gpl")]
 const IMSPECTOR_SYNTHETIC_STACK_MAGIC: &[u8; 14] = b"OMAS_BF_STACK\n";
+#[cfg(feature = "gpl")]
 const IMSPECTOR_MSR_MAGIC: &[u8; 10] = b"CDataStack";
+#[cfg(feature = "gpl")]
 const IMSPECTOR_MAGIC_NUMBER: u16 = 0xffff;
+#[cfg(feature = "gpl")]
 const IMSPECTOR_MAX_DIMS: usize = 15;
+#[cfg(feature = "gpl")]
 const IMSPECTOR_MIN_HEADER_LEN: usize = 14;
+#[cfg(feature = "gpl")]
 const IMSPECTOR_STACK_OFFSET_POS: usize = IMSPECTOR_MIN_HEADER_LEN;
+#[cfg(feature = "gpl")]
 const IMSPECTOR_SYNTHETIC_STACK_HEADER_LEN: usize = IMSPECTOR_SYNTHETIC_STACK_MAGIC.len() + 44;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(feature = "gpl")]
 struct ImspectorHeader {
     version: i32,
 }
 
 #[derive(Debug, Clone)]
+#[cfg(feature = "gpl")]
 struct ImspectorStack {
     meta: ImageMetadata,
     payload_offset: usize,
@@ -2234,11 +2285,13 @@ struct ImspectorStack {
 }
 
 #[derive(Clone, Debug)]
+#[cfg(feature = "gpl")]
 struct ImspectorMsrBlock {
     payload_offset: usize,
     planes: u32,
 }
 
+#[cfg(feature = "gpl")]
 fn parse_imspector_header(bytes: &[u8]) -> Result<ImspectorHeader> {
     if bytes.len() < IMSPECTOR_MIN_HEADER_LEN {
         return Err(BioFormatsError::Format(
@@ -2267,6 +2320,7 @@ fn parse_imspector_header(bytes: &[u8]) -> Result<ImspectorHeader> {
     Ok(ImspectorHeader { version })
 }
 
+#[cfg(feature = "gpl")]
 fn imspector_is_java_msr(bytes: &[u8]) -> bool {
     bytes.get(..bytes.len().min(32)).is_some_and(|header| {
         header
@@ -2276,6 +2330,7 @@ fn imspector_is_java_msr(bytes: &[u8]) -> bool {
 }
 
 #[allow(dead_code)]
+#[cfg(feature = "gpl")]
 fn imspector_pixel_type(type_code: i32) -> Result<PixelType> {
     match type_code {
         0x01 => Ok(PixelType::Uint8),
@@ -2293,6 +2348,7 @@ fn imspector_pixel_type(type_code: i32) -> Result<PixelType> {
 }
 
 #[allow(dead_code)]
+#[cfg(feature = "gpl")]
 fn imspector_bits_per_pixel(type_code: i32) -> Result<u8> {
     Ok(match type_code {
         0x01 | 0x02 => 8,
@@ -2308,6 +2364,7 @@ fn imspector_bits_per_pixel(type_code: i32) -> Result<u8> {
 }
 
 #[allow(dead_code)]
+#[cfg(feature = "gpl")]
 fn imspector_stack_length(length: i64) -> Result<u64> {
     if length >= 0 {
         Ok(length as u64)
@@ -2319,6 +2376,7 @@ fn imspector_stack_length(length: i64) -> Result<u64> {
 }
 
 #[allow(dead_code)]
+#[cfg(feature = "gpl")]
 fn imspector_compression_flag(compression: i32) -> Result<bool> {
     match compression {
         0 => Ok(false),
@@ -2329,6 +2387,7 @@ fn imspector_compression_flag(compression: i32) -> Result<bool> {
     }
 }
 
+#[cfg(feature = "gpl")]
 fn imspector_read_len_string(bytes: &[u8], offset: &mut usize) -> Result<String> {
     if bytes.len().saturating_sub(*offset) < 4 {
         return Err(BioFormatsError::Format(
@@ -2364,6 +2423,7 @@ fn imspector_read_len_string(bytes: &[u8], offset: &mut usize) -> Result<String>
 /// and `Description` are stored as plain byte runs whose length is given by a
 /// separate header field). Mirrors `RandomAccessInputStream.readString(length)`;
 /// decoded lossily because descriptions can carry non-UTF-8 bytes.
+#[cfg(feature = "gpl")]
 fn imspector_read_fixed_string(
     bytes: &[u8],
     offset: usize,
@@ -2382,6 +2442,7 @@ fn imspector_read_fixed_string(
     Ok(String::from_utf8_lossy(&bytes[offset..offset + len]).into_owned())
 }
 
+#[cfg(feature = "gpl")]
 fn imspector_read_i32(bytes: &[u8], offset: &mut usize, field: &str) -> Result<i32> {
     if bytes.len().saturating_sub(*offset) < 4 {
         return Err(BioFormatsError::Format(format!(
@@ -2398,6 +2459,7 @@ fn imspector_read_i32(bytes: &[u8], offset: &mut usize, field: &str) -> Result<i
     Ok(value)
 }
 
+#[cfg(feature = "gpl")]
 fn imspector_read_i64(bytes: &[u8], offset: &mut usize, field: &str) -> Result<i64> {
     if bytes.len().saturating_sub(*offset) < 8 {
         return Err(BioFormatsError::Format(format!(
@@ -2418,6 +2480,7 @@ fn imspector_read_i64(bytes: &[u8], offset: &mut usize, field: &str) -> Result<i
     Ok(value)
 }
 
+#[cfg(feature = "gpl")]
 fn imspector_read_f64(bytes: &[u8], offset: &mut usize, field: &str) -> Result<f64> {
     if bytes.len().saturating_sub(*offset) < 8 {
         return Err(BioFormatsError::Format(format!(
@@ -2438,6 +2501,7 @@ fn imspector_read_f64(bytes: &[u8], offset: &mut usize, field: &str) -> Result<f
     Ok(value)
 }
 
+#[cfg(feature = "gpl")]
 fn imspector_positive_dim(value: i32, field: &str) -> Result<u32> {
     u32::try_from(value)
         .map_err(|_| {
@@ -2456,6 +2520,7 @@ fn imspector_positive_dim(value: i32, field: &str) -> Result<u32> {
         })
 }
 
+#[cfg(feature = "gpl")]
 fn imspector_checked_plane_len(width: u32, height: u32, bytes_per_sample: usize) -> Result<usize> {
     (width as usize)
         .checked_mul(height as usize)
@@ -2463,6 +2528,7 @@ fn imspector_checked_plane_len(width: u32, height: u32, bytes_per_sample: usize)
         .ok_or_else(|| BioFormatsError::Format("Imspector OBF/MSR plane size overflows".into()))
 }
 
+#[cfg(feature = "gpl")]
 fn imspector_stack_offset(bytes: &[u8]) -> Result<Option<usize>> {
     if bytes.len() < IMSPECTOR_STACK_OFFSET_POS + 8 {
         return Ok(None);
@@ -2485,6 +2551,7 @@ fn imspector_stack_offset(bytes: &[u8]) -> Result<Option<usize>> {
     })
 }
 
+#[cfg(feature = "gpl")]
 fn imspector_skip_len_bytes(bytes: &[u8], offset: &mut usize, len: i32, field: &str) -> Result<()> {
     let len = len.max(0) as usize;
     if bytes.len().saturating_sub(*offset) < len {
@@ -2496,6 +2563,7 @@ fn imspector_skip_len_bytes(bytes: &[u8], offset: &mut usize, len: i32, field: &
     Ok(())
 }
 
+#[cfg(feature = "gpl")]
 fn imspector_hex_preview(bytes: &[u8], limit: usize) -> String {
     bytes
         .iter()
@@ -2505,6 +2573,7 @@ fn imspector_hex_preview(bytes: &[u8], limit: usize) -> String {
         .join(" ")
 }
 
+#[cfg(feature = "gpl")]
 fn imspector_ascii_preview(bytes: &[u8], limit: usize) -> String {
     bytes
         .iter()
@@ -2529,6 +2598,7 @@ fn imspector_ascii_preview(bytes: &[u8], limit: usize) -> String {
 ///
 /// Returns the extracted `(key, value)` pairs (empty when the string did not
 /// parse as XML, in which case the caller stores the raw `Description`).
+#[cfg(feature = "gpl")]
 fn imspector_parse_description(description: &str) -> Vec<(String, String)> {
     use quick_xml::events::Event;
 
@@ -2599,6 +2669,7 @@ fn imspector_parse_description(description: &str) -> Vec<(String, String)> {
     pairs
 }
 
+#[cfg(feature = "gpl")]
 fn imspector_msr_read_u8(bytes: &[u8], offset: &mut usize, field: &str) -> Result<u8> {
     if bytes.len().saturating_sub(*offset) < 1 {
         return Err(BioFormatsError::Format(format!(
@@ -2610,6 +2681,7 @@ fn imspector_msr_read_u8(bytes: &[u8], offset: &mut usize, field: &str) -> Resul
     Ok(value)
 }
 
+#[cfg(feature = "gpl")]
 fn imspector_msr_read_u16(bytes: &[u8], offset: &mut usize, field: &str) -> Result<u16> {
     if bytes.len().saturating_sub(*offset) < 2 {
         return Err(BioFormatsError::Format(format!(
@@ -2621,6 +2693,7 @@ fn imspector_msr_read_u16(bytes: &[u8], offset: &mut usize, field: &str) -> Resu
     Ok(value)
 }
 
+#[cfg(feature = "gpl")]
 fn imspector_msr_read_i32(bytes: &[u8], offset: &mut usize, field: &str) -> Result<i32> {
     if bytes.len().saturating_sub(*offset) < 4 {
         return Err(BioFormatsError::Format(format!(
@@ -2637,6 +2710,7 @@ fn imspector_msr_read_i32(bytes: &[u8], offset: &mut usize, field: &str) -> Resu
     Ok(value)
 }
 
+#[cfg(feature = "gpl")]
 fn imspector_msr_read_string(
     bytes: &[u8],
     offset: &mut usize,
@@ -2653,6 +2727,7 @@ fn imspector_msr_read_string(
     Ok(value)
 }
 
+#[cfg(feature = "gpl")]
 fn imspector_msr_skip(bytes: &[u8], offset: &mut usize, len: usize, field: &str) -> Result<()> {
     if bytes.len().saturating_sub(*offset) < len {
         return Err(BioFormatsError::Format(format!(
@@ -2663,6 +2738,7 @@ fn imspector_msr_skip(bytes: &[u8], offset: &mut usize, len: usize, field: &str)
     Ok(())
 }
 
+#[cfg(feature = "gpl")]
 fn imspector_msr_skip_tags(bytes: &[u8], offset: &mut usize, count: i32) -> Result<()> {
     let mut seen = 0i32;
     while seen < count {
@@ -2676,6 +2752,7 @@ fn imspector_msr_skip_tags(bytes: &[u8], offset: &mut usize, count: i32) -> Resu
     Ok(())
 }
 
+#[cfg(feature = "gpl")]
 fn imspector_msr_skip_tag_block(bytes: &[u8], offset: &mut usize) -> Result<usize> {
     imspector_msr_skip(bytes, offset, 1, "tag block marker")?;
     let len = imspector_msr_read_u16(bytes, offset, "tag block length")? as usize;
@@ -2683,6 +2760,7 @@ fn imspector_msr_skip_tag_block(bytes: &[u8], offset: &mut usize) -> Result<usiz
     Ok(len)
 }
 
+#[cfg(feature = "gpl")]
 fn imspector_msr_read_stack_header(bytes: &[u8], offset: &mut usize) -> Result<()> {
     let mut count = imspector_msr_read_i32(bytes, offset, "stack tag count")?;
     if count > 0xffff {
@@ -2701,6 +2779,7 @@ fn imspector_msr_read_stack_header(bytes: &[u8], offset: &mut usize) -> Result<(
     Ok(())
 }
 
+#[cfg(feature = "gpl")]
 fn imspector_msr_parse_pmt_block(
     bytes: &[u8],
     offset: &mut usize,
@@ -2783,6 +2862,7 @@ fn imspector_msr_parse_pmt_block(
     Ok(())
 }
 
+#[cfg(feature = "gpl")]
 fn imspector_msr_scan_blocks(
     bytes: &[u8],
     mut offset: usize,
@@ -2854,6 +2934,7 @@ fn imspector_msr_scan_blocks(
     Ok(())
 }
 
+#[cfg(feature = "gpl")]
 fn imspector_msr_java_integer_metadata_equals(
     bytes: &[u8],
     start: usize,
@@ -2888,6 +2969,7 @@ fn imspector_msr_java_integer_metadata_equals(
     false
 }
 
+#[cfg(feature = "gpl")]
 fn imspector_msr_tile_count(metadata: &str) -> u32 {
     let mut tile_x = 1u32;
     let mut tile_y = 1u32;
@@ -2910,6 +2992,7 @@ fn imspector_msr_tile_count(metadata: &str) -> u32 {
     tile_x.saturating_mul(tile_y)
 }
 
+#[cfg(feature = "gpl")]
 fn imspector_msr_logical_plane_index(
     no: u32,
     size_z: u32,
@@ -2923,6 +3006,7 @@ fn imspector_msr_logical_plane_index(
     (z, c, t)
 }
 
+#[cfg(feature = "gpl")]
 fn parse_imspector_msr_stack(bytes: &[u8]) -> Result<Option<Vec<ImspectorStack>>> {
     if !imspector_is_java_msr(bytes) {
         return Ok(None);
@@ -3229,6 +3313,7 @@ fn parse_imspector_msr_stack(bytes: &[u8]) -> Result<Option<Vec<ImspectorStack>>
     Ok(Some(stacks))
 }
 
+#[cfg(feature = "gpl")]
 fn parse_imspector_native_stack(
     bytes: &[u8],
     stack_offset: usize,
@@ -3913,6 +3998,7 @@ fn parse_imspector_native_stack(
     )))
 }
 
+#[cfg(feature = "gpl")]
 fn parse_imspector_synthetic_stack(bytes: &[u8]) -> Result<Option<ImspectorStack>> {
     let Some(stack_offset) = imspector_stack_offset(bytes)? else {
         return Ok(None);
@@ -4037,6 +4123,7 @@ fn parse_imspector_synthetic_stack(bytes: &[u8]) -> Result<Option<ImspectorStack
 /// Header parsing is translated from Bio-Formats' `OBFReader`. Only a strict,
 /// raw subset with an explicit stack marker is decoded; unknown
 /// stack layouts are still intentionally rejected instead of guessed.
+#[cfg(feature = "gpl")]
 pub struct ImspectorReader {
     path: Option<PathBuf>,
     bytes: Vec<u8>,
@@ -4044,6 +4131,7 @@ pub struct ImspectorReader {
     current_series: usize,
 }
 
+#[cfg(feature = "gpl")]
 impl ImspectorReader {
     pub fn new() -> Self {
         ImspectorReader {
@@ -4055,12 +4143,14 @@ impl ImspectorReader {
     }
 }
 
+#[cfg(feature = "gpl")]
 impl Default for ImspectorReader {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(feature = "gpl")]
 impl FormatReader for ImspectorReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
         let ext = path
@@ -4319,6 +4409,7 @@ impl FormatReader for ImspectorReader {
     }
 }
 
+#[cfg(feature = "gpl")]
 #[cfg(test)]
 mod imspector_tests {
     use super::{
@@ -5810,8 +5901,10 @@ mod imspector_tests {
 // 5. Hamamatsu VMS whole-slide
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "gpl")]
 const HAMAMATSU_VMS_MAX_SIZE: u32 = 2048;
 
+#[cfg(feature = "gpl")]
 fn hamamatsu_vms_normalize_key(key: &str) -> String {
     key.trim()
         .chars()
@@ -5820,6 +5913,7 @@ fn hamamatsu_vms_normalize_key(key: &str) -> String {
         .collect()
 }
 
+#[cfg(feature = "gpl")]
 fn hamamatsu_vms_parse_index(bytes: &[u8]) -> Result<HashMap<String, String>> {
     let text = std::str::from_utf8(bytes).map_err(|_| {
         BioFormatsError::Format("Not a Hamamatsu VMS/VMU text index file".to_string())
@@ -5873,6 +5967,7 @@ fn hamamatsu_vms_parse_index(bytes: &[u8]) -> Result<HashMap<String, String>> {
     }
 }
 
+#[cfg(feature = "gpl")]
 fn hamamatsu_vms_required_u32(values: &HashMap<String, String>, key: &str) -> Result<u32> {
     values
         .get(key)
@@ -5881,6 +5976,7 @@ fn hamamatsu_vms_required_u32(values: &HashMap<String, String>, key: &str) -> Re
         .map_err(|_| BioFormatsError::UnsupportedFormat(format!("Hamamatsu VMS invalid {key}")))
 }
 
+#[cfg(feature = "gpl")]
 fn hamamatsu_vms_optional_u32(
     values: &HashMap<String, String>,
     keys: &[String],
@@ -5895,6 +5991,7 @@ fn hamamatsu_vms_optional_u32(
     Ok(None)
 }
 
+#[cfg(feature = "gpl")]
 fn hamamatsu_vms_tile_key(col: u32, row: u32) -> String {
     if col == 0 && row == 0 {
         "imagefile".to_string()
@@ -5903,12 +6000,14 @@ fn hamamatsu_vms_tile_key(col: u32, row: u32) -> String {
     }
 }
 
+#[cfg(feature = "gpl")]
 fn hamamatsu_vms_push_key(keys: &mut Vec<String>, key: String) {
     if !keys.contains(&key) {
         keys.push(key);
     }
 }
 
+#[cfg(feature = "gpl")]
 fn hamamatsu_vms_clean_path(value: &str) -> &str {
     let trimmed = value.trim();
     trimmed
@@ -5923,6 +6022,7 @@ fn hamamatsu_vms_clean_path(value: &str) -> &str {
         .trim()
 }
 
+#[cfg(feature = "gpl")]
 fn hamamatsu_vms_resolve_sidecar_path(parent: &Path, value: &str) -> PathBuf {
     let cleaned = hamamatsu_vms_clean_path(value);
     if cleaned.is_empty() {
@@ -5970,6 +6070,7 @@ fn hamamatsu_vms_resolve_sidecar_path(parent: &Path, value: &str) -> PathBuf {
     joined
 }
 
+#[cfg(feature = "gpl")]
 fn hamamatsu_vms_tile_key_candidates(
     prefix: &str,
     layer: u32,
@@ -6021,6 +6122,7 @@ fn hamamatsu_vms_tile_key_candidates(
     keys
 }
 
+#[cfg(feature = "gpl")]
 fn hamamatsu_vms_tile_value(
     values: &HashMap<String, String>,
     layer: u32,
@@ -6038,6 +6140,7 @@ fn hamamatsu_vms_tile_value(
     None
 }
 
+#[cfg(feature = "gpl")]
 fn hamamatsu_vms_pyramid_key(level: u32, name: &str) -> Vec<String> {
     [
         format!("pyramidlevel{level}{name}"),
@@ -6057,6 +6160,7 @@ fn hamamatsu_vms_pyramid_key(level: u32, name: &str) -> Vec<String> {
     .collect()
 }
 
+#[cfg(feature = "gpl")]
 fn hamamatsu_vms_pyramid_tile_value(
     values: &HashMap<String, String>,
     level: u32,
@@ -6079,6 +6183,7 @@ fn hamamatsu_vms_pyramid_tile_value(
 }
 
 #[derive(Default)]
+#[cfg(feature = "gpl")]
 struct HamamatsuVmsJpegMarkerMetadata {
     sof_marker: Option<u8>,
     precision: Option<u8>,
@@ -6095,6 +6200,7 @@ struct HamamatsuVmsJpegMarkerMetadata {
     icc_profile: Option<Vec<u8>>,
 }
 
+#[cfg(feature = "gpl")]
 impl HamamatsuVmsJpegMarkerMetadata {
     fn color_model(&self) -> &'static str {
         match (self.components, self.adobe_transform) {
@@ -6183,6 +6289,7 @@ impl HamamatsuVmsJpegMarkerMetadata {
     }
 }
 
+#[cfg(feature = "gpl")]
 fn hamamatsu_vms_read_marker_byte(file: &mut File) -> Result<Option<u8>> {
     let mut byte = [0u8; 1];
     loop {
@@ -6204,6 +6311,7 @@ fn hamamatsu_vms_read_marker_byte(file: &mut File) -> Result<Option<u8>> {
     }
 }
 
+#[cfg(feature = "gpl")]
 fn hamamatsu_vms_parse_jpeg_marker_metadata(path: &Path) -> Result<HamamatsuVmsJpegMarkerMetadata> {
     let mut file = File::open(path).map_err(BioFormatsError::Io)?;
     let mut soi = [0u8; 2];
@@ -6319,6 +6427,7 @@ fn hamamatsu_vms_parse_jpeg_marker_metadata(path: &Path) -> Result<HamamatsuVmsJ
     Ok(meta)
 }
 
+#[cfg(feature = "gpl")]
 fn hamamatsu_vms_insert_jpeg_metadata(
     metadata: &mut HashMap<String, MetadataValue>,
     prefix: &str,
@@ -6444,6 +6553,7 @@ fn hamamatsu_vms_insert_jpeg_metadata(
     Ok(())
 }
 
+#[cfg(feature = "gpl")]
 fn hamamatsu_vms_insert_capability_diagnostics(
     metadata: &mut HashMap<String, MetadataValue>,
     pixel_prefix: &str,
@@ -6481,6 +6591,7 @@ fn hamamatsu_vms_insert_capability_diagnostics(
     );
 }
 
+#[cfg(feature = "gpl")]
 fn hamamatsu_vms_parse_optional_index(path: &Path) -> Result<HashMap<String, String>> {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
@@ -6513,6 +6624,7 @@ fn hamamatsu_vms_parse_optional_index(path: &Path) -> Result<HashMap<String, Str
     Ok(values)
 }
 
+#[cfg(feature = "gpl")]
 fn hamamatsu_vms_decode_jpeg(path: &Path, scale_denom: u32) -> Result<(u32, u32, Vec<u8>)> {
     let file = File::open(path).map_err(BioFormatsError::Io)?;
     let mut decoder = jpeg_decoder::Decoder::new(file);
@@ -6573,6 +6685,7 @@ fn hamamatsu_vms_decode_jpeg(path: &Path, scale_denom: u32) -> Result<(u32, u32,
     Ok((info.width as u32, info.height as u32, rgb))
 }
 
+#[cfg(feature = "gpl")]
 fn hamamatsu_vms_unsupported_jpeg_pixel_format_error(
     pixel_format: jpeg_decoder::PixelFormat,
     path: &Path,
@@ -6585,6 +6698,7 @@ fn hamamatsu_vms_unsupported_jpeg_pixel_format_error(
     ))
 }
 
+#[cfg(feature = "gpl")]
 struct HamamatsuVmsDecodedJpegBand {
     width: u32,
     height: u32,
@@ -6593,6 +6707,7 @@ struct HamamatsuVmsDecodedJpegBand {
     rgb: Vec<u8>,
 }
 
+#[cfg(feature = "gpl")]
 fn hamamatsu_vms_decode_jpeg_rows(
     path: &Path,
     scale_denom: u32,
@@ -6633,6 +6748,7 @@ fn hamamatsu_vms_decode_jpeg_rows(
     })
 }
 
+#[cfg(feature = "gpl")]
 fn hamamatsu_vms_jpeg_pixels_to_rgb(
     data: Vec<u8>,
     width: u32,
@@ -6669,6 +6785,7 @@ fn hamamatsu_vms_jpeg_pixels_to_rgb(
     }
 }
 
+#[cfg(feature = "gpl")]
 fn hamamatsu_vms_cmyk_to_rgb(data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(data.len() / 4 * 3);
     for pixel in data.as_chunks::<4>().0 {
@@ -6683,6 +6800,7 @@ fn hamamatsu_vms_cmyk_to_rgb(data: &[u8]) -> Vec<u8> {
     out
 }
 
+#[cfg(feature = "gpl")]
 fn hamamatsu_vms_jpeg_dimensions(path: &Path) -> Result<(u32, u32)> {
     let file = File::open(path).map_err(BioFormatsError::Io)?;
     let mut decoder = jpeg_decoder::Decoder::new(file);
@@ -6698,6 +6816,7 @@ fn hamamatsu_vms_jpeg_dimensions(path: &Path) -> Result<(u32, u32)> {
     Ok((info.width as u32, info.height as u32))
 }
 
+#[cfg(feature = "gpl")]
 fn hamamatsu_vms_jpeg_dimensions_from_decode(path: &Path) -> Result<(u32, u32)> {
     let file = File::open(path).map_err(BioFormatsError::Io)?;
     let mut decoder = jpeg_decoder::Decoder::new(file);
@@ -6717,6 +6836,7 @@ fn hamamatsu_vms_jpeg_dimensions_from_decode(path: &Path) -> Result<(u32, u32)> 
 }
 
 #[derive(Clone)]
+#[cfg(feature = "gpl")]
 struct HamamatsuVmsTile {
     path: PathBuf,
     x: u32,
@@ -6726,16 +6846,19 @@ struct HamamatsuVmsTile {
     scale_denom: u32,
 }
 
+#[cfg(feature = "gpl")]
 enum HamamatsuVmsPixels {
     TilePyramid(Vec<Vec<Vec<HamamatsuVmsTile>>>),
     Jpeg(PathBuf),
 }
 
+#[cfg(feature = "gpl")]
 struct HamamatsuVmsSeries {
     metadata: Vec<ImageMetadata>,
     pixels: HamamatsuVmsPixels,
 }
 
+#[cfg(feature = "gpl")]
 fn hamamatsu_vms_build_tile_layers<F>(
     values: &HashMap<String, String>,
     parent: &Path,
@@ -6827,6 +6950,7 @@ where
     Ok((layer_tiles, full_size_x, full_size_y))
 }
 
+#[cfg(feature = "gpl")]
 fn hamamatsu_vms_scaled_tile_layers(
     source_layers: &[Vec<HamamatsuVmsTile>],
     scale_denom: u32,
@@ -6882,6 +7006,7 @@ fn hamamatsu_vms_scaled_tile_layers(
 ///
 /// The text index names a grid of native JPEG tile files. Pixel dimensions are
 /// read from the tile JPEG headers because the index only stores physical sizes.
+#[cfg(feature = "gpl")]
 pub struct HamamatsuVmsReader {
     path: Option<PathBuf>,
     series: Vec<HamamatsuVmsSeries>,
@@ -6890,6 +7015,7 @@ pub struct HamamatsuVmsReader {
     metadata_level: MetadataLevel,
 }
 
+#[cfg(feature = "gpl")]
 impl HamamatsuVmsReader {
     pub fn new() -> Self {
         HamamatsuVmsReader {
@@ -6902,12 +7028,14 @@ impl HamamatsuVmsReader {
     }
 }
 
+#[cfg(feature = "gpl")]
 impl Default for HamamatsuVmsReader {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(feature = "gpl")]
 impl FormatReader for HamamatsuVmsReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
         let ext = path
@@ -7537,6 +7665,7 @@ impl FormatReader for HamamatsuVmsReader {
     }
 }
 
+#[cfg(feature = "gpl")]
 #[cfg(test)]
 mod hamamatsu_vms_tests {
     use super::HamamatsuVmsReader;
@@ -8786,6 +8915,7 @@ mod hamamatsu_vms_tests {
 /// is a DIB-style bitmap: at offset 4 the 32-bit width and height (LE), then
 /// 16-bit plane count and bit depth, a 32-bit compression code, and pixel data
 /// starting at offset 52. A `.dib` file is the same layout but not compressed.
+#[cfg(feature = "gpl")]
 pub struct CellomicsReader {
     path: Option<PathBuf>,
     metas: Vec<ImageMetadata>,
@@ -8797,6 +8927,7 @@ pub struct CellomicsReader {
     series_planes: Vec<Vec<CellomicsPlaneSource>>,
 }
 
+#[cfg(feature = "gpl")]
 impl CellomicsReader {
     pub fn new() -> Self {
         CellomicsReader {
@@ -8811,12 +8942,14 @@ impl CellomicsReader {
     }
 }
 
+#[cfg(feature = "gpl")]
 impl Default for CellomicsReader {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(feature = "gpl")]
 fn parse_legacy_cellomics_header(data: &[u8]) -> Result<(u32, u32, u32, PixelType, u8, u64)> {
     let w = u16::from_le_bytes([data[4], data[5]]) as u32;
     let h = u16::from_le_bytes([data[6], data[7]]) as u32;
@@ -8839,6 +8972,7 @@ fn parse_legacy_cellomics_header(data: &[u8]) -> Result<(u32, u32, u32, PixelTyp
 }
 
 #[derive(Debug, Clone)]
+#[cfg(feature = "gpl")]
 struct CellomicsParsedHeader {
     width: u32,
     height: u32,
@@ -8853,6 +8987,7 @@ struct CellomicsParsedHeader {
 }
 
 #[derive(Debug, Clone)]
+#[cfg(feature = "gpl")]
 struct CellomicsDecodedSource {
     path: PathBuf,
     data: Vec<u8>,
@@ -8860,6 +8995,7 @@ struct CellomicsDecodedSource {
 }
 
 #[derive(Debug, Clone)]
+#[cfg(feature = "gpl")]
 struct CellomicsPlaneSource {
     source_index: usize,
     plane_index: u32,
@@ -8867,6 +9003,7 @@ struct CellomicsPlaneSource {
 }
 
 #[derive(Debug)]
+#[cfg(feature = "gpl")]
 struct CellomicsPlateSeries {
     sources: Vec<CellomicsDecodedSource>,
     planes: Vec<CellomicsPlaneSource>,
@@ -8874,11 +9011,13 @@ struct CellomicsPlateSeries {
 }
 
 #[derive(Debug)]
+#[cfg(feature = "gpl")]
 struct CellomicsPlateAssembly {
     series: Vec<CellomicsPlateSeries>,
 }
 
 #[derive(Debug)]
+#[cfg(feature = "gpl")]
 struct CellomicsCandidate {
     path: PathBuf,
     metadata: CellomicsFilenameMetadata,
@@ -8890,6 +9029,7 @@ struct CellomicsCandidate {
     channel: u32,
 }
 
+#[cfg(feature = "gpl")]
 fn decode_cellomics_file(path: &Path) -> Result<Vec<u8>> {
     let raw = std::fs::read(path).map_err(BioFormatsError::Io)?;
     let is_c01 = path
@@ -8913,6 +9053,7 @@ fn decode_cellomics_file(path: &Path) -> Result<Vec<u8>> {
     }
 }
 
+#[cfg(feature = "gpl")]
 fn parse_cellomics_decoded_header(data: &[u8]) -> Result<CellomicsParsedHeader> {
     let mut dib_header_size_metadata = None;
     let mut dib_planes_metadata = 1;
@@ -9017,6 +9158,7 @@ fn parse_cellomics_decoded_header(data: &[u8]) -> Result<CellomicsParsedHeader> 
     })
 }
 
+#[cfg(feature = "gpl")]
 fn cellomics_plate_prefix(path: &Path) -> Option<String> {
     let stem = path.file_stem()?.to_str()?;
     let bytes = stem.as_bytes();
@@ -9033,6 +9175,7 @@ fn cellomics_plate_prefix(path: &Path) -> Option<String> {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[cfg(feature = "gpl")]
 struct CellomicsFilenameMetadata {
     plate: Option<String>,
     well: Option<String>,
@@ -9041,6 +9184,7 @@ struct CellomicsFilenameMetadata {
     channel_prefix: Option<char>,
 }
 
+#[cfg(feature = "gpl")]
 fn cellomics_filename_metadata(path: &Path) -> CellomicsFilenameMetadata {
     let mut parsed = CellomicsFilenameMetadata::default();
     let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
@@ -9106,6 +9250,7 @@ fn cellomics_filename_metadata(path: &Path) -> CellomicsFilenameMetadata {
     parsed
 }
 
+#[cfg(feature = "gpl")]
 fn cellomics_well_row_col(metadata: &CellomicsFilenameMetadata) -> Option<(u32, u32)> {
     let well = metadata.well.as_deref()?;
     if well.len() != 3 {
@@ -9126,6 +9271,7 @@ fn cellomics_well_row_col(metadata: &CellomicsFilenameMetadata) -> Option<(u32, 
 
 /// Port of `FormatTools.getWellName(row, col)`: a row letter (A, ..., Z, AA, ...)
 /// followed by the 1-based column zero-padded to at least two digits.
+#[cfg(feature = "gpl")]
 fn cellomics_well_name(row: i32, col: i32) -> String {
     let mut r = row.max(0);
     let mut letters = String::new();
@@ -9140,6 +9286,7 @@ fn cellomics_well_name(row: i32, col: i32) -> String {
     format!("{}{:02}", letters, col.max(0) + 1)
 }
 
+#[cfg(feature = "gpl")]
 fn cellomics_headers_match_for_plate_assembly(
     left: &CellomicsParsedHeader,
     right: &CellomicsParsedHeader,
@@ -9155,6 +9302,7 @@ fn cellomics_headers_match_for_plate_assembly(
         && left.dib_compression == right.dib_compression
 }
 
+#[cfg(feature = "gpl")]
 fn cellomics_supported_pixel_extension(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
@@ -9162,6 +9310,7 @@ fn cellomics_supported_pixel_extension(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(feature = "gpl")]
 fn cellomics_plate_candidate(
     path: PathBuf,
     metadata: CellomicsFilenameMetadata,
@@ -9181,6 +9330,7 @@ fn cellomics_plate_candidate(
     })
 }
 
+#[cfg(feature = "gpl")]
 fn cellomics_plate_assembly(
     path: &Path,
     current_metadata: &CellomicsFilenameMetadata,
@@ -9284,6 +9434,7 @@ fn cellomics_plate_assembly(
     }
 }
 
+#[cfg(feature = "gpl")]
 fn cellomics_plate_series_from_group(
     group: Vec<CellomicsCandidate>,
     series_index: usize,
@@ -9370,6 +9521,7 @@ fn cellomics_plate_series_from_group(
     }
 }
 
+#[cfg(feature = "gpl")]
 fn find_cellomics_mdb(path: &Path) -> Option<PathBuf> {
     let plate_prefix = cellomics_plate_prefix(path)?;
     let dir = path.parent()?;
@@ -9396,6 +9548,7 @@ fn find_cellomics_mdb(path: &Path) -> Option<PathBuf> {
         })
 }
 
+#[cfg(feature = "gpl")]
 fn cellomics_channel_metadata_from_table(
     table: &crate::common::mdb::MdbTable,
 ) -> HashMap<String, MetadataValue> {
@@ -9522,6 +9675,7 @@ fn cellomics_channel_metadata_from_table(
     metadata
 }
 
+#[cfg(feature = "gpl")]
 fn cellomics_scalar_mdb_metadata_from_tables(
     tables: &[crate::common::mdb::MdbTable],
 ) -> HashMap<String, MetadataValue> {
@@ -9585,6 +9739,7 @@ fn cellomics_scalar_mdb_metadata_from_tables(
     metadata
 }
 
+#[cfg(feature = "gpl")]
 fn cellomics_mdb_table_diagnostics_from_tables(
     tables: &[crate::common::mdb::MdbTable],
 ) -> HashMap<String, MetadataValue> {
@@ -9638,6 +9793,7 @@ fn cellomics_mdb_table_diagnostics_from_tables(
     metadata
 }
 
+#[cfg(feature = "gpl")]
 fn cellomics_mdb_scalar_scope(
     table_name: &str,
 ) -> Option<(
@@ -9704,6 +9860,7 @@ fn cellomics_mdb_scalar_scope(
     }
 }
 
+#[cfg(feature = "gpl")]
 fn cellomics_insert_first_string(
     metadata: &mut HashMap<String, MetadataValue>,
     row: &[String],
@@ -9719,6 +9876,7 @@ fn cellomics_insert_first_string(
     }
 }
 
+#[cfg(feature = "gpl")]
 fn cellomics_insert_first_typed(
     metadata: &mut HashMap<String, MetadataValue>,
     row: &[String],
@@ -9741,6 +9899,7 @@ fn cellomics_insert_first_typed(
     }
 }
 
+#[cfg(feature = "gpl")]
 fn cellomics_normalize_metadata_name(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     let mut last_sep = false;
@@ -9756,6 +9915,7 @@ fn cellomics_normalize_metadata_name(name: &str) -> String {
     out.trim_matches('_').to_string()
 }
 
+#[cfg(feature = "gpl")]
 fn mdb_row_value<'a>(
     row: &'a [String],
     column_index: &HashMap<String, usize>,
@@ -9769,6 +9929,7 @@ fn mdb_row_value<'a>(
     }
 }
 
+#[cfg(feature = "gpl")]
 fn read_cellomics_mdb_metadata(path: &Path) -> HashMap<String, MetadataValue> {
     let mut metadata = HashMap::new();
     let Some(mdb_path) = find_cellomics_mdb(path) else {
@@ -9812,6 +9973,7 @@ fn read_cellomics_mdb_metadata(path: &Path) -> HashMap<String, MetadataValue> {
     metadata
 }
 
+#[cfg(feature = "gpl")]
 fn insert_cellomics_file_metadata(
     metadata: &mut HashMap<String, MetadataValue>,
     path: &Path,
@@ -9869,6 +10031,7 @@ fn insert_cellomics_file_metadata(
     }
 }
 
+#[cfg(feature = "gpl")]
 fn cellomics_metadata_f64(metadata: &HashMap<String, MetadataValue>, key: &str) -> Option<f64> {
     match metadata.get(key)? {
         MetadataValue::Float(value) => Some(*value),
@@ -9878,6 +10041,7 @@ fn cellomics_metadata_f64(metadata: &HashMap<String, MetadataValue>, key: &str) 
     }
 }
 
+#[cfg(feature = "gpl")]
 fn cellomics_metadata_i64(metadata: &HashMap<String, MetadataValue>, key: &str) -> Option<i64> {
     match metadata.get(key)? {
         MetadataValue::Int(value) => Some(*value),
@@ -9887,6 +10051,7 @@ fn cellomics_metadata_i64(metadata: &HashMap<String, MetadataValue>, key: &str) 
     }
 }
 
+#[cfg(feature = "gpl")]
 fn cellomics_metadata_string(
     metadata: &HashMap<String, MetadataValue>,
     key: &str,
@@ -9899,6 +10064,7 @@ fn cellomics_metadata_string(
     }
 }
 
+#[cfg(feature = "gpl")]
 fn cellomics_ome_color(value: i64) -> Option<i32> {
     if (0..=0x00ff_ffff).contains(&value) {
         // Java CellomicsReader parses MDB CompositeColor as BGR:
@@ -9916,6 +10082,7 @@ fn cellomics_ome_color(value: i64) -> Option<i32> {
     }
 }
 
+#[cfg(feature = "gpl")]
 fn cellomics_matching_channel_sources(
     path: &Path,
     current_metadata: &CellomicsFilenameMetadata,
@@ -10116,9 +10283,11 @@ fn cellomics_matching_channel_sources(
 ///   - 1 series                -> 1x1 (the lone well is placed at its own row/col)
 ///   - <= 8 rows and <= 12 cols -> 96-well (8x12)
 ///   - otherwise               -> 384-well (16x24)
-///     Each series maps to a WellSample (field index) inside its well. We stamp the
-///     resulting per-series plate placement into the series metadata so that
-///     `ome_metadata` can rebuild the OME Plate/Well/WellSample tree faithfully.
+///
+/// Each series maps to a WellSample (field index) inside its well. We stamp the
+/// resulting per-series plate placement into the series metadata so that
+/// `ome_metadata` can rebuild the OME Plate/Well/WellSample tree faithfully.
+#[cfg(feature = "gpl")]
 fn cellomics_finalize_plate_metadata(
     metas: &mut [ImageMetadata],
     filename_metadata: &CellomicsFilenameMetadata,
@@ -10205,6 +10374,7 @@ fn cellomics_finalize_plate_metadata(
     }
 }
 
+#[cfg(feature = "gpl")]
 #[cfg(test)]
 mod cellomics_mdb_tests {
     use super::{
@@ -10609,6 +10779,7 @@ mod cellomics_mdb_tests {
     }
 }
 
+#[cfg(feature = "gpl")]
 impl FormatReader for CellomicsReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
         let ext = path
@@ -11065,6 +11236,7 @@ impl FormatReader for CellomicsReader {
 /// the appropriate color map (`COLOR_MAP_1`/`COLOR_MAP_2`), and
 /// `ImageTools.interpolate` fills the missing components into an interleaved
 /// big-endian RGB plane.
+#[cfg(feature = "gpl")]
 pub struct MrwReader {
     meta: Option<ImageMetadata>,
     path: Option<PathBuf>,
@@ -11078,6 +11250,7 @@ pub struct MrwReader {
     full_image: Option<Vec<u8>>,
 }
 
+#[cfg(feature = "gpl")]
 impl MrwReader {
     /// Bayer color maps from `MRWReader.java`.
     const COLOR_MAP_1: [i32; 4] = [0, 1, 1, 2];
@@ -11100,7 +11273,7 @@ impl MrwReader {
     /// Port of `MRWReader.openBytes` (the full-plane decode). Returns the
     /// demosaiced interleaved RGB UINT16 big-endian plane.
     fn decode_full_image(&self) -> Result<Vec<u8>> {
-        use crate::formats::camera2::cfa;
+        use crate::formats::gpl::camera2::cfa;
 
         let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
@@ -11183,12 +11356,14 @@ impl MrwReader {
     }
 }
 
+#[cfg(feature = "gpl")]
 impl Default for MrwReader {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(feature = "gpl")]
 impl FormatReader for MrwReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
         let ext = path
@@ -11392,6 +11567,7 @@ impl FormatReader for MrwReader {
 ///
 /// Each (well, field) combination becomes a series; planes within a series are
 /// addressed in XYCZT order. `open_bytes` delegates to the per-plane TIFF.
+#[cfg(feature = "gpl")]
 pub struct YokogawaReader {
     inner: crate::tiff::TiffReader,
     tiff_loaded: bool,
@@ -11412,6 +11588,7 @@ pub struct YokogawaReader {
 }
 
 #[derive(Default, Clone)]
+#[cfg(feature = "gpl")]
 struct YokogawaPlate {
     name: Option<String>,
     rows: u32,
@@ -11419,6 +11596,7 @@ struct YokogawaPlate {
 }
 
 #[derive(Clone)]
+#[cfg(feature = "gpl")]
 struct YokogawaPlane {
     row: u32,
     column: u32,
@@ -11432,6 +11610,7 @@ struct YokogawaPlane {
 }
 
 #[derive(Clone, Default)]
+#[cfg(feature = "gpl")]
 struct YokogawaChannel {
     index: i32,
     action_index: i32,
@@ -11441,6 +11620,7 @@ struct YokogawaChannel {
     y_size: Option<f64>,
 }
 
+#[cfg(feature = "gpl")]
 impl YokogawaReader {
     pub fn new() -> Self {
         YokogawaReader {
@@ -11460,6 +11640,7 @@ impl YokogawaReader {
     }
 }
 
+#[cfg(feature = "gpl")]
 impl Default for YokogawaReader {
     fn default() -> Self {
         Self::new()
@@ -11468,6 +11649,7 @@ impl Default for YokogawaReader {
 
 /// Read every `name="value"` style attribute from the start tag and return the
 /// requested one. `bts:` prefixes are preserved by quick_xml.
+#[cfg(feature = "gpl")]
 fn yk_attr(
     e: &quick_xml::events::BytesStart,
     decoder: quick_xml::encoding::Decoder,
@@ -11481,6 +11663,7 @@ fn yk_attr(
     None
 }
 
+#[cfg(feature = "gpl")]
 fn yk_attr_int(
     e: &quick_xml::events::BytesStart,
     decoder: quick_xml::encoding::Decoder,
@@ -11489,6 +11672,7 @@ fn yk_attr_int(
     yk_attr(e, decoder, name).and_then(|s| s.trim().parse::<i64>().ok())
 }
 
+#[cfg(feature = "gpl")]
 fn yk_attr_positive_i64(
     e: &quick_xml::events::BytesStart,
     decoder: quick_xml::encoding::Decoder,
@@ -11503,6 +11687,7 @@ fn yk_attr_positive_i64(
     Ok(value)
 }
 
+#[cfg(feature = "gpl")]
 fn yk_attr_f64(
     e: &quick_xml::events::BytesStart,
     decoder: quick_xml::encoding::Decoder,
@@ -11512,6 +11697,7 @@ fn yk_attr_f64(
 }
 
 /// Read a file and strip a stray trailing '>' (mirrors readSanitizedXML).
+#[cfg(feature = "gpl")]
 fn yk_read_sanitized(path: &Path) -> Result<String> {
     let mut s = std::fs::read_to_string(path).map_err(BioFormatsError::Io)?;
     let trimmed = s.trim_end();
@@ -11523,6 +11709,7 @@ fn yk_read_sanitized(path: &Path) -> Result<String> {
     Ok(s)
 }
 
+#[cfg(feature = "gpl")]
 fn yk_parse_wpi(xml: &str) -> YokogawaPlate {
     use quick_xml::events::Event;
     let mut reader = quick_xml::Reader::from_str(xml);
@@ -11545,6 +11732,7 @@ fn yk_parse_wpi(xml: &str) -> YokogawaPlate {
     plate
 }
 
+#[cfg(feature = "gpl")]
 fn yk_parse_mlf(xml: &str, parent: &Path) -> Result<Vec<YokogawaPlane>> {
     use quick_xml::events::Event;
     let mut reader = quick_xml::Reader::from_str(xml);
@@ -11630,6 +11818,7 @@ fn yk_parse_mlf(xml: &str, parent: &Path) -> Result<Vec<YokogawaPlane>> {
     Ok(planes)
 }
 
+#[cfg(feature = "gpl")]
 fn yk_parse_mrf(xml: &str) -> Vec<YokogawaChannel> {
     use quick_xml::events::Event;
     let mut reader = quick_xml::Reader::from_str(xml);
@@ -11657,6 +11846,7 @@ fn yk_parse_mrf(xml: &str) -> Vec<YokogawaChannel> {
     channels
 }
 
+#[cfg(feature = "gpl")]
 impl YokogawaReader {
     fn build(&mut self, wpi_path: &Path) -> Result<()> {
         let parent = wpi_path
@@ -11886,6 +12076,7 @@ impl YokogawaReader {
 /// Compute the channel index of a plane within the list of acquired channels,
 /// mirroring CV7000Reader.getChannelIndex (simplified: when channel metadata is
 /// missing, fall back to the raw channel number).
+#[cfg(feature = "gpl")]
 fn yk_channel_index(p: &YokogawaPlane, channels: &[YokogawaChannel]) -> i32 {
     if channels.is_empty() {
         return p.channel;
@@ -11908,6 +12099,7 @@ fn yk_channel_index(p: &YokogawaPlane, channels: &[YokogawaChannel]) -> i32 {
     }
 }
 
+#[cfg(feature = "gpl")]
 fn yk_lookup_channel<'a>(
     p: &YokogawaPlane,
     channels: &'a [YokogawaChannel],
@@ -11919,6 +12111,7 @@ fn yk_lookup_channel<'a>(
     })
 }
 
+#[cfg(feature = "gpl")]
 fn yk_channel_name(p: &YokogawaPlane, channel: &YokogawaChannel) -> String {
     format!(
         "Action #{}, Channel #{}, Camera #{}",
@@ -11928,6 +12121,7 @@ fn yk_channel_name(p: &YokogawaPlane, channel: &YokogawaChannel) -> String {
     )
 }
 
+#[cfg(feature = "gpl")]
 impl FormatReader for YokogawaReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
         let ext = path
@@ -12130,6 +12324,7 @@ impl FormatReader for YokogawaReader {
 }
 
 /// Well row letter (0 -> "A", 25 -> "Z", 26 -> "AA", ...).
+#[cfg(feature = "gpl")]
 fn yk_row_name(row: u32) -> String {
     let mut n = row as i64;
     let mut s = String::new();
@@ -12144,6 +12339,7 @@ fn yk_row_name(row: u32) -> String {
     s
 }
 
+#[cfg(feature = "gpl")]
 #[cfg(test)]
 mod yokogawa_tests {
     use super::*;
@@ -12233,18 +12429,23 @@ mod yokogawa_tests {
 /// and acquisition fields. RGB channel order is recorded from explicit
 /// `ChannelDescription BytesInc` offsets when the simple Leica XML layout is
 /// unambiguous; pixel bytes are still returned in stored order.
+#[cfg(feature = "gpl")]
 const LOF_MAGIC_BYTE: u32 = 0x70;
+#[cfg(feature = "gpl")]
 const LOF_MEMORY_BYTE: u8 = 0x2a;
+#[cfg(feature = "gpl")]
 const LOF_TYPE_NAME: &str = "LMS_Object_File";
 
 /// In-memory little/big-endian byte cursor mirroring the subset of
 /// `loci.common.RandomAccessInputStream` used by the NAF and LOF readers.
+#[cfg(feature = "gpl")]
 struct ByteCursor<'a> {
     data: &'a [u8],
     pos: usize,
     little: bool,
 }
 
+#[cfg(feature = "gpl")]
 impl<'a> ByteCursor<'a> {
     fn new(data: &'a [u8], little: bool) -> Self {
         ByteCursor {
@@ -12391,6 +12592,7 @@ impl<'a> ByteCursor<'a> {
     }
 }
 
+#[cfg(feature = "gpl")]
 pub struct LofReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
@@ -12408,6 +12610,7 @@ pub struct LofReader {
     current_series: usize,
 }
 
+#[cfg(feature = "gpl")]
 impl LofReader {
     pub fn new() -> Self {
         LofReader {
@@ -12473,12 +12676,14 @@ impl LofReader {
     }
 }
 
+#[cfg(feature = "gpl")]
 impl Default for LofReader {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(feature = "gpl")]
 impl FormatReader for LofReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
         let ext = path
@@ -12757,6 +12962,7 @@ impl FormatReader for LofReader {
 }
 
 /// Core metadata derived from a LOF `<ImageDescription>`.
+#[cfg(feature = "gpl")]
 struct LofImageInfo {
     meta: ImageMetadata,
     ome: OmeImage,
@@ -12765,6 +12971,7 @@ struct LofImageInfo {
 }
 
 /// Minimal Leica `<ImageDescription>` DOM node (tag name + attributes).
+#[cfg(feature = "gpl")]
 struct LofNode {
     name: String,
     attrs: HashMap<String, String>,
@@ -12772,6 +12979,7 @@ struct LofNode {
 
 /// Translate a LOF XML description into core metadata, mirroring the Leica
 /// `translateImageNodes` dimension/channel logic shared with the LIF reader.
+#[cfg(feature = "gpl")]
 fn lof_translate_metadata(xml: &str) -> Result<LofImageInfo> {
     use quick_xml::events::Event;
 
@@ -12996,6 +13204,7 @@ fn lof_translate_metadata(xml: &str) -> Result<LofImageInfo> {
     })
 }
 
+#[cfg(feature = "gpl")]
 fn lof_insert_structured_metadata(
     metadata: &mut HashMap<String, MetadataValue>,
     nodes: &[LofNode],
@@ -13076,6 +13285,7 @@ fn lof_insert_structured_metadata(
     (instruments, rois)
 }
 
+#[cfg(feature = "gpl")]
 fn lof_insert_node_scalar_attrs(
     metadata: &mut HashMap<String, MetadataValue>,
     prefix: &str,
@@ -13099,14 +13309,17 @@ fn lof_insert_node_scalar_attrs(
     }
 }
 
+#[cfg(feature = "gpl")]
 fn lof_first_attr(node: &LofNode, keys: &[&str]) -> Option<String> {
     keys.iter().find_map(|key| lof_clean_attr(node, key))
 }
 
+#[cfg(feature = "gpl")]
 fn lof_first_f64(node: &LofNode, keys: &[&str]) -> Option<f64> {
     keys.iter().find_map(|key| lof_attr_f64(node, key))
 }
 
+#[cfg(feature = "gpl")]
 fn lof_ome_roi(node: &LofNode, idx: usize) -> Option<OmeROI> {
     let x = lof_first_f64(node, &["X", "Left", "PosX", "StageX"])?;
     let y = lof_first_f64(node, &["Y", "Top", "PosY", "StageY"])?;
@@ -13138,6 +13351,7 @@ fn lof_ome_roi(node: &LofNode, idx: usize) -> Option<OmeROI> {
     })
 }
 
+#[cfg(feature = "gpl")]
 fn lof_insert_channel_metadata(
     metadata: &mut HashMap<String, MetadataValue>,
     channel_index: usize,
@@ -13176,6 +13390,7 @@ fn lof_insert_channel_metadata(
     }
 }
 
+#[cfg(feature = "gpl")]
 fn lof_insert_rgb_channel_order_metadata(
     metadata: &mut HashMap<String, MetadataValue>,
     channel_nodes: &[&LofNode],
@@ -13228,6 +13443,7 @@ fn lof_insert_rgb_channel_order_metadata(
     }
 }
 
+#[cfg(feature = "gpl")]
 fn lof_channel_component_label(node: &LofNode, fallback_index: usize) -> Option<char> {
     for key in ["Color", "Colour", "LUTColor", "LutColor", "ColorRGB", "RGB"] {
         if let Some(value) = lof_clean_attr(node, key) {
@@ -13246,6 +13462,7 @@ fn lof_channel_component_label(node: &LofNode, fallback_index: usize) -> Option<
         })
 }
 
+#[cfg(feature = "gpl")]
 fn lof_component_label_from_text(value: &str) -> Option<char> {
     let lower = value.trim().to_ascii_lowercase();
     if lower.is_empty() {
@@ -13264,6 +13481,7 @@ fn lof_component_label_from_text(value: &str) -> Option<char> {
     }
 }
 
+#[cfg(feature = "gpl")]
 fn lof_ome_channels(
     channel_nodes: &[&LofNode],
     effective_c: usize,
@@ -13297,6 +13515,7 @@ fn lof_ome_channels(
 /// colour or a `Gradient(b,g,r)` triple) to a packed RGBA colour. Whitespace is
 /// stripped first; unknown names fall back to opaque white. The packed value
 /// uses the OME convention `(R<<24)|(G<<16)|(B<<8)|A` (alpha 255).
+#[cfg(feature = "gpl")]
 fn lof_translate_lut(lut_name: &str) -> i32 {
     let stripped: String = lut_name.chars().filter(|c| !c.is_whitespace()).collect();
     // Some LUTs are stored as gradients: `Gradient(b,g,r)`. Java reads the three
@@ -13318,6 +13537,7 @@ fn lof_translate_lut(lut_name: &str) -> i32 {
 
 /// Parse a Leica `Gradient(<u8>,<u8>,<u8>)` LUT (case-insensitive). Returns the
 /// three numeric components in source order, or `None` for any other text.
+#[cfg(feature = "gpl")]
 fn lof_parse_gradient_lut(stripped: &str) -> Option<(u8, u8, u8)> {
     let lower = stripped.to_ascii_lowercase();
     let inner = lower
@@ -13338,6 +13558,7 @@ fn lof_parse_gradient_lut(stripped: &str) -> Option<(u8, u8, u8)> {
 
 /// Pack an RGB triple as an OME-style signed RGBA integer with opaque alpha,
 /// matching `ome.xml.model.primitives.Color(r, g, b, 255)`.
+#[cfg(feature = "gpl")]
 fn lof_pack_rgba(r: u8, g: u8, b: u8) -> i32 {
     (((r as u32) << 24) | ((g as u32) << 16) | ((b as u32) << 8) | 0xff) as i32
 }
@@ -13347,6 +13568,7 @@ fn lof_pack_rgba(r: u8, g: u8, b: u8) -> i32 {
 /// `LOFReader.get8BitLookupTable`. Matching is case-sensitive lowercase (as in
 /// the Java `switch`), so capitalised names such as `"Red"` fall through to the
 /// default `8` (gray/identity).
+#[cfg(feature = "gpl")]
 fn lof_channel_priority(lut_name: &str) -> i32 {
     match lut_name {
         "red" => 0,
@@ -13364,6 +13586,7 @@ fn lof_channel_priority(lut_name: &str) -> i32 {
 /// Java `LMSMetadataExtractor.translateChannelDescriptions` inverse-RGB test:
 /// BGR ordering is assumed unless the first three channels are explicitly
 /// described as `Red`, `Green`, `Blue` (in that order).
+#[cfg(feature = "gpl")]
 fn lof_inverse_rgb(channel_nodes: &[&LofNode]) -> bool {
     if channel_nodes.len() < 3 {
         return true;
@@ -13375,6 +13598,7 @@ fn lof_inverse_rgb(channel_nodes: &[&LofNode]) -> bool {
 
 /// The raw `LUTName` attribute of a channel description (empty string if absent),
 /// matching the Java `getAttribute("LUTName")` default.
+#[cfg(feature = "gpl")]
 fn lof_lut_name(node: &LofNode) -> &str {
     node.attrs.get("LUTName").map(String::as_str).unwrap_or("")
 }
@@ -13383,6 +13607,7 @@ fn lof_lut_name(node: &LofNode) -> &str {
 /// `translateLuts` / `translateChannelDescriptions` but the LOF reader keeps in
 /// its transient `metaTemp` buffer (channel colour, channel priority, and the
 /// image-level inverse-RGB flag).
+#[cfg(feature = "gpl")]
 fn lof_insert_channel_lut_metadata(
     metadata: &mut HashMap<String, MetadataValue>,
     channel_nodes: &[&LofNode],
@@ -13407,6 +13632,7 @@ fn lof_insert_channel_lut_metadata(
     }
 }
 
+#[cfg(feature = "gpl")]
 fn lof_meta_inverse_rgb(meta: &ImageMetadata) -> bool {
     matches!(
         meta.series_metadata.get("lof.inverse_rgb"),
@@ -13414,6 +13640,7 @@ fn lof_meta_inverse_rgb(meta: &ImageMetadata) -> bool {
     )
 }
 
+#[cfg(feature = "gpl")]
 fn lof_bgr_to_rgb(buf: &mut [u8], bytes_per_sample: usize) {
     if bytes_per_sample == 0 {
         return;
@@ -13426,12 +13653,14 @@ fn lof_bgr_to_rgb(buf: &mut [u8], bytes_per_sample: usize) {
     }
 }
 
+#[cfg(feature = "gpl")]
 fn lof_channel_name(node: &LofNode) -> Option<String> {
     ["Name", "DyeName", "Dye"]
         .into_iter()
         .find_map(|key| lof_clean_attr(node, key))
 }
 
+#[cfg(feature = "gpl")]
 fn lof_clean_attr(node: &LofNode, key: &str) -> Option<String> {
     let trimmed = node.attrs.get(key)?.trim();
     if trimmed.is_empty() {
@@ -13441,11 +13670,13 @@ fn lof_clean_attr(node: &LofNode, key: &str) -> Option<String> {
     }
 }
 
+#[cfg(feature = "gpl")]
 fn lof_attr_f64(node: &LofNode, key: &str) -> Option<f64> {
     let parsed = node.attrs.get(key)?.trim().parse::<f64>().ok()?;
     parsed.is_finite().then_some(parsed)
 }
 
+#[cfg(feature = "gpl")]
 fn lof_ome_instruments_from_metadata(meta: &ImageMetadata) -> Vec<OmeInstrument> {
     let mut instrument = OmeInstrument::default();
     let mut has_instrument = false;
@@ -13502,6 +13733,7 @@ fn lof_ome_instruments_from_metadata(meta: &ImageMetadata) -> Vec<OmeInstrument>
     }
 }
 
+#[cfg(feature = "gpl")]
 fn lof_ome_rois_from_metadata(meta: &ImageMetadata) -> Vec<OmeROI> {
     let mut rois = Vec::new();
     let mut idx = 0usize;
@@ -13553,6 +13785,7 @@ fn lof_ome_rois_from_metadata(meta: &ImageMetadata) -> Vec<OmeROI> {
     rois
 }
 
+#[cfg(feature = "gpl")]
 fn metadata_string(meta: &ImageMetadata, key: &str) -> Option<String> {
     match meta.series_metadata.get(key) {
         Some(MetadataValue::String(value)) => Some(value.clone()),
@@ -13560,6 +13793,7 @@ fn metadata_string(meta: &ImageMetadata, key: &str) -> Option<String> {
     }
 }
 
+#[cfg(feature = "gpl")]
 fn metadata_float(meta: &ImageMetadata, key: &str) -> Option<f64> {
     match meta.series_metadata.get(key) {
         Some(MetadataValue::Float(value)) => Some(*value),
@@ -13568,6 +13802,7 @@ fn metadata_float(meta: &ImageMetadata, key: &str) -> Option<f64> {
     }
 }
 
+#[cfg(feature = "gpl")]
 fn lof_key_name(key: &str) -> String {
     match key {
         "DyeName" => return "dye_name".to_string(),
@@ -13592,6 +13827,7 @@ fn lof_key_name(key: &str) -> String {
 /// Leica calibration: `length / (numElements - 1)`, normalised to µm
 /// (`Unit="m"` → ×1e6, `Unit="Ks"` → ÷1000). Returns `None` when there is no
 /// usable calibration.
+#[cfg(feature = "gpl")]
 fn lof_physical_size_um(node: &LofNode, num_elements: u32) -> Option<f64> {
     if num_elements <= 1 {
         return None;
@@ -13616,6 +13852,7 @@ fn lof_physical_size_um(node: &LofNode, num_elements: u32) -> Option<f64> {
 
 /// Java `FormatTools.pixelTypeFromBytes(nBytes, signed=false, fp=...)` as used
 /// by the Leica readers: unsigned integer types (8-byte → double).
+#[cfg(feature = "gpl")]
 fn lof_pixel_type_from_bytes(n_bytes: u64) -> PixelType {
     match n_bytes {
         0 | 1 => PixelType::Uint8,
@@ -14645,12 +14882,14 @@ impl FormatWriter for ApngWriter {
 ///
 /// DF3 format: 6-byte header (3x uint16 BE: x, y, z dimensions) followed
 /// by raw uint8 voxel data.
+#[cfg(feature = "gpl")]
 pub struct PovrayReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
     pixel_data: Option<Vec<u8>>,
 }
 
+#[cfg(feature = "gpl")]
 impl PovrayReader {
     pub fn new() -> Self {
         PovrayReader {
@@ -14661,12 +14900,14 @@ impl PovrayReader {
     }
 }
 
+#[cfg(feature = "gpl")]
 impl Default for PovrayReader {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(feature = "gpl")]
 impl FormatReader for PovrayReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
         let ext = path
@@ -14881,6 +15122,7 @@ impl FormatReader for PovrayReader {
     }
 }
 
+#[cfg(feature = "gpl")]
 #[cfg(test)]
 mod povray_tests {
     use super::*;
@@ -14951,6 +15193,7 @@ mod povray_tests {
 /// and the `0xC0 0x2E` sentinel + fixed `LUT_SIZE`/`16063`/`352` deltas);
 /// subsequent series follow contiguously. Compressed payloads are unsupported
 /// (Java throws `UnsupportedCompressionException`).
+#[cfg(feature = "gpl")]
 pub struct NafReader {
     path: Option<PathBuf>,
     series: Vec<ImageMetadata>,
@@ -14958,6 +15201,7 @@ pub struct NafReader {
     current_series: usize,
 }
 
+#[cfg(feature = "gpl")]
 impl NafReader {
     pub fn new() -> Self {
         NafReader {
@@ -14969,18 +15213,22 @@ impl NafReader {
     }
 }
 
+#[cfg(feature = "gpl")]
 impl Default for NafReader {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(feature = "gpl")]
 const BURLEIGH_MAGIC: [u8; 4] = [0x66, 0x66, 0x46, 0x40];
 /// Java `NAFReader.LUT_SIZE`.
+#[cfg(feature = "gpl")]
 const NAF_LUT_SIZE: u64 = 263168;
 
 /// Java `FormatTools.pixelTypeFromBytes(nBytes, signed=false, fp=(nBytes==8))`
 /// as used by NAF.
+#[cfg(feature = "gpl")]
 fn naf_pixel_type(n_bytes: i32) -> Result<(PixelType, u8)> {
     match n_bytes {
         1 => Ok((PixelType::Uint8, 8)),
@@ -14993,6 +15241,7 @@ fn naf_pixel_type(n_bytes: i32) -> Result<(PixelType, u8)> {
     }
 }
 
+#[cfg(feature = "gpl")]
 impl FormatReader for NafReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
         let ext = path
@@ -15266,6 +15515,7 @@ impl FormatReader for NafReader {
 ///
 /// Detection follows the Java magic test (`0x66 0x66 {0x46|0x06} 0x40`); the
 /// `.img` extension is too generic to be sufficient on its own.
+#[cfg(feature = "gpl")]
 pub struct BurleighReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
@@ -15273,6 +15523,7 @@ pub struct BurleighReader {
     pixels_offset: u64,
 }
 
+#[cfg(feature = "gpl")]
 impl BurleighReader {
     pub fn new() -> Self {
         BurleighReader {
@@ -15284,12 +15535,14 @@ impl BurleighReader {
     }
 }
 
+#[cfg(feature = "gpl")]
 impl Default for BurleighReader {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(feature = "gpl")]
 impl FormatReader for BurleighReader {
     fn is_this_type_by_name(&self, _path: &Path) -> bool {
         // Java sets suffixSufficient=false and suffixNecessary=false; `.img`
@@ -15520,6 +15773,7 @@ impl FormatReader for BurleighReader {
     }
 }
 
+#[cfg(feature = "gpl")]
 #[cfg(test)]
 mod mrw_tests {
     use super::MrwReader;
@@ -15697,6 +15951,7 @@ mod mrw_tests {
     }
 }
 
+#[cfg(feature = "gpl")]
 #[cfg(test)]
 mod lof_lut_tests {
     use super::{

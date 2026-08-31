@@ -300,36 +300,45 @@ fn open_reader_with_options_and_metadata(
     // companion has no ICS magic and can accidentally match unrelated byte
     // probes, but Java ICSReader accepts either side by suffix.
     if has_ics_extension(path) || (has_ids_extension(path) && ics_header_sibling_exists(path)) {
-        let mut r = boxed_reader(crate::formats::ics::IcsReader::new());
+        let mut r = boxed_reader(crate::formats::bsd::ics::IcsReader::new());
         set_reader_id(&mut r, path, &options, metadata_options)?;
         return Ok(r);
     }
 
     // CV7000 `.wpi` files are XML entry points with no useful magic bytes.
     // Java accepts them by suffix via CV7000Reader before later XML/HCS readers.
-    if has_wpi_extension(path) {
-        let mut r = boxed_reader(crate::formats::extended::YokogawaReader::new());
-        set_reader_id(&mut r, path, &options, metadata_options)?;
-        return Ok(r);
+    #[cfg(feature = "gpl")]
+    {
+        if has_wpi_extension(path) {
+            let mut r = boxed_reader(crate::formats::extended::YokogawaReader::new());
+            set_reader_id(&mut r, path, &options, metadata_options)?;
+            return Ok(r);
+        }
     }
 
     // Java LeicaReader accepts `.raw` companions by suffix when a sibling `.lei`
     // can resolve the dataset. Route that before generic raw readers so direct
     // companion entry points behave like opening the LEI file.
-    if has_raw_extension(path) && has_lei_sibling(path) {
-        let mut r = boxed_reader(crate::formats::leica::LeicaReader::new());
-        set_reader_id(&mut r, path, &options, metadata_options)?;
-        return Ok(r);
+    #[cfg(feature = "gpl")]
+    {
+        if has_raw_extension(path) && has_lei_sibling(path) {
+            let mut r = boxed_reader(crate::formats::gpl::leica::LeicaReader::new());
+            set_reader_id(&mut r, path, &options, metadata_options)?;
+            return Ok(r);
+        }
     }
 
     // Java OperettaReader accepts Index.idx.xml, Index.ref.xml, and Index.xml
     // by filename before broad XML readers such as Leica TCS. Dispatch those
     // entry points directly so a valid Operetta index is not claimed by the
     // generic XML suffix fallback first.
-    if has_operetta_index_name(path) {
-        let mut r = boxed_reader(crate::formats::hcs2::OperettaReader::new());
-        set_reader_id(&mut r, path, &options, metadata_options)?;
-        return Ok(r);
+    #[cfg(feature = "gpl")]
+    {
+        if has_operetta_index_name(path) {
+            let mut r = boxed_reader(crate::formats::gpl::hcs2::OperettaReader::new());
+            set_reader_id(&mut r, path, &options, metadata_options)?;
+            return Ok(r);
+        }
     }
 
     let header = peek_header(path, DETECTION_HEADER_BYTES)?;
@@ -343,15 +352,18 @@ fn open_reader_with_options_and_metadata(
     // but Java ND2Reader has an explicit old-JP2 branch for `.nd2` paths. Give
     // ND2Reader the suffix-dispatched first chance before the generic
     // JPEG2000Reader magic probe can claim the file as a plain JP2 pyramid.
-    if path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("nd2"))
+    #[cfg(feature = "gpl")]
     {
-        let mut r = boxed_reader(crate::formats::nd2::Nd2Reader::new());
-        match set_reader_id(&mut r, path, &options, metadata_options) {
-            Ok(()) => return Ok(r),
-            Err(err) => remember_set_id_error(&mut best_error, err),
+        if path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("nd2"))
+        {
+            let mut r = boxed_reader(crate::formats::gpl::nd2::Nd2Reader::new());
+            match set_reader_id(&mut r, path, &options, metadata_options) {
+                Ok(()) => return Ok(r),
+                Err(err) => remember_set_id_error(&mut best_error, err),
+            }
         }
     }
 
@@ -361,66 +373,78 @@ fn open_reader_with_options_and_metadata(
     // extension, so for a genuine HDF5 `.ims` file the HDF5 reader must win.
     // Dispatch on the actual header here: if the file carries the HDF5 magic,
     // route straight to the HDF5 Imaris reader before any TIFF-based handling.
-    if has_ims_extension(path) && is_hdf5_header(&header) {
-        let mut r = boxed_reader(crate::formats::imaris_hdf::ImarisHdfReader::new());
-        set_reader_id(&mut r, path, &options, metadata_options)?;
-        return Ok(r);
+    #[cfg(feature = "gpl")]
+    {
+        if has_ims_extension(path) && is_hdf5_header(&header) {
+            let mut r = boxed_reader(crate::formats::gpl::imaris_hdf::ImarisHdfReader::new());
+            set_reader_id(&mut r, path, &options, metadata_options)?;
+            return Ok(r);
+        }
     }
 
     if has_h5_extension(path) && is_hdf5_header(&header) && has_bdv_xml_sibling(path) {
-        let mut r = boxed_reader(crate::formats::bdv::BdvReader::new());
+        let mut r = boxed_reader(crate::formats::bsd::bdv::BdvReader::new());
         set_reader_id(&mut r, path, &options, metadata_options)?;
         return Ok(r);
     }
 
     if has_ch5_extension(path) && is_hdf5_header(&header) {
-        let mut r = boxed_reader(crate::formats::cellh5::CellH5Reader::new());
+        let mut r = boxed_reader(crate::formats::bsd::cellh5::CellH5Reader::new());
         set_reader_id(&mut r, path, &options, metadata_options)?;
         return Ok(r);
     }
 
-    if has_tiff_extension(path)
-        && is_tiff_header(&header)
-        && has_columbus_measurement_index_sibling(path)
+    #[cfg(feature = "gpl")]
     {
-        let mut r = boxed_reader(crate::formats::hcs2::ColumbusReader::new());
-        set_reader_id(&mut r, path, &options, metadata_options)?;
-        return Ok(r);
+        if has_tiff_extension(path)
+            && is_tiff_header(&header)
+            && has_columbus_measurement_index_sibling(path)
+        {
+            let mut r = boxed_reader(crate::formats::gpl::hcs2::ColumbusReader::new());
+            set_reader_id(&mut r, path, &options, metadata_options)?;
+            return Ok(r);
+        }
     }
 
     // ZVI is an OLE/CFB container whose magic bytes are shared with many other
     // formats. Java's ZeissZVIReader is extension-driven for this case; routing
     // `.zvi` directly avoids probing unrelated OLE readers that may parse large
     // streams before rejecting the file.
-    if has_zvi_extension(path) {
-        let mut r = boxed_reader(crate::formats::zeiss_zvi::ZeissZviReader::new());
-        match set_reader_id(&mut r, path, &options, metadata_options) {
-            Ok(()) => return Ok(r),
-            Err(err) => remember_set_id_error(&mut best_error, err),
+    #[cfg(feature = "gpl")]
+    {
+        if has_zvi_extension(path) {
+            let mut r = boxed_reader(crate::formats::gpl::zeiss_zvi::ZeissZviReader::new());
+            match set_reader_id(&mut r, path, &options, metadata_options) {
+                Ok(()) => return Ok(r),
+                Err(err) => remember_set_id_error(&mut best_error, err),
+            }
         }
     }
 
     // Java CanonRawReader byte-detects legacy 300D CRW files solely by exact
     // file length. `peek_header` cannot represent that full-stream predicate,
     // so mirror it before extension/generic probing.
-    if path
-        .metadata()
-        .map(|m| crate::formats::camera2::CanonRawReader::is_legacy_file_length(m.len()))
-        .unwrap_or(false)
+    #[cfg(feature = "gpl")]
     {
-        let mut r = boxed_reader(crate::formats::camera2::CanonRawReader::new());
-        match set_reader_id(&mut r, path, &options, metadata_options) {
-            Ok(()) => return Ok(r),
-            Err(err) => remember_set_id_error(&mut best_error, err),
+        if path
+            .metadata()
+            .map(|m| crate::formats::gpl::camera2::CanonRawReader::is_legacy_file_length(m.len()))
+            .unwrap_or(false)
+        {
+            let mut r = boxed_reader(crate::formats::gpl::camera2::CanonRawReader::new());
+            match set_reader_id(&mut r, path, &options, metadata_options) {
+                Ok(()) => return Ok(r),
+                Err(err) => remember_set_id_error(&mut best_error, err),
+            }
         }
     }
 
     // Java readers.txt places DicomReader before the final generic TIFF reader
     // because DICOM-TIFF files can carry a valid TIFF-looking preamble. Our
     // split probe still needs this explicit guard before TIFF wrapper probing.
-    let dicom_probe = crate::formats::dicom::DicomReader::new();
+    let dicom_probe = crate::formats::bsd::dicom::DicomReader::new();
     if dicom_probe.is_this_type_by_bytes(&header) {
-        let mut r = boxed_reader(crate::formats::dicom::DicomReader::new());
+        let mut r = boxed_reader(crate::formats::bsd::dicom::DicomReader::new());
         match set_reader_id(&mut r, path, &options, metadata_options) {
             Ok(()) => return Ok(r),
             Err(err) => remember_set_id_error(&mut best_error, err),
@@ -462,11 +486,14 @@ fn open_reader_with_options_and_metadata(
     // SpiderReader's Java byte probe compares declared payload/header sizes to
     // the full stream length. The generic registry byte loop only passes a
     // prefix, so bridge that full-stream predicate here before suffix fallback.
-    if crate::formats::amira::is_spider_file(path) {
-        let mut r = boxed_reader(crate::formats::amira::SpiderReader::new());
-        match set_reader_id(&mut r, path, &options, metadata_options) {
-            Ok(()) => return Ok(r),
-            Err(err) => remember_set_id_error(&mut best_error, err),
+    #[cfg(feature = "gpl")]
+    {
+        if crate::formats::gpl::amira::is_spider_file(path) {
+            let mut r = boxed_reader(crate::formats::gpl::amira::SpiderReader::new());
+            match set_reader_id(&mut r, path, &options, metadata_options) {
+                Ok(()) => return Ok(r),
+                Err(err) => remember_set_id_error(&mut best_error, err),
+            }
         }
     }
 
@@ -664,32 +691,40 @@ pub(crate) fn detect_reader_without_set_id(path: &Path) -> Result<Box<dyn Format
 
     let header = peek_header(path, DETECTION_HEADER_BYTES)?;
 
+    #[cfg(feature = "gpl")]
     if has_ims_extension(path) && is_hdf5_header(&header) {
         return Ok(boxed_reader(
-            crate::formats::imaris_hdf::ImarisHdfReader::new(),
+            crate::formats::gpl::imaris_hdf::ImarisHdfReader::new(),
         ));
     }
 
     if has_ch5_extension(path) && is_hdf5_header(&header) {
-        return Ok(boxed_reader(crate::formats::cellh5::CellH5Reader::new()));
-    }
-
-    if has_zvi_extension(path) {
         return Ok(boxed_reader(
-            crate::formats::zeiss_zvi::ZeissZviReader::new(),
+            crate::formats::bsd::cellh5::CellH5Reader::new(),
         ));
     }
 
+    #[cfg(feature = "gpl")]
+    if has_zvi_extension(path) {
+        return Ok(boxed_reader(
+            crate::formats::gpl::zeiss_zvi::ZeissZviReader::new(),
+        ));
+    }
+
+    #[cfg(feature = "gpl")]
     if has_wpi_extension(path) {
         return Ok(boxed_reader(crate::formats::extended::YokogawaReader::new()));
     }
 
+    #[cfg(feature = "gpl")]
     if path
         .metadata()
-        .map(|m| crate::formats::camera2::CanonRawReader::is_legacy_file_length(m.len()))
+        .map(|m| crate::formats::gpl::camera2::CanonRawReader::is_legacy_file_length(m.len()))
         .unwrap_or(false)
     {
-        return Ok(boxed_reader(crate::formats::camera2::CanonRawReader::new()));
+        return Ok(boxed_reader(
+            crate::formats::gpl::camera2::CanonRawReader::new(),
+        ));
     }
 
     if is_tiff_header(&header) {
@@ -699,8 +734,9 @@ pub(crate) fn detect_reader_without_set_id(path: &Path) -> Result<Box<dyn Format
         }
     }
 
-    if crate::formats::amira::is_spider_file(path) {
-        return Ok(boxed_reader(crate::formats::amira::SpiderReader::new()));
+    #[cfg(feature = "gpl")]
+    if crate::formats::gpl::amira::is_spider_file(path) {
+        return Ok(boxed_reader(crate::formats::gpl::amira::SpiderReader::new()));
     }
 
     for r in all_readers() {
@@ -808,31 +844,40 @@ fn tiff_wrapper_readers_for_extension(path: &Path, header: &[u8]) -> Vec<Box<dyn
         .map(|e| e.to_ascii_lowercase());
 
     match ext.as_deref() {
+        #[cfg(feature = "gpl")]
         Some("lsm") => vec![boxed_reader(
-            crate::formats::zeiss_lsm::ZeissLsmReader::new(),
+            crate::formats::gpl::zeiss_lsm::ZeissLsmReader::new(),
         )],
+        #[cfg(feature = "gpl")]
         Some("stk") => vec![boxed_reader(
-            crate::formats::metamorph::MetamorphReader::new(),
+            crate::formats::gpl::metamorph::MetamorphReader::new(),
         )],
-        Some("svs") => vec![boxed_reader(crate::formats::svs::SvsReader::new())],
+        #[cfg(feature = "gpl")]
+        Some("svs") => vec![boxed_reader(crate::formats::gpl::svs::SvsReader::new())],
+        #[cfg(feature = "gpl")]
         Some("ndpi") => {
             let mut readers = Vec::new();
-            if crate::formats::tiff_wrappers::ndpi_has_hamamatsu_tags(path) {
+            if crate::formats::gpl::tiff_wrappers::ndpi_has_hamamatsu_tags(path) {
                 readers.push(boxed_reader(
-                    crate::formats::tiff_wrappers::NdpiReader::new(),
+                    crate::formats::gpl::tiff_wrappers::NdpiReader::new(),
                 ));
             }
             readers
         }
+        #[cfg(feature = "gpl")]
         Some("scn") => vec![
-            boxed_reader(crate::formats::tiff_wrappers::LeicaScnReader::new()),
+            boxed_reader(crate::formats::gpl::tiff_wrappers::LeicaScnReader::new()),
             boxed_reader(crate::formats::flim2::BioRadScnReader::new()),
         ],
+        #[cfg(feature = "gpl")]
         Some("bif") => vec![boxed_reader(
-            crate::formats::tiff_wrappers::VentanaReader::new(),
+            crate::formats::gpl::tiff_wrappers::VentanaReader::new(),
         )],
+        #[cfg(feature = "gpl")]
         Some("vsi") => vec![boxed_reader(crate::formats::flim2::CellSensReader::new())],
+        #[cfg(feature = "gpl")]
         Some("afi") => vec![boxed_reader(crate::formats::flim2::AfiReader::new())],
+        #[cfg(feature = "gpl")]
         Some("dng") => {
             let mut readers = Vec::new();
             // Java readers.txt probes NikonReader before DNGReader. Some
@@ -840,31 +885,54 @@ fn tiff_wrapper_readers_for_extension(path: &Path, header: &[u8]) -> Vec<Box<dyn
             // must still route through NikonReader rather than the thumbnail
             // IFD path in DNGReader.
             if tiff_first_ifd_is_nikon_raw(path) {
-                readers.push(boxed_reader(crate::formats::camera2::NikonReader::new()));
+                readers.push(boxed_reader(
+                    crate::formats::gpl::camera2::NikonReader::new(),
+                ));
             }
             readers.push(boxed_reader(crate::formats::extended::DngReader::new()));
             readers
         }
+        #[cfg(feature = "gpl")]
         Some("qptiff") => vec![boxed_reader(crate::formats::extended::VectraReader::new())],
+        #[cfg(feature = "gpl")]
         Some("gel") => vec![boxed_reader(crate::formats::extended::GelReader::new())],
-        Some("flex") => vec![boxed_reader(crate::formats::flex::FlexReader::new())],
-        Some("fff") => vec![boxed_reader(crate::formats::camera2::ImaconReader::new())],
-        Some("pcoraw") => vec![boxed_reader(crate::formats::camera2::PcoRawReader::new())],
+        #[cfg(feature = "gpl")]
+        Some("flex") => vec![boxed_reader(crate::formats::gpl::flex::FlexReader::new())],
+        #[cfg(feature = "gpl")]
+        Some("fff") => vec![boxed_reader(
+            crate::formats::gpl::camera2::ImaconReader::new(),
+        )],
+        #[cfg(feature = "gpl")]
+        Some("pcoraw") => vec![boxed_reader(
+            crate::formats::gpl::camera2::PcoRawReader::new(),
+        )],
+        #[cfg(feature = "gpl")]
         Some("cr2") | Some("crw") | Some("cr3") => {
-            vec![boxed_reader(crate::formats::camera2::CanonRawReader::new())]
+            vec![boxed_reader(
+                crate::formats::gpl::camera2::CanonRawReader::new(),
+            )]
         }
         // Nikon NEF camera RAW (TIFF-based; is_this_type_by_bytes requires the
         // EPS-standard tag or a Nikon Make, so it won't grab arbitrary TIFFs).
-        Some("nef") => vec![boxed_reader(crate::formats::camera2::NikonReader::new())],
+        #[cfg(feature = "gpl")]
+        Some("nef") => vec![boxed_reader(
+            crate::formats::gpl::camera2::NikonReader::new(),
+        )],
         // Image-Pro Sequence (TIFF-based with IMAGE_PRO custom tags). Raw Norpix
         // StreamPix `.seq` is not TIFF and is handled by NorpixReader instead.
+        #[cfg(feature = "gpl")]
         Some("seq") | Some("ips") => {
-            vec![boxed_reader(crate::formats::norpix::SeqReader::new())]
+            vec![boxed_reader(crate::formats::gpl::norpix::SeqReader::new())]
         }
-        Some("ipw") => vec![boxed_reader(crate::formats::camera2::IpwReader::new())],
+        #[cfg(feature = "gpl")]
+        Some("ipw") => vec![boxed_reader(crate::formats::gpl::camera2::IpwReader::new())],
+        #[cfg(feature = "gpl")]
         Some("ims") => vec![boxed_reader(crate::formats::flim2::ImarisTiffReader::new())],
+        #[cfg(feature = "gpl")]
         Some("xlef") => vec![boxed_reader(crate::formats::flim2::XlefReader::new())],
+        #[cfg(feature = "gpl")]
         Some("ctf") => vec![boxed_reader(crate::formats::flim2::MicroCtReader::new())],
+        #[cfg(feature = "gpl")]
         Some("ndpis") => vec![boxed_reader(crate::formats::flim2::NdpisReader::new())],
         // Generic .tif/.tiff TIFF wrappers only run early when they can be
         // identified from wrapper-specific metadata. Several wrapper readers
@@ -875,7 +943,7 @@ fn tiff_wrapper_readers_for_extension(path: &Path, header: &[u8]) -> Vec<Box<dyn
             let software = tiff_software_tag(path);
 
             let mut readers = Vec::new();
-            let micromanager = crate::formats::micromanager::MicromanagerReader::new();
+            let micromanager = crate::formats::bsd::micromanager::MicromanagerReader::new();
             if micromanager.is_this_type_by_name(path) {
                 readers.push(boxed_reader(micromanager));
             }
@@ -886,153 +954,170 @@ fn tiff_wrapper_readers_for_extension(path: &Path, header: &[u8]) -> Vec<Box<dyn
             if tiff_first_ifd_has_ome_xml_description(path) {
                 readers.push(boxed_reader(crate::tiff::TiffReader::new()));
             }
-            // Faas-format pyramid TIFFs are identified by a SOFTWARE tag
-            // containing "Faas" (mirrors Java PyramidTiffReader.isThisType).
-            if software
-                .as_deref()
-                .map(|software| software.contains("Faas"))
-                .unwrap_or(false)
+            #[cfg(feature = "gpl")]
             {
-                readers.push(boxed_reader(crate::formats::svs::PyramidTiffReader::new()));
-            }
-
-            // MIAS datasets are plain TIFFs, so the generic TiffReader would
-            // win the magic pass. Give MiasReader a chance first, but ONLY when
-            // the file is genuinely a MIAS plane (a Well<xxxx> directory +
-            // mode/z/t naming), so ordinary .tif files still fall through.
-            readers.extend(generic_tiff_name_wrappers(path, header));
-
-            // Columbus image planes are ordinary TIFF leaves, but Java opens a
-            // leaf through the sibling MeasurementIndex.ColumbusIDX.xml and
-            // exposes the whole grouped plate/timepoint structure.
-            if has_columbus_measurement_index_sibling(path) {
-                readers.push(boxed_reader(crate::formats::hcs2::ColumbusReader::new()));
-            }
-
-            // Java readers.txt probes NikonReader before the other generic
-            // `.tif` wrappers and before the final generic TIFF reader.
-            if tiff_first_ifd_is_nikon_raw(path) {
-                readers.push(boxed_reader(crate::formats::camera2::NikonReader::new()));
-            }
-
-            if description
-                .as_deref()
-                .map(|description| tiff_first_ifd_matches_fluoview(path, description))
-                .unwrap_or(false)
-            {
-                readers.push(boxed_reader(
-                    crate::formats::tiff_wrappers::FluoviewReader::new(),
-                ));
-            }
-            if has_prairie_xml_sibling(path) {
-                readers.push(boxed_reader(crate::formats::prairie::PrairieReader::new()));
-            }
-
-            // Nikon EZ-C1 confocal TIFFs are plain TIFFs identified only by a
-            // SOFTWARE tag containing "EZ-C1". Gate on that tag (mirroring the
-            // ImageDescription gating below) so ordinary TIFFs are untouched.
-            if let Some(software) = software.as_deref() {
-                // Classic MetaMorph/STK can also use .tif/.tiff. Java
-                // MetamorphReader.isThisType checks the SOFTWARE tag before
-                // the later MetamorphTiffReader XML-comment reader gets a turn.
+                // Faas-format pyramid TIFFs are identified by a SOFTWARE tag
+                // containing "Faas" (mirrors Java PyramidTiffReader.isThisType).
                 if software
-                    .trim()
-                    .to_ascii_lowercase()
-                    .starts_with("metamorph")
+                    .as_deref()
+                    .map(|software| software.contains("Faas"))
+                    .unwrap_or(false)
                 {
                     readers.push(boxed_reader(
-                        crate::formats::metamorph::MetamorphReader::new(),
+                        crate::formats::gpl::svs::PyramidTiffReader::new(),
                     ));
                 }
-            }
 
-            // Java also accepts classic MetaMorph TIFFs by UIC tags even when
-            // SOFTWARE is absent: UIC1 + UIC3 + UIC4 on the first IFD.
-            if tiff_first_ifd_has_all_tags(path, &[33628, 33630, 33631]) {
-                readers.push(boxed_reader(
-                    crate::formats::metamorph::MetamorphReader::new(),
-                ));
-            }
-            if has_metamorph_nd_sibling(path) {
-                readers.push(boxed_reader(
-                    crate::formats::metamorph::MetamorphReader::new(),
-                ));
-            }
-            if let Some(description) = description.as_deref() {
-                if description.contains("Improvision") {
-                    readers.push(boxed_reader(
-                        crate::formats::tiff_wrappers::ImprovisionTiffReader::new(),
-                    ));
-                }
-                let trimmed = description.trim();
-                if trimmed.starts_with("<MetaData>") && trimmed.ends_with("</MetaData>") {
-                    readers.push(boxed_reader(
-                        crate::formats::tiff_wrappers::MetamorphTiffReader::new(),
-                    ));
-                }
-            }
-            if software
-                .as_deref()
-                .map(|software| software.contains("EZ-C1"))
-                .unwrap_or(false)
-            {
-                readers.push(boxed_reader(
-                    crate::formats::tiff_wrappers::NikonTiffReader::new(),
-                ));
-            }
-            if tiff_first_ifd_has_all_tags(path, &[50457]) {
-                readers.push(boxed_reader(crate::formats::camera2::ImaconReader::new()));
-            }
-            if tiff_first_ifd_has_all_tags(path, &[37724]) {
-                readers.push(boxed_reader(
-                    crate::formats::camera2::PhotoshopTiffReader::new(),
-                ));
-            }
-            if tiff_first_ifd_has_any_tag(path, &[34680, 34682, 34683]) {
-                readers.push(boxed_reader(
-                    crate::formats::tiff_wrappers::FeiTiffReader::new(),
-                ));
-            }
-            if tiff_first_ifd_has_any_tag(path, &[34118]) {
-                readers.push(boxed_reader(crate::formats::sem::LeoReader::new()));
-            }
-            if let Some(description) = description.as_deref() {
-                readers.extend(simplepci_tiff_wrappers_for_description(description));
-            }
-            if tiff_first_ifd_has_all_tags(path, &[65332]) {
-                readers.push(boxed_reader(
-                    crate::formats::tiff_wrappers::NikonElementsTiffReader::new(),
-                ));
-            }
-            if tiff_first_ifd_copyright_contains(path, "Trestle Corp.") {
-                readers.push(boxed_reader(crate::formats::hcs2::TrestleReader::new()));
-            }
-            if tiff_first_ifd_matches_sis(path) {
-                readers.push(boxed_reader(crate::formats::tiff_wrappers::SisReader::new()));
-            }
-            if tiff_first_ifd_matches_dng(path) {
-                readers.push(boxed_reader(crate::formats::extended::DngReader::new()));
-            }
-            if let Some(software) = software.as_deref() {
-                if software.starts_with("PerkinElmer-QPI") {
-                    readers.push(boxed_reader(crate::formats::extended::VectraReader::new()));
-                }
-                if software.starts_with("IonpathMIBI") {
-                    readers.push(boxed_reader(
-                        crate::formats::hcs2::IonpathMibiTiffReader::new(),
-                    ));
-                }
-            }
-            if zeiss_tiff_meta_xml_exists(path) {
-                readers.push(boxed_reader(crate::formats::sem::ZeissTiffReader::new()));
-            }
+                // MIAS datasets are plain TIFFs, so the generic TiffReader would
+                // win the magic pass. Give MiasReader a chance first, but ONLY when
+                // the file is genuinely a MIAS plane (a Well<xxxx> directory +
+                // mode/z/t naming), so ordinary .tif files still fall through.
+                readers.extend(generic_tiff_name_wrappers(path, header));
 
-            if let Some(description) = description.as_deref() {
-                readers.extend(remaining_generic_tiff_wrappers_for_description(
-                    path,
-                    ext.as_deref().unwrap_or_default(),
-                    description,
-                ));
+                // Columbus image planes are ordinary TIFF leaves, but Java opens a
+                // leaf through the sibling MeasurementIndex.ColumbusIDX.xml and
+                // exposes the whole grouped plate/timepoint structure.
+                if has_columbus_measurement_index_sibling(path) {
+                    readers.push(boxed_reader(
+                        crate::formats::gpl::hcs2::ColumbusReader::new(),
+                    ));
+                }
+
+                // Java readers.txt probes NikonReader before the other generic
+                // `.tif` wrappers and before the final generic TIFF reader.
+                if tiff_first_ifd_is_nikon_raw(path) {
+                    readers.push(boxed_reader(
+                        crate::formats::gpl::camera2::NikonReader::new(),
+                    ));
+                }
+
+                if description
+                    .as_deref()
+                    .map(|description| tiff_first_ifd_matches_fluoview(path, description))
+                    .unwrap_or(false)
+                {
+                    readers.push(boxed_reader(
+                        crate::formats::gpl::tiff_wrappers::FluoviewReader::new(),
+                    ));
+                }
+                if has_prairie_xml_sibling(path) {
+                    readers.push(boxed_reader(
+                        crate::formats::gpl::prairie::PrairieReader::new(),
+                    ));
+                }
+
+                // Nikon EZ-C1 confocal TIFFs are plain TIFFs identified only by a
+                // SOFTWARE tag containing "EZ-C1". Gate on that tag (mirroring the
+                // ImageDescription gating below) so ordinary TIFFs are untouched.
+                if let Some(software) = software.as_deref() {
+                    // Classic MetaMorph/STK can also use .tif/.tiff. Java
+                    // MetamorphReader.isThisType checks the SOFTWARE tag before
+                    // the later MetamorphTiffReader XML-comment reader gets a turn.
+                    if software
+                        .trim()
+                        .to_ascii_lowercase()
+                        .starts_with("metamorph")
+                    {
+                        readers.push(boxed_reader(
+                            crate::formats::gpl::metamorph::MetamorphReader::new(),
+                        ));
+                    }
+                }
+
+                // Java also accepts classic MetaMorph TIFFs by UIC tags even when
+                // SOFTWARE is absent: UIC1 + UIC3 + UIC4 on the first IFD.
+                if tiff_first_ifd_has_all_tags(path, &[33628, 33630, 33631]) {
+                    readers.push(boxed_reader(
+                        crate::formats::gpl::metamorph::MetamorphReader::new(),
+                    ));
+                }
+                if has_metamorph_nd_sibling(path) {
+                    readers.push(boxed_reader(
+                        crate::formats::gpl::metamorph::MetamorphReader::new(),
+                    ));
+                }
+                if let Some(description) = description.as_deref() {
+                    if description.contains("Improvision") {
+                        readers.push(boxed_reader(
+                            crate::formats::gpl::tiff_wrappers::ImprovisionTiffReader::new(),
+                        ));
+                    }
+                    let trimmed = description.trim();
+                    if trimmed.starts_with("<MetaData>") && trimmed.ends_with("</MetaData>") {
+                        readers.push(boxed_reader(
+                            crate::formats::gpl::tiff_wrappers::MetamorphTiffReader::new(),
+                        ));
+                    }
+                }
+                if software
+                    .as_deref()
+                    .map(|software| software.contains("EZ-C1"))
+                    .unwrap_or(false)
+                {
+                    readers.push(boxed_reader(
+                        crate::formats::gpl::tiff_wrappers::NikonTiffReader::new(),
+                    ));
+                }
+                if tiff_first_ifd_has_all_tags(path, &[50457]) {
+                    readers.push(boxed_reader(
+                        crate::formats::gpl::camera2::ImaconReader::new(),
+                    ));
+                }
+                if tiff_first_ifd_has_all_tags(path, &[37724]) {
+                    readers.push(boxed_reader(
+                        crate::formats::gpl::camera2::PhotoshopTiffReader::new(),
+                    ));
+                }
+                if tiff_first_ifd_has_any_tag(path, &[34680, 34682, 34683]) {
+                    readers.push(boxed_reader(
+                        crate::formats::gpl::tiff_wrappers::FeiTiffReader::new(),
+                    ));
+                }
+                if tiff_first_ifd_has_any_tag(path, &[34118]) {
+                    readers.push(boxed_reader(crate::formats::gpl::sem::LeoReader::new()));
+                }
+                if let Some(description) = description.as_deref() {
+                    readers.extend(simplepci_tiff_wrappers_for_description(description));
+                }
+                if tiff_first_ifd_has_all_tags(path, &[65332]) {
+                    readers.push(boxed_reader(
+                        crate::formats::gpl::tiff_wrappers::NikonElementsTiffReader::new(),
+                    ));
+                }
+                if tiff_first_ifd_copyright_contains(path, "Trestle Corp.") {
+                    readers.push(boxed_reader(crate::formats::gpl::hcs2::TrestleReader::new()));
+                }
+                if tiff_first_ifd_matches_sis(path) {
+                    readers.push(boxed_reader(
+                        crate::formats::gpl::tiff_wrappers::SisReader::new(),
+                    ));
+                }
+                if tiff_first_ifd_matches_dng(path) {
+                    readers.push(boxed_reader(crate::formats::extended::DngReader::new()));
+                }
+                if let Some(software) = software.as_deref() {
+                    if software.starts_with("PerkinElmer-QPI") {
+                        readers.push(boxed_reader(crate::formats::extended::VectraReader::new()));
+                    }
+                    if software.starts_with("IonpathMIBI") {
+                        readers.push(boxed_reader(
+                            crate::formats::gpl::hcs2::IonpathMibiTiffReader::new(),
+                        ));
+                    }
+                }
+                if zeiss_tiff_meta_xml_exists(path) {
+                    readers.push(boxed_reader(
+                        crate::formats::gpl::sem::ZeissTiffReader::new(),
+                    ));
+                }
+
+                if let Some(description) = description.as_deref() {
+                    readers.extend(remaining_generic_tiff_wrappers_for_description(
+                        path,
+                        ext.as_deref().unwrap_or_default(),
+                        description,
+                    ));
+                }
             }
 
             readers
@@ -1074,20 +1159,21 @@ fn has_columbus_measurement_index_sibling(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(feature = "gpl")]
 fn generic_tiff_name_wrappers(path: &Path, _header: &[u8]) -> Vec<Box<dyn FormatReader>> {
     let mut readers = Vec::new();
-    let mias = crate::formats::mias::MiasReader::new();
+    let mias = crate::formats::gpl::mias::MiasReader::new();
     if mias.is_this_type_by_name(path) {
         readers.push(boxed_reader(mias));
     }
     if !has_lei_sibling(path)
-        && (crate::formats::prairie::tcs_xml_sibling_references_tiff(path)
-            || crate::formats::prairie::is_tcs_tagged_tiff(path))
+        && (crate::formats::gpl::prairie::tcs_xml_sibling_references_tiff(path)
+            || crate::formats::gpl::prairie::is_tcs_tagged_tiff(path))
     {
-        readers.push(boxed_reader(crate::formats::prairie::TcsReader::new()));
+        readers.push(boxed_reader(crate::formats::gpl::prairie::TcsReader::new()));
     }
     if has_lei_sibling(path) {
-        readers.push(boxed_reader(crate::formats::leica::LeicaReader::new()));
+        readers.push(boxed_reader(crate::formats::gpl::leica::LeicaReader::new()));
     }
     readers
 }
@@ -1309,6 +1395,7 @@ fn tiff_first_ifd(path: &Path) -> Option<crate::tiff::ifd::Ifd> {
     parser.read_ifd(offset).ok().map(|(ifd, _)| ifd)
 }
 
+#[cfg(feature = "gpl")]
 fn simplepci_tiff_wrappers_for_description(description: &str) -> Vec<Box<dyn FormatReader>> {
     let mut readers = Vec::new();
     if description
@@ -1316,12 +1403,13 @@ fn simplepci_tiff_wrappers_for_description(description: &str) -> Vec<Box<dyn For
         .starts_with("Created by Hamamatsu Inc.")
     {
         readers.push(boxed_reader(
-            crate::formats::hcs2::SimplePciTiffReader::new(),
+            crate::formats::gpl::hcs2::SimplePciTiffReader::new(),
         ));
     }
     readers
 }
 
+#[cfg(feature = "gpl")]
 fn remaining_generic_tiff_wrappers_for_description(
     path: &Path,
     ext: &str,
@@ -1335,7 +1423,7 @@ fn remaining_generic_tiff_wrappers_for_description(
 
             if tiff_first_ifd_matches_fluoview(path, description) {
                 readers.push(boxed_reader(
-                    crate::formats::tiff_wrappers::FluoviewReader::new(),
+                    crate::formats::gpl::tiff_wrappers::FluoviewReader::new(),
                 ));
             }
             if description.contains("<Zeiss")
@@ -1344,7 +1432,7 @@ fn remaining_generic_tiff_wrappers_for_description(
                 || description.contains("AxioVision")
             {
                 readers.push(boxed_reader(
-                    crate::formats::tiff_wrappers::ZeissApotomeTiffReader::new(),
+                    crate::formats::gpl::tiff_wrappers::ZeissApotomeTiffReader::new(),
                 ));
             }
             if description.contains("<MetaXpress")
@@ -1352,14 +1440,14 @@ fn remaining_generic_tiff_wrappers_for_description(
                 || description.contains("<PlateID")
             {
                 readers.push(boxed_reader(
-                    crate::formats::tiff_wrappers::MolecularDevicesTiffReader::new(),
+                    crate::formats::gpl::tiff_wrappers::MolecularDevicesTiffReader::new(),
                 ));
             }
         }
         "tiff" => {
             if description.contains("<variant") || description.contains("NIS-Elements") {
                 readers.push(boxed_reader(
-                    crate::formats::tiff_wrappers::NikonElementsTiffReader::new(),
+                    crate::formats::gpl::tiff_wrappers::NikonElementsTiffReader::new(),
                 ));
             }
         }
@@ -1369,6 +1457,7 @@ fn remaining_generic_tiff_wrappers_for_description(
     readers
 }
 
+#[cfg(feature = "gpl")]
 fn hcs_tiff_wrappers_for_description(description: &str) -> Vec<Box<dyn FormatReader>> {
     let mut readers = Vec::new();
     let lower = description.to_ascii_lowercase();
@@ -1378,7 +1467,7 @@ fn hcs_tiff_wrappers_for_description(description: &str) -> Vec<Box<dyn FormatRea
         || lower.contains("<plateid")
     {
         readers.push(boxed_reader(
-            crate::formats::hcs2::MetaxpressTiffReader::new(),
+            crate::formats::gpl::hcs2::MetaxpressTiffReader::new(),
         ));
     }
     if description
@@ -1386,26 +1475,30 @@ fn hcs_tiff_wrappers_for_description(description: &str) -> Vec<Box<dyn FormatRea
         .starts_with("Created by Hamamatsu Inc.")
     {
         readers.push(boxed_reader(
-            crate::formats::hcs2::SimplePciTiffReader::new(),
+            crate::formats::gpl::hcs2::SimplePciTiffReader::new(),
         ));
     }
     if lower.contains("ionpath") || lower.contains("mibi") || lower.contains("mibiscope") {
         readers.push(boxed_reader(
-            crate::formats::hcs2::IonpathMibiTiffReader::new(),
+            crate::formats::gpl::hcs2::IonpathMibiTiffReader::new(),
         ));
     }
     if lower.contains("beckman coulter mias") {
-        readers.push(boxed_reader(crate::formats::hcs2::MiasTiffReader::new()));
+        readers.push(boxed_reader(
+            crate::formats::gpl::hcs2::MiasTiffReader::new(),
+        ));
     }
     if lower.contains("trestle") {
-        readers.push(boxed_reader(crate::formats::hcs2::TrestleReader::new()));
+        readers.push(boxed_reader(crate::formats::gpl::hcs2::TrestleReader::new()));
     }
     if lower.contains("tissuefaxs") || lower.contains("tissuegnostics") {
-        readers.push(boxed_reader(crate::formats::hcs2::TissueFaxsReader::new()));
+        readers.push(boxed_reader(
+            crate::formats::gpl::hcs2::TissueFaxsReader::new(),
+        ));
     }
     if lower.contains("mikroscan") || lower.contains("microvision instruments") {
         readers.push(boxed_reader(
-            crate::formats::hcs2::MikroscanTiffReader::new(),
+            crate::formats::gpl::hcs2::MikroscanTiffReader::new(),
         ));
     }
 
@@ -1771,6 +1864,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "gpl")]
     #[test]
     fn tiff_wrapper_extension_dispatch_runs_before_generic_tiff_reader() {
         let path = temp_path("wrapper_metadata.ndpi");
@@ -1800,6 +1894,7 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    #[cfg(feature = "gpl")]
     #[test]
     fn generic_tif_wrapper_dispatch_uses_fluoview_metadata_signature() {
         let path = temp_path("fluoview_metadata.tif");
@@ -1865,6 +1960,7 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    #[cfg(feature = "gpl")]
     #[test]
     fn dng_tif_dispatch_runs_before_generic_tiff_like_java() {
         let path = temp_path("canon_dng_as_tif.tif");
@@ -1887,6 +1983,7 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    #[cfg(feature = "gpl")]
     #[test]
     fn vectra_tif_software_dispatch_runs_before_generic_tiff_like_java() {
         let path = temp_path("vectra_as_tif.tif");
@@ -1901,6 +1998,7 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    #[cfg(feature = "gpl")]
     #[test]
     fn pyramid_tiff_faas_dispatch_runs_before_generic_tiff_like_java() {
         let path = temp_path("faas_pyramid_as_tif.tif");
@@ -1916,6 +2014,7 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    #[cfg(feature = "gpl")]
     #[test]
     fn ionpath_tif_software_dispatch_runs_before_generic_tiff_like_java() {
         let path = temp_path("ionpath_as_tif.tif");
@@ -1940,6 +2039,7 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    #[cfg(feature = "gpl")]
     #[test]
     fn zeiss_tiff_companion_xml_dispatch_runs_before_generic_tiff_like_java() {
         let path = temp_path("zeiss_axiovision.tif");
@@ -2050,6 +2150,7 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    #[cfg(feature = "gpl")]
     #[test]
     fn generic_tif_metamorph_prefix_without_end_tag_stays_generic_tiff() {
         let path = temp_path("metamorph_prefix_only.tif");
@@ -2072,6 +2173,7 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    #[cfg(feature = "gpl")]
     #[test]
     fn generic_tif_classic_metamorph_software_dispatches_before_generic_tiff() {
         let path = temp_path("classic_metamorph.tif");
@@ -2131,6 +2233,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[cfg(feature = "gpl")]
     #[test]
     fn pcoraw_dispatch_runs_before_generic_tiff_and_reads_rec_companion() {
         let image = temp_path("pco_pair.pcoraw");
@@ -2148,6 +2251,7 @@ mod tests {
         let _ = std::fs::remove_file(rec);
     }
 
+    #[cfg(feature = "gpl")]
     #[test]
     fn imacon_fff_dispatch_runs_before_generic_tiff() {
         let path = temp_path("imacon.fff");
@@ -2176,6 +2280,7 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    #[cfg(feature = "gpl")]
     #[test]
     fn imacon_tiff_tag_dispatch_runs_before_generic_tiff() {
         let path = temp_path("imacon_tagged.tif");
@@ -2197,6 +2302,7 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    #[cfg(feature = "gpl")]
     #[test]
     fn fei_tiff_tag_dispatch_runs_before_generic_tiff() {
         let path = temp_path("fei_tagged.tif");
@@ -2218,6 +2324,7 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    #[cfg(feature = "gpl")]
     #[test]
     fn nikon_raw_tif_make_dispatch_runs_before_generic_tiff() {
         let path = temp_path("nikon_raw_make.tif");
@@ -2235,6 +2342,7 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    #[cfg(feature = "gpl")]
     #[test]
     fn nikon_raw_dng_dispatch_runs_before_dng_reader_like_java() {
         let path = temp_path("eps_raw_make.dng");
@@ -2252,6 +2360,7 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    #[cfg(feature = "gpl")]
     #[test]
     fn nikon_elements_tiff_tag_dispatch_runs_before_generic_tiff() {
         let path = temp_path("nikon_elements_tagged.tif");
@@ -2269,6 +2378,7 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    #[cfg(feature = "gpl")]
     #[test]
     fn simplepci_tiff_precedes_nikon_elements_like_java_readers_txt() {
         let path = temp_path("simplepci_and_nikon_elements.tif");
@@ -2296,6 +2406,7 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    #[cfg(feature = "gpl")]
     #[test]
     fn non_java_simplepci_extra_does_not_override_nikon_elements() {
         let path = temp_path("hcimage_and_nikon_elements.tif");
@@ -2323,6 +2434,7 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    #[cfg(feature = "gpl")]
     #[test]
     fn improvision_tiff_comment_dispatch_runs_before_generic_tiff() {
         let path = temp_path("improvision_tagged.tif");
@@ -2343,6 +2455,7 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    #[cfg(feature = "gpl")]
     #[test]
     fn trestle_tiff_precedes_sis_like_java_readers_txt() {
         let path = temp_path("trestle_and_sis.tif");
@@ -2370,6 +2483,7 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    #[cfg(feature = "gpl")]
     #[test]
     fn photoshop_tiff_dispatch_runs_before_generic_tiff() {
         let path = temp_path("photoshop_layers.tif");
@@ -2384,6 +2498,7 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    #[cfg(feature = "gpl")]
     #[test]
     fn extensionless_fixed_length_canon_crw_dispatches_like_java_byte_probe() {
         let path = temp_path("legacy_canon_raw");
@@ -2401,6 +2516,7 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    #[cfg(feature = "gpl")]
     #[test]
     fn extensionless_sbig_dispatch_reads_full_java_probe_window() {
         let path = temp_path("sbig_no_suffix");
@@ -2416,7 +2532,7 @@ mod tests {
 
     #[test]
     fn dicom_name_detection_includes_jpeg2000_transfer_extensions() {
-        let reader = crate::formats::dicom::DicomReader::new();
+        let reader = crate::formats::bsd::dicom::DicomReader::new();
 
         assert!(reader.is_this_type_by_name(&PathBuf::from("ct.j2ki")));
         assert!(reader.is_this_type_by_name(&PathBuf::from("mr.j2kr")));
@@ -2441,6 +2557,7 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    #[cfg(feature = "gpl")]
     #[test]
     fn wpi_dispatches_to_cv7000_reader() {
         let path = temp_path("minimal.wpi");
@@ -2462,6 +2579,7 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    #[cfg(feature = "gpl")]
     #[test]
     fn generic_tif_hcs_wrapper_dispatch_uses_metadata_signature() {
         let path = temp_path("simplepci_metadata.tif");
@@ -2476,6 +2594,7 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    #[cfg(feature = "gpl")]
     #[test]
     fn generic_tif_hcs_words_without_vendor_signature_still_uses_generic_tiff() {
         let path = temp_path("plain_hcs_words.tif");
@@ -2493,6 +2612,7 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    #[cfg(feature = "gpl")]
     #[test]
     fn prairie_companion_tiff_entry_dispatches_before_generic_tiff() {
         let dir = temp_dir("prairie_tiff_entry");
@@ -2588,6 +2708,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[cfg(feature = "gpl")]
     #[test]
     fn leica_lei_companion_dispatches_before_generic_tiff_without_private_tag() {
         let dir = temp_dir("leica_lei_companion");
@@ -2617,6 +2738,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[cfg(feature = "gpl")]
     #[test]
     fn leica_lei_raw_companion_dispatches_before_generic_raw_like_java() {
         let dir = temp_dir("leica_lei_raw_companion");
@@ -2635,6 +2757,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[cfg(feature = "gpl")]
     #[test]
     fn leica_tcs_single_multipage_tiff_maps_later_planes_to_later_pages() {
         let dir = temp_dir("leica_tcs_pages");
@@ -2664,7 +2787,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut reader = crate::formats::prairie::TcsReader::new();
+        let mut reader = crate::formats::gpl::prairie::TcsReader::new();
         reader.set_id(&xml).unwrap();
 
         assert_eq!(reader.metadata().image_count, 2);
@@ -2673,6 +2796,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[cfg(feature = "gpl")]
     #[test]
     fn leica_tcs_companion_tiff_entry_dispatches_before_generic_tiff() {
         let dir = temp_dir("leica_tcs_tiff_entry");
@@ -2710,6 +2834,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[cfg(feature = "gpl")]
     #[test]
     fn leica_lei_companion_excludes_tcs_tiff_predispatch_like_java() {
         let dir = temp_dir("leica_lei_excludes_tcs_tiff");
@@ -2749,6 +2874,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[cfg(feature = "gpl")]
     #[test]
     fn leica_tcs_single_multipage_tiff_rejects_missing_exact_page() {
         let dir = temp_dir("leica_tcs_page_out_of_range");
@@ -2778,7 +2904,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut reader = crate::formats::prairie::TcsReader::new();
+        let mut reader = crate::formats::gpl::prairie::TcsReader::new();
         reader.set_id(&xml).unwrap();
         let err = reader.open_bytes(1).unwrap_err();
 
@@ -2789,6 +2915,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[cfg(feature = "gpl")]
     #[test]
     fn registered_unsupported_stubs_do_not_open_with_fake_metadata() {
         for (name, expected) in [
@@ -2876,6 +3003,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "gpl")]
     #[test]
     fn visitech_registry_opens_metadata_only_xys_but_rejects_hcs_without_tiffs() {
         let dir = temp_path("hcs_no_tiffs_dir");
@@ -2910,6 +3038,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[cfg(feature = "gpl")]
     #[test]
     fn registered_hdf5_readers_reject_unknown_layouts_without_fake_metadata() {
         for (name, expected) in [
@@ -2942,6 +3071,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "gpl")]
     #[test]
     fn imspector_magic_rejects_without_fake_metadata() {
         let path = temp_path("magic_imspector.obf");

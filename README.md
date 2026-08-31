@@ -79,21 +79,25 @@ known deviations from the translated Bio-Formats behavior.
 
 ### Read + Write
 
-| Format | Extensions | Rust-specific notes |
-|--------|-----------|-------|
-| TIFF / OME-TIFF | `.tif` `.tiff` `.tf2` `.tf8` `.btf` `.ome.tif` `.ome.tiff` `.ome.tf2` `.ome.tf8` `.ome.btf` | Auto-dispatched `.ome.*` writes ordinary OME-TIFF; use `PyramidOmeTiffWriter` directly for pyramid output. |
-| PNG | `.png` | |
-| JPEG | `.jpg` `.jpeg` | |
-| BMP | `.bmp` | |
-| TGA | `.tga` | |
-| ICS / ICS2 | `.ics` | |
-| MRC / CCP4 | `.mrc` `.mrcs` `.map` `.ccp4` | |
-| FITS | `.fits` `.fit` `.fts` | |
-| NRRD | `.nrrd` `.nhdr` | |
-| MetaImage | `.mha` `.mhd` | Rust-only writer. |
-| JPEG 2000 | `.jp2` `.j2k` `.j2c` `.jpc` | Write support is behind the default-on `jpeg2000-write` feature and is limited to single 2D lossless planes with 1 or 3 integer components. |
-| DICOM | `.dcm` | Writer emits unencapsulated planes. |
-| PNM / PGM / PPM | `.pnm` `.pgm` `.ppm` `.pbm` `.pfm` | Rust-only writer. |
+Reader license per upstream Bio-Formats' own split
+(`formats-bsd` vs `formats-gpl`); see [License](#license). "N/A" = no Bio-Formats
+counterpart (Rust-only addition).
+
+| Format | Extensions | License | Rust-specific notes |
+|--------|-----------|:---:|-------|
+| TIFF / OME-TIFF | `.tif` `.tiff` `.tf2` `.tf8` `.btf` `.ome.tif` `.ome.tiff` `.ome.tf2` `.ome.tf8` `.ome.btf` | BSD | Auto-dispatched `.ome.*` writes ordinary OME-TIFF; use `PyramidOmeTiffWriter` directly for pyramid output. |
+| PNG | `.png` | BSD | |
+| JPEG | `.jpg` `.jpeg` | BSD | |
+| BMP | `.bmp` | BSD | |
+| TGA | `.tga` | GPL | Read only; write is a Rust-only addition (no Java `TGAWriter`). |
+| ICS / ICS2 | `.ics` | BSD | |
+| MRC / CCP4 | `.mrc` `.mrcs` `.map` `.ccp4` | GPL | |
+| FITS | `.fits` `.fit` `.fts` | BSD | |
+| NRRD | `.nrrd` `.nhdr` | BSD | |
+| MetaImage | `.mha` `.mhd` | N/A | Rust-only reader and writer. |
+| JPEG 2000 | `.jp2` `.j2k` `.j2c` `.jpc` | BSD | Write support is behind the default-on `jpeg2000-write` feature and is limited to single 2D lossless planes with 1 or 3 integer components. |
+| DICOM | `.dcm` | BSD | Writer emits unencapsulated planes. |
+| PNM / PGM / PPM | `.pnm` `.pgm` `.ppm` `.pbm` `.pfm` | BSD | Read only for PGM (`PGMReader`); write is a Rust-only addition. |
 
 Additional write-capable formats (read support listed elsewhere): OME-XML
 (`.ome`, `.ome.xml`), APNG (`.apng`), AVI (`.avi`), EPS (`.eps`), QuickTime RAW
@@ -102,27 +106,27 @@ Additional write-capable formats (read support listed elsewhere): OME-XML
 
 ### Read only
 
-| Format | Extensions | Rust-specific notes |
-|--------|-----------|-------|
-| GIF | `.gif` | |
-| WebP | `.webp` | |
-| OpenEXR | `.exr` | |
-| HDR / RGBE | `.hdr` `.rgbe` | |
-| DDS | `.dds` | |
-| Farbfeld | `.ff` | |
-| Leica LIF | `.lif` | |
-| Nikon ND2 | `.nd2` | |
-| Zeiss CZI | `.czi` | JPEG-XR uses the default-on `jpegxr` feature. |
-| NIfTI-1 / Analyze 7.5 | `.nii` `.nii.gz` `.hdr` `.img` | |
-| Zeiss LSM | `.lsm` | |
-| Applied Precision DeltaVision | `.dv` `.r3d` | |
-| Andor SIF | `.sif` | |
-| Olympus FV1000 OIF | `.oif` | |
-| Gatan DM3 / DM4 | `.dm3` `.dm4` | |
-| Bio-Rad PIC | `.pic` | |
-| Princeton SPE | `.spe` | |
-| Norpix StreamPix | `.seq` | Rust-only reader; Bio-Formats' `.seq` reader is Image-Pro Sequence. |
-| Hamamatsu DCIMG | `.dcimg` | |
+| Format | Extensions | License | Rust-specific notes |
+|--------|-----------|:---:|-------|
+| GIF | `.gif` | BSD | |
+| WebP | `.webp` | N/A | Rust-only, via `image`. |
+| OpenEXR | `.exr` | N/A | Rust-only, via `image`. |
+| HDR / RGBE | `.hdr` `.rgbe` | N/A | Rust-only, via `image`. |
+| DDS | `.dds` | N/A | Rust-only, via `image`. |
+| Farbfeld | `.ff` | N/A | Rust-only, via `image`. |
+| Leica LIF | `.lif` | GPL | |
+| Nikon ND2 | `.nd2` | GPL | |
+| Zeiss CZI | `.czi` | GPL | JPEG-XR uses the default-on `jpegxr` feature. |
+| NIfTI-1 / Analyze 7.5 | `.nii` `.nii.gz` `.hdr` `.img` | GPL | |
+| Zeiss LSM | `.lsm` | GPL | |
+| Applied Precision DeltaVision | `.dv` `.r3d` | GPL | |
+| Andor SIF | `.sif` | GPL | |
+| Olympus FV1000 OIF | `.oif` | GPL | |
+| Gatan DM3 / DM4 | `.dm3` `.dm4` | GPL | |
+| Bio-Rad PIC | `.pic` | GPL | |
+| Princeton SPE | `.spe` | GPL | |
+| Norpix StreamPix | `.seq` | N/A | Rust-only reader; Bio-Formats' `.seq` reader is Image-Pro Sequence (GPL). |
+| Hamamatsu DCIMG | `.dcimg` | GPL | |
 
 ## Translation status (all readers)
 
@@ -148,168 +152,181 @@ Readers with **no Bio-Formats counterpart** are *added code*, not translations,
 so they are not rated here — see
 [Added (non-upstream) readers](#added-non-upstream-readers) for that list.
 
+The **License** column below reflects upstream Bio-Formats' own `formats-bsd`
+vs `formats-gpl` split (see [License](#license)); "N/A" means no Bio-Formats
+counterpart. Rows combining several readers list each license once.
+
 ### Standard image formats
 
-| Format | Extensions | Status | Rust-specific notes |
-|--------|-----------|:------:|-------|
-| TIFF / BigTIFF / OME-TIFF | `.tif` `.tiff` `.btf` `.tf8` | ✅ | Zstd and JP2 tile paths are implemented. |
-| PNG | `.png` | ✅ | APNG is routed separately. |
-| JPEG | `.jpg` `.jpeg` | ✅ | |
-| BMP | `.bmp` | ✅ | |
-| PCX | `.pcx` | ✅ | |
-| Imagic-5 | `.hed` `.img` | ✅ | |
-| TGA | `.tga` `.tpic` | ✅ | |
-| GIF | `.gif` | ✅ | |
-| WebP / OpenEXR / HDR / DDS / Farbfeld / PNM | `.webp` `.exr` `.hdr` `.dds` `.ff` `.pnm` `.pgm` `.ppm` `.pbm` `.pfm` | ✅ | Some entries are Rust-only additions via `image`. |
-| JPEG 2000 / JPX | `.jp2` `.j2k` `.j2c` `.jpc` `.jpx` | ✅ | |
-| EPS / PostScript | `.eps` `.epsi` `.ps` | ✅ | |
-| Photoshop PSD/PSB | `.psd` `.psb` | ✅ | |
-| Khoros VIFF | `.xv` `.viff` | ✅ | |
-| Apple PICT | `.pict` `.pct` | ✅ | |
-| ZIP container | `.zip` | ✅ | |
-| FilePattern dataset | `.pattern` | ✅ | |
-| APNG | `.apng` | ✅ | |
-| MNG | `.mng` | ✅ | |
-| AVI (video) | `.avi` | ✅ | |
-| QuickTime MOV/QT | `.mov` `.qt` | ✅ | Modern platform codecs are listed under missing external codecs. |
-| Fake (test format) | `.fake` | ✅ | Test-only format. |
+| Format | Extensions | Status | License | Rust-specific notes |
+|--------|-----------|:------:|:---:|-------|
+| TIFF / BigTIFF / OME-TIFF | `.tif` `.tiff` `.btf` `.tf8` | ✅ | BSD | Zstd and JP2 tile paths are implemented. |
+| PNG | `.png` | ✅ | BSD | APNG is routed separately. |
+| JPEG | `.jpg` `.jpeg` | ✅ | BSD | |
+| BMP | `.bmp` | ✅ | BSD | |
+| PCX | `.pcx` | ✅ | BSD | |
+| Imagic-5 | `.hed` `.img` | ✅ | GPL | |
+| TGA | `.tga` `.tpic` | ✅ | GPL | |
+| GIF | `.gif` | ✅ | BSD | |
+| WebP / OpenEXR / HDR / DDS / Farbfeld / PNM | `.webp` `.exr` `.hdr` `.dds` `.ff` `.pnm` `.pgm` `.ppm` `.pbm` `.pfm` | ✅ | BSD / N/A | PNM/PGM is BSD (`PGMReader`); the rest are Rust-only additions via `image`. |
+| JPEG 2000 / JPX | `.jp2` `.j2k` `.j2c` `.jpc` `.jpx` | ✅ | BSD / GPL | JPEG 2000 (`.jp2`/`.j2k`) is BSD; JPX is GPL. |
+| EPS / PostScript | `.eps` `.epsi` `.ps` | ✅ | BSD | |
+| Photoshop PSD/PSB | `.psd` `.psb` | ✅ | GPL | |
+| Khoros VIFF | `.xv` `.viff` | ✅ | GPL | |
+| Apple PICT | `.pict` `.pct` | ✅ | BSD | |
+| ZIP container | `.zip` | ✅ | BSD | |
+| FilePattern dataset | `.pattern` | ✅ | BSD | |
+| APNG | `.apng` | ✅ | BSD | |
+| MNG | `.mng` | ✅ | BSD | |
+| AVI (video) | `.avi` | ✅ | BSD | |
+| QuickTime MOV/QT | `.mov` `.qt` | ✅ | BSD | Modern platform codecs are listed under missing external codecs. |
+| Fake (test format) | `.fake` | ✅ | BSD | Test-only format. |
 
 ### Microscopy acquisition containers
 
-| Format | Extensions | Status | Rust-specific notes |
-|--------|-----------|:------:|-------|
-| Zeiss ZVI | `.zvi` | ✅ | |
-| Zeiss XRM/TXRM | `.xrm` `.txrm` `.txm` | ✅ | |
-| OME-XML | `.ome` | ✅ | |
-| Zeiss LSM | `.lsm` | ✅ | |
-| Olympus FV1000 OIF/OIB | `.oif` `.oib` | ✅ | |
-| Leica LEI | `.lei` | ✅ | |
-| Leica TCS | `.xml` | ✅ | |
-| MicroManager | `metadata.txt` `.json` | ✅ | |
-| Visitech | `.xys` `.html` | ✅ | |
-| Zeiss CZI | `.czi` | ✅ | JPEG-XR via default-on `jpegxr` feature. |
-| Nikon ND2 | `.nd2` | ✅ | |
-| Prairie View | `.xml` `.cfg` `.env` `.tif` | ✅ | |
-| MetaMorph STK | `.stk` `.nd` | ✅ | |
-| Leica XLEF | `.xlef` `.xlif` `.lms` | ✅ | Compressed/internal LMS Memory blocks return `UnsupportedFormat`. |
-| Imaris IMS | `.ims` | ✅ | |
-| Leica LIF | `.lif` | ✅ | |
-| Volocity | `.mvd2` `.aisf` `.aiix` `.dat` `.atsf` | ✅ | Proprietary fixture-complete validation remains dataset-limited. |
+| Format | Extensions | Status | License | Rust-specific notes |
+|--------|-----------|:------:|:---:|-------|
+| Zeiss ZVI | `.zvi` | ✅ | GPL | |
+| Zeiss XRM/TXRM | `.xrm` `.txrm` `.txm` | ✅ | GPL | |
+| OME-XML | `.ome` | ✅ | BSD | |
+| Zeiss LSM | `.lsm` | ✅ | GPL | |
+| Olympus FV1000 OIF/OIB | `.oif` `.oib` | ✅ | GPL | |
+| Leica LEI | `.lei` | ✅ | GPL | |
+| Leica TCS | `.xml` | ✅ | GPL | |
+| MicroManager | `metadata.txt` `.json` | ✅ | BSD | |
+| Visitech | `.xys` `.html` | ✅ | GPL | |
+| Zeiss CZI | `.czi` | ✅ | GPL | JPEG-XR via default-on `jpegxr` feature. |
+| Nikon ND2 | `.nd2` | ✅ | GPL | |
+| Prairie View | `.xml` `.cfg` `.env` `.tif` | ✅ | GPL | |
+| MetaMorph STK | `.stk` `.nd` | ✅ | GPL | |
+| Leica XLEF | `.xlef` `.xlif` `.lms` | ✅ | GPL | Compressed/internal LMS Memory blocks return `UnsupportedFormat`. |
+| Imaris IMS | `.ims` | ✅ | GPL | |
+| Leica LIF | `.lif` | ✅ | GPL | |
+| Volocity | `.mvd2` `.aisf` `.aiix` `.dat` `.atsf` | ✅ | GPL | Proprietary fixture-complete validation remains dataset-limited. |
 
 ### High-content screening (HCS)
 
-| Format | Extensions | Status | Rust-specific notes |
-|--------|-----------|:------:|-------|
-| PerkinElmer FLEX | `.flex` `.mea` `.res` | ✅ | |
-| InCell (GE) | `.xdce` `.xml` | ✅ | |
-| PerkinElmer UltraVIEW | `.htm` `.tim` `.csv` `.zpo` | ✅ | |
-| MIAS (Maia Scientific) | `.tif` | ✅ | |
-| Operetta / Columbus / InCell3000 / RCPNL | `.xml` `.rcpnl` `.frm` | ✅ | |
-| ScanR / CellVoyager / BD Pathway | `.xml` `.mlf` `.exp` | ✅ | |
-| Tecan plate ASCII | `.asc` | ✅ | |
-| Yokogawa CV7000/8000 | `.wpi` `.mlf` `.mrf` | ✅ | |
-| MetaXpress | `.htd` `.tif` | ✅ | |
-| SimplePCI / Trestle / Mikroscan / Ionpath MIBI / MIAS TIFFs | `.tif` | ✅ | |
-| TissueFAXS | `.aqproj` `.tfcyto` | ✅ | Optional `tissuefaxs` feature, enabled by default. |
-| Cellomics | `.c01` `.dib` | ✅ | |
-| CellWorX | `.htd` `.pnl` | ✅ | |
+All readers in this category are GPL upstream.
+
+| Format | Extensions | Status | License | Rust-specific notes |
+|--------|-----------|:------:|:---:|-------|
+| PerkinElmer FLEX | `.flex` `.mea` `.res` | ✅ | GPL | |
+| InCell (GE) | `.xdce` `.xml` | ✅ | GPL | |
+| PerkinElmer UltraVIEW | `.htm` `.tim` `.csv` `.zpo` | ✅ | GPL | |
+| MIAS (Maia Scientific) | `.tif` | ✅ | GPL | |
+| Operetta / Columbus / InCell3000 / RCPNL | `.xml` `.rcpnl` `.frm` | ✅ | GPL | |
+| ScanR / CellVoyager / BD Pathway | `.xml` `.mlf` `.exp` | ✅ | GPL | |
+| Tecan plate ASCII | `.asc` | ✅ | GPL | |
+| Yokogawa CV7000/8000 | `.wpi` `.mlf` `.mrf` | ✅ | GPL | |
+| MetaXpress | `.htd` `.tif` | ✅ | GPL | |
+| SimplePCI / Trestle / Mikroscan / Ionpath MIBI / MIAS TIFFs | `.tif` | ✅ | GPL | |
+| TissueFAXS | `.aqproj` `.tfcyto` | ✅ | GPL | Optional `tissuefaxs` feature, enabled by default. |
+| Cellomics | `.c01` `.dib` | ✅ | GPL | |
+| CellWorX | `.htd` `.pnl` | ✅ | GPL | |
 
 ### Whole-slide / pyramidal TIFF
 
-| Format | Extensions | Status | Rust-specific notes |
-|--------|-----------|:------:|-------|
-| Aperio SVS (+ generic WSI) | `.svs` `.ndpi` `.scn` `.vsi` `.afi` | ✅ | |
-| Hamamatsu NDPI | `.ndpi` | ✅ | |
-| Nikon NIS / FEI / Olympus SIS / Improvision / Zeiss ApoTome / Fluoview / Molecular Devices TIFFs | `.tif` `.tiff` | ✅ | |
-| Leica SCN | `.scn` | ✅ | |
-| Ventana/Roche BIF | `.bif` | ✅ | |
-| Hamamatsu NDPIS | `.ndpis` | ✅ | |
-| Olympus cellSens VSI | `.vsi` | ✅ | |
+All readers in this category are GPL upstream (or, for the two Rust-only TIFF
+wrappers below, live in the same GPL-gated `tiff_wrappers` module).
+
+| Format | Extensions | Status | License | Rust-specific notes |
+|--------|-----------|:------:|:---:|-------|
+| Aperio SVS (+ generic WSI) | `.svs` `.ndpi` `.scn` `.vsi` `.afi` | ✅ | GPL | |
+| Hamamatsu NDPI | `.ndpi` | ✅ | GPL | |
+| Nikon NIS / FEI / Olympus SIS / Improvision / Zeiss ApoTome / Fluoview / Molecular Devices TIFFs | `.tif` `.tiff` | ✅ | GPL | Zeiss ApoTome and Molecular Devices wrappers are Rust-only additions. |
+| Leica SCN | `.scn` | ✅ | GPL | |
+| Ventana/Roche BIF | `.bif` | ✅ | GPL | |
+| Hamamatsu NDPIS | `.ndpis` | ✅ | GPL | |
+| Olympus cellSens VSI | `.vsi` | ✅ | GPL | |
 
 ### Vendor microscopy & cameras
 
-| Format | Extensions | Status | Rust-specific notes |
-|--------|-----------|:------:|-------|
-| Applied Precision DeltaVision | `.dv` `.r3d` | ✅ | |
-| Gatan DM3/DM4 | `.dm3` `.dm4` | ✅ | |
-| Bio-Rad PIC | `.pic` | ✅ | |
-| IPLab | `.ipl` `.ipm` | ✅ | |
-| Bio-Rad GEL | `.1sc` | ✅ | |
-| Li-Cor L2D | `.l2d` `.scn` | ✅ | |
-| PCO-RAW | `.pcoraw` `.rec` | ✅ | `.rec` companion metadata is optional. |
-| Openlab Raw | `.raw` | ✅ | |
-| SM-Camera | `.smc` | ✅ | |
-| Andor SIF | `.sif` | ✅ | |
-| Princeton SPE | `.spe` | ✅ | |
-| Gatan DM2 | `.dm2` | ✅ | |
-| Lab Imaging LIM | `.lim` | ✅ | |
-| Hasselblad Imacon / Image-Pro IPW | `.fff` `.ipw` | ✅ | |
-| Hamamatsu DCIMG | `.dcimg` | ✅ | v0 legacy fallback is Rust-only extra. |
-| TillVision | `.vws` `.pst` | ✅ | |
-| Canon RAW / Minolta MRW / DNG (CFA) | `.cr2` `.crw` `.mrw` `.dng` | ✅ | |
-| Photoshop / QPTIFF / NIS TIFF wrappers | `.tif` `.qptiff` `.nif` | ✅ | |
-| Hamamatsu VMS/VMU | `.vms` `.vmu` | ✅ | |
+All readers in this category are GPL upstream.
+
+| Format | Extensions | Status | License | Rust-specific notes |
+|--------|-----------|:------:|:---:|-------|
+| Applied Precision DeltaVision | `.dv` `.r3d` | ✅ | GPL | |
+| Gatan DM3/DM4 | `.dm3` `.dm4` | ✅ | GPL | |
+| Bio-Rad PIC | `.pic` | ✅ | GPL | |
+| IPLab | `.ipl` `.ipm` | ✅ | GPL | |
+| Bio-Rad GEL | `.1sc` | ✅ | GPL | |
+| Li-Cor L2D | `.l2d` `.scn` | ✅ | GPL | |
+| PCO-RAW | `.pcoraw` `.rec` | ✅ | GPL | `.rec` companion metadata is optional. |
+| Openlab Raw | `.raw` | ✅ | GPL | |
+| SM-Camera | `.smc` | ✅ | GPL | |
+| Andor SIF | `.sif` | ✅ | GPL | |
+| Princeton SPE | `.spe` | ✅ | GPL | |
+| Gatan DM2 | `.dm2` | ✅ | GPL | |
+| Lab Imaging LIM | `.lim` | ✅ | GPL | |
+| Hasselblad Imacon / Image-Pro IPW | `.fff` `.ipw` | ✅ | GPL | |
+| Hamamatsu DCIMG | `.dcimg` | ✅ | GPL | v0 legacy fallback is Rust-only extra. |
+| TillVision | `.vws` `.pst` | ✅ | GPL | |
+| Canon RAW / Minolta MRW / DNG (CFA) | `.cr2` `.crw` `.mrw` `.dng` | ✅ | GPL | |
+| Photoshop / QPTIFF / NIS TIFF wrappers | `.tif` `.qptiff` `.nif` | ✅ | GPL | |
+| Hamamatsu VMS/VMU | `.vms` `.vmu` | ✅ | GPL | |
 
 ### Medical, volumetric & astronomy
 
-| Format | Extensions | Status | Rust-specific notes |
-|--------|-----------|:------:|-------|
-| MRC / CCP4 | `.mrc` `.mrcs` `.ccp4` `.map` `.rec` | ✅ | |
-| NIfTI-1 / Analyze 7.5 | `.nii` `.nii.gz` `.hdr` `.img` | ✅ | |
-| ICS / ICS2 | `.ics` | ✅ | |
-| Siemens Inveon | `.hdr` (+`.img`) | ✅ | |
-| POV-Ray DF3 | `.df3` | ✅ | |
-| SBIG astronomy | `.fts` | ✅ | |
-| FITS | `.fits` `.fit` `.fts` | ✅ | |
-| NRRD | `.nrrd` `.nhdr` | ✅ | |
-| DICOM | `.dcm` `.dicom` `.dic` | ✅ | |
-| ECAT7 PET | `.v` | ✅ | |
-| Varian FDF | `.fdf` | ✅ | |
-| Molecular Dynamics GEL | `.gel` | ✅ | |
-| Kodak BIP | `.bip` | ✅ | |
-| MINC | `.mnc` | ✅ | Classic MINC-1 uses a pure-Rust NetCDF-3 parser. |
-| PDS (planetary) | `.pds` | ✅ | |
-| Photon Dynamics | `.hdr` `.img` `.pds` | ✅ | |
+| Format | Extensions | Status | License | Rust-specific notes |
+|--------|-----------|:------:|:---:|-------|
+| MRC / CCP4 | `.mrc` `.mrcs` `.ccp4` `.map` `.rec` | ✅ | GPL | |
+| NIfTI-1 / Analyze 7.5 | `.nii` `.nii.gz` `.hdr` `.img` | ✅ | GPL | |
+| ICS / ICS2 | `.ics` | ✅ | BSD | |
+| Siemens Inveon | `.hdr` (+`.img`) | ✅ | GPL | |
+| POV-Ray DF3 | `.df3` | ✅ | GPL | |
+| SBIG astronomy | `.fts` | ✅ | GPL | |
+| FITS | `.fits` `.fit` `.fts` | ✅ | BSD | |
+| NRRD | `.nrrd` `.nhdr` | ✅ | BSD | |
+| DICOM | `.dcm` `.dicom` `.dic` | ✅ | BSD | |
+| ECAT7 PET | `.v` | ✅ | GPL | |
+| Varian FDF | `.fdf` | ✅ | GPL | |
+| Molecular Dynamics GEL | `.gel` | ✅ | GPL | |
+| Kodak BIP | `.bip` | ✅ | GPL | |
+| MINC | `.mnc` | ✅ | GPL | Classic MINC-1 uses a pure-Rust NetCDF-3 parser. |
+| PDS (planetary) | `.pds` | ✅ | GPL | |
+| Photon Dynamics | `.hdr` `.img` `.pds` | ✅ | N/A | Rust-only reader (no Bio-Formats counterpart). |
 
 ### Electron / scanning-probe / AFM microscopy
 
-| Format | Extensions | Status | Rust-specific notes |
-|--------|-----------|:------:|-------|
-| FEI/Philips XL SEM | `.img` | ✅ | |
-| INRIMAGE-4 | `.inr` | ✅ | |
-| Veeco/Nanoscope AFM | `.afm` | ✅ | |
-| Seiko / UBM / VG SAM / WA-Top SPM | `.xqd` `.pr3` `.dti` `.wat` | ✅ | |
-| Unisoku STM/AFM | `.hdr` `.dat` | ✅ | |
-| JPK AFM | `.jpk` | ✅ | |
-| Scanco AIM/ISQ micro-CT | `.aim` `.isq` | ✅ | |
-| Zeiss TIFF SEM | `.tif` | ✅ | |
-| Hitachi SEM | `.txt` | ✅ | |
-| LEO/Zeiss SEM | `.tif` | ✅ | |
-| RHK SPM | `.sm2` `.sm3` `.sm4` | ✅ | |
-| TopoMetrix AFM | `.tfr` `.zfr` | ✅ | Byte probe is extra Rust support. |
-| IMOD mesh | `.mod` | ✅ | |
-| JEOL | `.dat` `.img` `.par` | ✅ | |
-| Zeiss LMS (LMSFile) | `.lms` | ✅ | |
-| Quesant AFM | `.afm` | ✅ | |
+All readers in this category are GPL upstream.
+
+| Format | Extensions | Status | License | Rust-specific notes |
+|--------|-----------|:------:|:---:|-------|
+| FEI/Philips XL SEM | `.img` | ✅ | GPL | |
+| INRIMAGE-4 | `.inr` | ✅ | GPL | |
+| Veeco/Nanoscope AFM | `.afm` | ✅ | GPL | |
+| Seiko / UBM / VG SAM / WA-Top SPM | `.xqd` `.pr3` `.dti` `.wat` | ✅ | GPL | |
+| Unisoku STM/AFM | `.hdr` `.dat` | ✅ | GPL | |
+| JPK AFM | `.jpk` | ✅ | GPL | |
+| Scanco AIM/ISQ micro-CT | `.aim` `.isq` | ✅ | GPL | |
+| Zeiss TIFF SEM | `.tif` | ✅ | GPL | |
+| Hitachi SEM | `.txt` | ✅ | GPL | |
+| LEO/Zeiss SEM | `.tif` | ✅ | GPL | |
+| RHK SPM | `.sm2` `.sm3` `.sm4` | ✅ | GPL | |
+| TopoMetrix AFM | `.tfr` `.zfr` | ✅ | GPL | Byte probe is extra Rust support. |
+| IMOD mesh | `.mod` | ✅ | GPL | |
+| JEOL | `.dat` `.img` `.par` | ✅ | GPL | |
+| Zeiss LMS (LMSFile) | `.lms` | ✅ | GPL | |
+| Quesant AFM | `.afm` | ✅ | GPL | |
 
 ### FLIM / lifetime / flow / HDF5
 
-| Format | Extensions | Status | Rust-specific notes |
-|--------|-----------|:------:|-------|
-| Lambert LI-FLIM | `.fli` | ✅ | |
-| Becker & Hickl SDT/SPC | `.sdt` `.spc` | ✅ | |
-| Amira/Avizo Mesh | `.am` `.amiramesh` | ✅ | |
-| Spider EM | `.spi` `.xmp` | ✅ | |
-| Amnis FlowSight CIF | `.cif` | ✅ | |
-| CellH5 | `.ch5` | ✅ | |
-| Aperio AFI / Bio-Rad SCN | `.afi` `.scn` | ✅ | |
-| Imaris TIFF / SlideBook TIFF | `.ims` `.tif` | ✅ | |
-| BigDataViewer | `.h5` | ✅ | |
-| Olympus OIR / Volocity clipping | `.oir` `.acff` | ✅ | |
-| Imspector OBF/MSR | `.obf` `.msr` | ✅ | Bio-Formats-style OBF is handled separately by `ObfReader`. |
-| Amnis IM3 | `.im3` | ✅ | |
-| SlideBook 7 | `.sld` `.sldy` `.sldyz` | ✅ | |
-| iVision IPM | `.ipm` | ✅ | |
+| Format | Extensions | Status | License | Rust-specific notes |
+|--------|-----------|:------:|:---:|-------|
+| Lambert LI-FLIM | `.fli` | ✅ | GPL | |
+| Becker & Hickl SDT/SPC | `.sdt` `.spc` | ✅ | GPL | |
+| Amira/Avizo Mesh | `.am` `.amiramesh` | ✅ | GPL | |
+| Spider EM | `.spi` `.xmp` | ✅ | GPL | |
+| Amnis FlowSight CIF | `.cif` | ✅ | BSD | |
+| CellH5 | `.ch5` | ✅ | BSD | |
+| Aperio AFI / Bio-Rad SCN | `.afi` `.scn` | ✅ | GPL | |
+| Imaris TIFF / SlideBook TIFF | `.ims` `.tif` | ✅ | GPL | |
+| BigDataViewer | `.h5` | ✅ | BSD | |
+| Olympus OIR / Volocity clipping | `.oir` `.acff` | ✅ | GPL | |
+| Imspector OBF/MSR | `.obf` `.msr` | ✅ | GPL / BSD | Imspector `.msr` is GPL; Bio-Formats-style OBF is BSD, handled separately by `ObfReader`. |
+| Amnis IM3 | `.im3` | ✅ | BSD | |
+| SlideBook 7 | `.sld` `.sldy` `.sldyz` | ✅ | BSD | |
+| iVision IPM | `.ipm` | ✅ | GPL | |
 
 Various no-Java-reference camera/SPM readers remain best-effort extensions; when
 native layout is unknown they return `UnsupportedFormat` instead of guessed
@@ -323,16 +340,21 @@ of a Bio-Formats reader. They are listed separately because there is no Java
 reader to be faithful to; confidence comes from local synthetic tests, optional
 real fixtures, or the wrapped upstream library.
 
-| Reader | Extensions | Validation | Note |
-|--------|-----------|------------|------|
-| MetaImage (ITK) | `.mha` `.mhd` | Synthetic round-trip plus optional real fixture. | ITK/MetaIO volume. |
-| OME-Zarr / NGFF | `.zarr` | Synthetic NGFF/plain-Zarr tests. | Ported from the separate `ome/ZarrReader`. |
-| OpenSlide | `.mrxs` | Covered by OpenSlide and optional local feature tests. | Wraps the OpenSlide library only as a fallback for MRXS. Overlapping OpenSlide formats such as BIF, CZI, DICOM, NDPI, SCN, SVS, TIFF, and VMS/VMU are intentionally handled by native bioformats-rs readers first because they provide fuller Bio-Formats metadata and format semantics. |
-| SimFCS | `.b64` `.r64` `.i64` | Synthetic raw-frame tests. | Globals SimFCS raw FLIM frames. |
-| Norpix StreamPix | `.seq` | Synthetic header, timestamp, and pixel tests. | Bio-Formats' `SEQReader` is unrelated Image-Pro Sequence. |
-| Bruker MicroCT | `.ctf` | Needs a real fixture before claiming support. | Bio-Formats' translated MicroCT reader is the separate `.vff` reader. |
-| PCO B16 | `.b16` | Synthetic header and pixel tests. | Raw uint16 PCO camera files. |
-| PicoQuant PTU/PHU | `.ptu` `.phu` `.pqres` | Synthetic metadata/reconstruction tests plus optional real fixture. | Set `BIOFORMATS_RS_PICOQUANT_FIXTURE` for local PTU/PQRes coverage. |
+None of these are part of the upstream BSD/GPL split (License = N/A), except
+OME-Zarr, whose upstream `ome/ZarrReader` is its own separate BSD-2-Clause
+project. A few are nevertheless only *compiled* under the `gpl` feature because
+they happen to live in a file whose other readers are GPL (noted below).
+
+| Reader | Extensions | License | Validation | Note |
+|--------|-----------|:---:|------------|------|
+| MetaImage (ITK) | `.mha` `.mhd` | N/A | Synthetic round-trip plus optional real fixture. | ITK/MetaIO volume. |
+| OME-Zarr / NGFF | `.zarr` | BSD | Synthetic NGFF/plain-Zarr tests. | Ported from the separate `ome/ZarrReader`. |
+| OpenSlide | `.mrxs` | N/A | Covered by OpenSlide and optional local feature tests. | Wraps the OpenSlide library (itself LGPL-2.1) only as a fallback for MRXS. Overlapping OpenSlide formats such as BIF, CZI, DICOM, NDPI, SCN, SVS, TIFF, and VMS/VMU are intentionally handled by native bioformats-rs readers first because they provide fuller Bio-Formats metadata and format semantics. |
+| SimFCS | `.b64` `.r64` `.i64` | N/A | Synthetic raw-frame tests. | Globals SimFCS raw FLIM frames. |
+| Norpix StreamPix | `.seq` | N/A | Synthetic header, timestamp, and pixel tests. | Bio-Formats' `SEQReader` is unrelated Image-Pro Sequence (GPL). Only compiled under `gpl`: lives alongside GPL readers in `formats::gpl::norpix`. |
+| Bruker MicroCT | `.ctf` | N/A | Needs a real fixture before claiming support. | Bio-Formats' translated MicroCT reader is the separate `.vff` reader. Only compiled under `gpl`: lives alongside GPL readers in `formats::gpl::bruker`. |
+| PCO B16 | `.b16` | N/A | Synthetic header and pixel tests. | Raw uint16 PCO camera files. Only compiled under `gpl`: lives alongside GPL readers in `formats::gpl::camera2`. |
+| PicoQuant PTU/PHU | `.ptu` `.phu` `.pqres` | N/A | Synthetic metadata/reconstruction tests plus optional real fixture. | Set `BIOFORMATS_RS_PICOQUANT_FIXTURE` for local PTU/PQRes coverage. Only compiled under `gpl`: lives alongside GPL readers in `formats::gpl::spm`. |
 
 ## Intentional deviations from Java Bio-Formats
 
@@ -856,7 +878,21 @@ In addition, we appreciate if you cite the paper below describing the translatio
 
 ## License
 
-GPL v2 or later (`GPL-2.0-or-later`), matching the upstream Bio-Formats
+GPL v2 or later (`GPL-2.0-or-later`) by default, matching the upstream Bio-Formats
 `formats-gpl` grant ("either version 2 of the License, or (at your option) any
 later version"). Bio-Formats' `formats-bsd`/`formats-api` components are BSD-2-Clause;
-because this crate also translates GPL readers, the combined work is GPL-2.0-or-later.
+because this crate also translates GPL readers by default, the combined work is
+GPL-2.0-or-later as distributed.
+
+Readers are split the same way upstream splits them, under `src/formats/gpl/` and
+`src/formats/bsd/` (mixed-format files gate their individual GPL readers with
+`#[cfg(feature = "gpl")]`). The `gpl` cargo feature is on by default; disabling it
+excludes all GPL-derived reader source from compilation, not just from the format
+registry:
+
+```bash
+cargo build --no-default-features --features "jpegxr,zarr,tissuefaxs"
+```
+
+This produces a BSD-2-Clause-only binary, at the cost of most format coverage (the
+majority of Bio-Formats readers are GPL upstream).

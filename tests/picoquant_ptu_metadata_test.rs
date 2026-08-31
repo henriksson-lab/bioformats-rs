@@ -1,3 +1,7 @@
+//! Every reader exercised here lives in `src/formats/gpl/`, so the whole
+//! test crate is empty in a BSD-only (`--no-default-features`) build.
+#![cfg(feature = "gpl")]
+
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -218,7 +222,7 @@ fn picoquant_ptu_rejects_picoharp_marker_raster_candidates_without_hydraharp_inf
         let path = tmp(label);
         std::fs::write(&path, picoharp_marker_raster_candidate(code)).unwrap();
 
-        let mut reader = bioformats::formats::spm::PicoQuantReader::new();
+        let mut reader = bioformats::formats::gpl::spm::PicoQuantReader::new();
         reader.set_id(&path).unwrap();
         let meta = reader.metadata();
         assert!(matches!(
@@ -319,7 +323,7 @@ fn picoquant_ptu_recognizes_non_hydraharp_tttr_record_metadata_before_marker_rec
         let path = tmp(label);
         std::fs::write(&path, minimal_ptu(code)).unwrap();
 
-        let mut reader = bioformats::formats::spm::PicoQuantReader::new();
+        let mut reader = bioformats::formats::gpl::spm::PicoQuantReader::new();
         reader.set_id(&path).unwrap();
         let meta = reader.metadata();
         assert_eq!(meta.size_x, 3);
@@ -416,7 +420,7 @@ fn picoquant_ptu_marks_unknown_tttr_record_mode_as_ambiguous() {
     let path = tmp("unknown_tttr_record.ptu");
     std::fs::write(&path, minimal_ptu(0x0001_0999)).unwrap();
 
-    let mut reader = bioformats::formats::spm::PicoQuantReader::new();
+    let mut reader = bioformats::formats::gpl::spm::PicoQuantReader::new();
     reader.set_id(&path).unwrap();
     let meta = reader.metadata();
     assert_eq!(meta.size_x, 3);
@@ -490,7 +494,7 @@ fn picoquant_ptu_infers_t2_t3_mode_from_unknown_tttr_record_mode_byte() {
         let path = tmp(mode);
         std::fs::write(&path, minimal_ptu(code)).unwrap();
 
-        let mut reader = bioformats::formats::spm::PicoQuantReader::new();
+        let mut reader = bioformats::formats::gpl::spm::PicoQuantReader::new();
         reader.set_id(&path).unwrap();
         let meta = reader.metadata();
         assert!(matches!(
@@ -544,7 +548,7 @@ fn picoquant_ptu_marks_missing_tttr_record_mode_as_unspecified() {
     let path = tmp("missing_tttr_record_type.ptu");
     std::fs::write(&path, minimal_ptu_without_record_type()).unwrap();
 
-    let mut reader = bioformats::formats::spm::PicoQuantReader::new();
+    let mut reader = bioformats::formats::gpl::spm::PicoQuantReader::new();
     reader.set_id(&path).unwrap();
     let meta = reader.metadata();
     assert_eq!(meta.size_x, 3);
@@ -601,7 +605,7 @@ fn picoquant_ptu_marks_histogram_mode_as_unambiguous() {
     let path = tmp("histogram_mode.ptu");
     std::fs::write(&path, minimal_histogram_ptu()).unwrap();
 
-    let mut reader = bioformats::formats::spm::PicoQuantReader::new();
+    let mut reader = bioformats::formats::gpl::spm::PicoQuantReader::new();
     reader.set_id(&path).unwrap();
     let meta = reader.metadata();
     assert_eq!(meta.size_x, 4);
@@ -631,7 +635,7 @@ fn picoquant_ptu_recognizes_histo_result_histogram_metadata_variant() {
     let path = tmp("histo_result_metadata.ptu");
     std::fs::write(&path, minimal_histo_result_ptu(5, 2)).unwrap();
 
-    let mut reader = bioformats::formats::spm::PicoQuantReader::new();
+    let mut reader = bioformats::formats::gpl::spm::PicoQuantReader::new();
     reader.set_id(&path).unwrap();
     let meta = reader.metadata();
     assert_eq!(meta.size_x, 5);
@@ -687,7 +691,7 @@ fn picoquant_ptu_reports_supported_histogram_payload_sizes_for_unmatched_payload
     data.extend_from_slice(&[1, 2, 3, 4, 5, 6]);
     std::fs::write(&path, data).unwrap();
 
-    let mut reader = bioformats::formats::spm::PicoQuantReader::new();
+    let mut reader = bioformats::formats::gpl::spm::PicoQuantReader::new();
     reader.set_id(&path).unwrap();
     let meta = reader.metadata();
     assert!(matches!(
@@ -733,7 +737,7 @@ fn picoquant_ptu_decodes_declared_zlib_histogram_payload() {
     data.extend_from_slice(&zlib_encode(&raw));
     std::fs::write(&path, data).unwrap();
 
-    let mut reader = bioformats::formats::spm::PicoQuantReader::new();
+    let mut reader = bioformats::formats::gpl::spm::PicoQuantReader::new();
     reader.set_id(&path).unwrap();
     let meta = reader.metadata();
     assert_eq!(meta.size_x, 4);
@@ -792,7 +796,7 @@ fn picoquant_ptu_decodes_declared_gzip_histogram_payload() {
     data.extend_from_slice(&gzip_encode(&raw));
     std::fs::write(&path, data).unwrap();
 
-    let mut reader = bioformats::formats::spm::PicoQuantReader::new();
+    let mut reader = bioformats::formats::gpl::spm::PicoQuantReader::new();
     reader.set_id(&path).unwrap();
     let meta = reader.metadata();
     assert_eq!(meta.size_x, 3);
@@ -832,7 +836,7 @@ fn picoquant_ptu_decodes_declared_raw_deflate_histogram_payload() {
     data.extend_from_slice(&deflate_encode(&raw));
     std::fs::write(&path, data).unwrap();
 
-    let mut reader = bioformats::formats::spm::PicoQuantReader::new();
+    let mut reader = bioformats::formats::gpl::spm::PicoQuantReader::new();
     reader.set_id(&path).unwrap();
     let meta = reader.metadata();
     assert_eq!(meta.size_x, 2);
@@ -868,7 +872,7 @@ fn picoquant_ptu_reports_integer_compressed_histogram_flag_and_payload_signature
     data.extend_from_slice(&[0x1f, 0x8b, 0x08, 0x00, 0xff]);
     std::fs::write(&path, data).unwrap();
 
-    let mut reader = bioformats::formats::spm::PicoQuantReader::new();
+    let mut reader = bioformats::formats::gpl::spm::PicoQuantReader::new();
     reader.set_id(&path).unwrap();
     let meta = reader.metadata();
     assert!(matches!(
@@ -914,7 +918,7 @@ fn picoquant_ptu_preserves_non_contiguous_histogram_descriptor_metadata_without_
     }
     std::fs::write(&path, data).unwrap();
 
-    let mut reader = bioformats::formats::spm::PicoQuantReader::new();
+    let mut reader = bioformats::formats::gpl::spm::PicoQuantReader::new();
     reader.set_id(&path).unwrap();
     let meta = reader.metadata();
     assert_eq!(meta.size_x, 1);
@@ -979,7 +983,7 @@ fn picoquant_ptu_preserves_mixed_indexed_histogram_bin_counts_without_decoding()
     }
     std::fs::write(&path, data).unwrap();
 
-    let mut reader = bioformats::formats::spm::PicoQuantReader::new();
+    let mut reader = bioformats::formats::gpl::spm::PicoQuantReader::new();
     reader.set_id(&path).unwrap();
     let meta = reader.metadata();
     assert_eq!(meta.size_x, 2);
@@ -1048,7 +1052,7 @@ fn picoquant_ptu_decodes_equal_width_indexed_histogram_descriptors() {
     }
     std::fs::write(&path, data).unwrap();
 
-    let mut reader = bioformats::formats::spm::PicoQuantReader::new();
+    let mut reader = bioformats::formats::gpl::spm::PicoQuantReader::new();
     reader.set_id(&path).unwrap();
     let meta = reader.metadata();
     assert_eq!(meta.size_x, 3);
@@ -1116,7 +1120,7 @@ fn picoquant_ptu_decodes_indexed_offset_histogram_payload_with_padding() {
     }
     std::fs::write(&path, data).unwrap();
 
-    let mut reader = bioformats::formats::spm::PicoQuantReader::new();
+    let mut reader = bioformats::formats::gpl::spm::PicoQuantReader::new();
     reader.set_id(&path).unwrap();
     let meta = reader.metadata();
     assert_eq!(meta.size_x, 3);
@@ -1181,7 +1185,7 @@ fn picoquant_ptu_decodes_histo_result_histogram_payload_with_explicit_curve_coun
     }
     std::fs::write(&path, data).unwrap();
 
-    let mut reader = bioformats::formats::spm::PicoQuantReader::new();
+    let mut reader = bioformats::formats::gpl::spm::PicoQuantReader::new();
     reader.set_id(&path).unwrap();
     let meta = reader.metadata();
     assert_eq!(meta.size_x, 3);
@@ -1234,7 +1238,7 @@ fn picoquant_ptu_decodes_headered_histo_result_payload_from_declared_offset() {
     }
     std::fs::write(&path, data).unwrap();
 
-    let mut reader = bioformats::formats::spm::PicoQuantReader::new();
+    let mut reader = bioformats::formats::gpl::spm::PicoQuantReader::new();
     reader.set_id(&path).unwrap();
     let meta = reader.metadata();
     assert_eq!(meta.size_x, 3);
@@ -1295,7 +1299,7 @@ fn picoquant_ptu_rejects_histogram_payload_offset_past_payload() {
     data.extend_from_slice(&[1, 2, 3, 4]);
     std::fs::write(&path, data).unwrap();
 
-    let mut reader = bioformats::formats::spm::PicoQuantReader::new();
+    let mut reader = bioformats::formats::gpl::spm::PicoQuantReader::new();
     let err = reader.set_id(&path).unwrap_err();
     assert!(
         matches!(

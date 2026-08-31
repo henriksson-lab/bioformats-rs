@@ -1,0 +1,46 @@
+pub mod afm;
+pub mod aim;
+pub mod amira;
+pub mod biorad;
+pub mod bruker;
+pub mod camera2;
+pub mod clinical;
+pub mod dcimg;
+pub mod deltavision;
+pub mod flex;
+pub mod flim;
+pub mod gatan;
+pub mod hcs2;
+pub mod imagic;
+pub mod imaris_hdf;
+pub mod incell;
+pub mod khoros;
+pub mod leica;
+// Support module for flim2::XlefReader (Java's GPL LeicaMicrosystemsMetadata
+// subpackage); no FormatReader impl of its own, but part of the same GPL
+// subsystem as its only caller.
+pub mod leica_lms;
+pub mod lif;
+pub mod lim;
+pub mod metamorph;
+pub mod mias;
+pub mod mrc;
+pub mod nd2;
+pub mod nifti;
+pub mod norpix;
+pub mod olympus;
+pub mod perkinelmer;
+pub mod prairie;
+pub mod psd;
+pub mod sem;
+pub mod sif;
+pub mod spe;
+pub mod spm;
+pub mod svs;
+pub mod tiff_wrappers;
+pub mod visitech;
+pub mod volocity;
+pub mod zeiss_czi;
+pub mod zeiss_lsm;
+pub mod zeiss_xrm;
+pub mod zeiss_zvi;

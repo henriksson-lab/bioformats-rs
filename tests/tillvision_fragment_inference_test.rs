@@ -154,7 +154,7 @@ fn tillvision_inf_entry_point_reads_bands_as_separate_channel_planes() {
     .unwrap();
     std::fs::write(&pst, [1u8, 2, 3, 4]).unwrap();
 
-    let reader_probe = bioformats::formats::lim::TillVisionReader::new();
+    let reader_probe = bioformats::formats::gpl::lim::TillVisionReader::new();
     assert!(reader_probe.is_this_type_by_name(&inf));
 
     let mut reader = ImageReader::open(&inf).unwrap();
@@ -209,7 +209,7 @@ fn tillvision_vws_reports_truncated_class_name_fixed_offset_cimage_layout() {
     contents[28..40].copy_from_slice(b"SpecialImage");
     write_tillvision_vws_with_contents(&vws, &contents);
 
-    let mut reader = bioformats::formats::lim::TillVisionReader::new();
+    let mut reader = bioformats::formats::gpl::lim::TillVisionReader::new();
     let err = reader.set_id(&vws).unwrap_err();
     assert!(
         matches!(err, BioFormatsError::UnsupportedFormat(ref message)
@@ -389,7 +389,7 @@ fn tillvision_vws_rejects_fragment_end_before_offset() {
         ),
     );
 
-    let mut reader = bioformats::formats::lim::TillVisionReader::new();
+    let mut reader = bioformats::formats::gpl::lim::TillVisionReader::new();
     let err = reader.set_id(&vws).unwrap_err();
     assert!(
         matches!(err, BioFormatsError::UnsupportedFormat(ref message)
@@ -579,7 +579,7 @@ fn tillvision_vws_rejects_native_compressed_flag_without_algorithm() {
         ),
     );
 
-    let mut reader = bioformats::formats::lim::TillVisionReader::new();
+    let mut reader = bioformats::formats::gpl::lim::TillVisionReader::new();
     let err = reader.set_id(&vws).unwrap_err();
     assert!(
         matches!(err, BioFormatsError::UnsupportedFormat(ref message)
@@ -633,7 +633,7 @@ fn tillvision_vws_rejects_ambiguous_implicit_fragment_payload_without_descriptio
         ]),
     );
 
-    let mut reader = bioformats::formats::lim::TillVisionReader::new();
+    let mut reader = bioformats::formats::gpl::lim::TillVisionReader::new();
     let err = reader.set_id(&vws).unwrap_err();
     assert!(
         matches!(err, BioFormatsError::UnsupportedFormat(ref message)

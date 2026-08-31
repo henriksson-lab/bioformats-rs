@@ -9,7 +9,7 @@ use bioformats::common::error::BioFormatsError;
 use bioformats::common::metadata::MetadataValue;
 use bioformats::common::pixel_type::PixelType;
 use bioformats::common::reader::FormatReader;
-use bioformats::formats::sem::ImodReader;
+use bioformats::formats::gpl::sem::ImodReader;
 use std::path::PathBuf;
 
 fn tmp(name: &str) -> PathBuf {

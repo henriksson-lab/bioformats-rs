@@ -375,6 +375,7 @@ mod tests {
         std::env::temp_dir().join(format!("bioformats_memoizer_{nanos}_{name}"))
     }
 
+    #[cfg(feature = "gpl")]
     fn write_minimal_sbig(path: &Path) {
         let mut bytes = vec![0u8; 2048];
         bytes[..21].copy_from_slice(b"ST-7 Compressed Image");
@@ -568,6 +569,7 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    #[cfg(feature = "gpl")]
     #[test]
     fn cache_hit_preserves_extensionless_sbig_detection() {
         let path = temp_path("cached_sbig_no_suffix");
