@@ -5,23 +5,31 @@
 //! Group C: Extension-only unsupported detectors and small native readers.
 
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use crate::common::compressed::{CompressedExtractionSupport, CompressedTile, CompressedTileMode};
 use crate::common::error::{BioFormatsError, Result};
-use crate::common::metadata::{
-    DimensionOrder, ImageMetadata, LookupTable, MetadataLevel, MetadataOptions, MetadataValue,
-};
+use crate::common::metadata::{DimensionOrder, ImageMetadata, LookupTable};
+use crate::common::pixel_type::PixelType;
+use crate::common::reader::FormatReader;
+use crate::common::region::crop_full_plane;
+
+// Used only by the GPL-gated readers in this mixed module.
+#[cfg(feature = "gpl")]
+use crate::common::compressed::{CompressedExtractionSupport, CompressedTile, CompressedTileMode};
+#[cfg(feature = "gpl")]
+use crate::common::metadata::{MetadataLevel, MetadataOptions, MetadataValue};
+#[cfg(feature = "gpl")]
 use crate::common::ome_metadata::{
     create_lsid, OmeChannel, OmeDetector, OmeImage, OmeInstrument, OmeMetadata, OmeObjective,
     OmePlane, OmePlate, OmeROI, OmeShape, OmeWell, OmeWellSample,
 };
-use crate::common::pixel_type::PixelType;
-use crate::common::reader::FormatReader;
-use crate::common::region::crop_full_plane;
+#[cfg(feature = "gpl")]
 use crate::tiff::jpeg_restart;
+#[cfg(feature = "gpl")]
+use std::fs::File;
+#[cfg(feature = "gpl")]
+use std::io::{Seek, SeekFrom};
 
 // ---------------------------------------------------------------------------
 // Shared helpers

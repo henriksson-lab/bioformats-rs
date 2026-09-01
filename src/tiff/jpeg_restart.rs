@@ -507,6 +507,7 @@ pub(crate) fn index(jpeg: &[u8]) -> Option<JpegRestartIndex> {
 }
 
 impl JpegRestartIndex {
+    #[cfg(feature = "gpl")]
     pub(crate) fn height(&self) -> u32 {
         self.height
     }
@@ -648,6 +649,7 @@ impl JpegRestartIndex {
     ///
     /// This keeps non-TIFF callers from depending on the private TIFF
     /// compression module while reusing the same restart-windowing machinery.
+    #[cfg(feature = "gpl")]
     pub(crate) fn decode_rows_default(
         &self,
         jpeg: &[u8],

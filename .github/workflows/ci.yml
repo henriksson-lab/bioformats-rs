@@ -95,3 +95,6 @@ jobs:
 
       - name: Clippy (all features)
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Clippy (BSD-only, no gpl)
+        run: cargo clippy --workspace --all-targets --no-default-features --features "jpegxr,zarr,tissuefaxs" -- -D warnings

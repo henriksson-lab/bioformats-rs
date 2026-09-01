@@ -5,6 +5,7 @@ use crate::common::error::{BioFormatsError, Result};
 use crate::common::io::peek_header;
 use crate::common::metadata::{ImageMetadata, LookupTable, MetadataOptions};
 use crate::common::ome_metadata::OmeMetadata;
+#[cfg(feature = "gpl")]
 use crate::common::path::confined_join;
 use crate::common::reader::{uninitialized_metadata, FormatReader};
 
@@ -587,6 +588,7 @@ fn ics_header_sibling_exists(path: &Path) -> bool {
     path.with_extension(ics_ext).exists()
 }
 
+#[cfg(feature = "gpl")]
 fn has_zvi_extension(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
@@ -594,6 +596,7 @@ fn has_zvi_extension(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(feature = "gpl")]
 fn has_wpi_extension(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
@@ -601,6 +604,7 @@ fn has_wpi_extension(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(feature = "gpl")]
 fn has_operetta_index_name(path: &Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
@@ -771,6 +775,7 @@ fn terminal_extension_error(path: &Path, err: &BioFormatsError) -> bool {
     )
 }
 
+#[cfg(feature = "gpl")]
 fn has_ims_extension(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
@@ -838,6 +843,8 @@ fn is_tiff_header(header: &[u8]) -> bool {
 }
 
 fn tiff_wrapper_readers_for_extension(path: &Path, header: &[u8]) -> Vec<Box<dyn FormatReader>> {
+    #[cfg(not(feature = "gpl"))]
+    let _ = header;
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
@@ -939,7 +946,9 @@ fn tiff_wrapper_readers_for_extension(path: &Path, header: &[u8]) -> Vec<Box<dyn
         // otherwise accept by extension and delegate to TiffReader, which would
         // steal ordinary TIFF files from explicit generic TIFF handling.
         Some("tif") | Some("tiff") => {
+            #[cfg(feature = "gpl")]
             let description = tiff_image_description(path);
+            #[cfg(feature = "gpl")]
             let software = tiff_software_tag(path);
 
             let mut readers = Vec::new();
@@ -1126,6 +1135,7 @@ fn tiff_wrapper_readers_for_extension(path: &Path, header: &[u8]) -> Vec<Box<dyn
     }
 }
 
+#[cfg(feature = "gpl")]
 fn has_metamorph_nd_sibling(path: &Path) -> bool {
     let Some(dir) = path.parent() else {
         return false;
@@ -1153,6 +1163,7 @@ fn has_metamorph_nd_sibling(path: &Path) -> bool {
     })
 }
 
+#[cfg(feature = "gpl")]
 fn has_columbus_measurement_index_sibling(path: &Path) -> bool {
     path.parent()
         .map(|dir| dir.join("MeasurementIndex.ColumbusIDX.xml").is_file())
@@ -1178,6 +1189,7 @@ fn generic_tiff_name_wrappers(path: &Path, _header: &[u8]) -> Vec<Box<dyn Format
     readers
 }
 
+#[cfg(feature = "gpl")]
 fn has_prairie_xml_sibling(path: &Path) -> bool {
     find_prairie_xml_sibling(path)
         .and_then(|xml| std::fs::read_to_string(&xml).ok().map(|text| (xml, text)))
@@ -1188,6 +1200,7 @@ fn has_prairie_xml_sibling(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(feature = "gpl")]
 fn prairie_xml_references_tiff(xml_path: &Path, xml: &str, tiff_path: &Path) -> bool {
     let Some(xml_dir) = xml_path.parent() else {
         return false;
@@ -1201,6 +1214,7 @@ fn prairie_xml_references_tiff(xml_path: &Path, xml: &str, tiff_path: &Path) -> 
     })
 }
 
+#[cfg(feature = "gpl")]
 fn extract_xml_attr<'a>(text: &'a str, attr: &str) -> Option<&'a str> {
     let search = format!("{attr}=\"");
     let start = text.find(search.as_str())? + search.len();
@@ -1208,6 +1222,7 @@ fn extract_xml_attr<'a>(text: &'a str, attr: &str) -> Option<&'a str> {
     Some(&text[start..end])
 }
 
+#[cfg(feature = "gpl")]
 fn find_prairie_xml_sibling(path: &Path) -> Option<std::path::PathBuf> {
     let parent = path.parent()?;
     let mut prefix = path.file_stem()?.to_str()?.to_string();
@@ -1231,6 +1246,7 @@ fn find_prairie_xml_sibling(path: &Path) -> Option<std::path::PathBuf> {
     })
 }
 
+#[cfg(feature = "gpl")]
 fn has_lei_sibling(path: &Path) -> bool {
     let Some(parent) = path.parent() else {
         return false;
@@ -1255,6 +1271,7 @@ fn has_lei_sibling(path: &Path) -> bool {
     }
 }
 
+#[cfg(feature = "gpl")]
 fn has_raw_extension(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
@@ -1262,6 +1279,7 @@ fn has_raw_extension(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(feature = "gpl")]
 fn tiff_image_description(path: &Path) -> Option<String> {
     let mut reader = crate::tiff::TiffReader::new();
     reader.set_id(path).ok()?;
@@ -1298,6 +1316,7 @@ fn tiff_first_ifd_has_ome_xml_description(path: &Path) -> bool {
 /// Read the first IFD's SOFTWARE (tag 305) value from a TIFF, if present.
 /// Reads a generous header window so out-of-line tag values are usually
 /// covered; used to gate the Nikon EZ-C1 wrapper without a full open.
+#[cfg(feature = "gpl")]
 fn tiff_software_tag(path: &Path) -> Option<String> {
     let header = peek_header(path, 64 * 1024).ok()?;
     let cursor = std::io::Cursor::new(header);
@@ -1309,6 +1328,7 @@ fn tiff_software_tag(path: &Path) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+#[cfg(feature = "gpl")]
 fn tiff_first_ifd_has_all_tags(path: &Path, tags: &[u16]) -> bool {
     let Some(ifd) = tiff_first_ifd(path) else {
         return false;
@@ -1316,6 +1336,7 @@ fn tiff_first_ifd_has_all_tags(path: &Path, tags: &[u16]) -> bool {
     tags.iter().all(|tag| ifd.get(*tag).is_some())
 }
 
+#[cfg(feature = "gpl")]
 fn tiff_first_ifd_has_any_tag(path: &Path, tags: &[u16]) -> bool {
     let Some(ifd) = tiff_first_ifd(path) else {
         return false;
@@ -1323,6 +1344,7 @@ fn tiff_first_ifd_has_any_tag(path: &Path, tags: &[u16]) -> bool {
     tags.iter().any(|tag| ifd.get(*tag).is_some())
 }
 
+#[cfg(feature = "gpl")]
 fn tiff_first_ifd_matches_sis(path: &Path) -> bool {
     let Some(ifd) = tiff_first_ifd(path) else {
         return false;
@@ -1333,6 +1355,7 @@ fn tiff_first_ifd_matches_sis(path: &Path) -> bool {
         || (ifd.get(34853).is_some() && make.map(|s| s.starts_with("Olympus")).unwrap_or(false))
 }
 
+#[cfg(feature = "gpl")]
 fn tiff_first_ifd_matches_fluoview(path: &Path, description: &str) -> bool {
     let Some(ifd) = tiff_first_ifd(path) else {
         return false;
@@ -1342,6 +1365,7 @@ fn tiff_first_ifd_matches_fluoview(path: &Path, description: &str) -> bool {
         || description.starts_with("Andor")
 }
 
+#[cfg(feature = "gpl")]
 fn tiff_first_ifd_is_nikon_raw(path: &Path) -> bool {
     let Some(ifd) = tiff_first_ifd(path) else {
         return false;
@@ -1352,6 +1376,7 @@ fn tiff_first_ifd_is_nikon_raw(path: &Path) -> bool {
     matches!(ifd.get_str(271), Some(make) if make.contains("Nikon"))
 }
 
+#[cfg(feature = "gpl")]
 fn tiff_first_ifd_matches_dng(path: &Path) -> bool {
     let Some(ifd) = tiff_first_ifd(path) else {
         return false;
@@ -1369,6 +1394,7 @@ fn tiff_first_ifd_matches_dng(path: &Path) -> bool {
         && software.is_none_or(|software| software.contains("Canon"))
 }
 
+#[cfg(feature = "gpl")]
 fn tiff_first_ifd_copyright_contains(path: &Path, needle: &str) -> bool {
     const COPYRIGHT: u16 = 33432;
     tiff_first_ifd(path)
@@ -1377,6 +1403,7 @@ fn tiff_first_ifd_copyright_contains(path: &Path, needle: &str) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(feature = "gpl")]
 fn zeiss_tiff_meta_xml_exists(path: &Path) -> bool {
     let mut meta = path.as_os_str().to_os_string();
     meta.push("_meta.xml");
@@ -1577,6 +1604,7 @@ mod tests {
         dir
     }
 
+    #[cfg(feature = "gpl")]
     fn write_minimal_sbig(path: &PathBuf) {
         let mut bytes = vec![0u8; 2048];
         bytes[..21].copy_from_slice(b"ST-7 Compressed Image");
@@ -1627,6 +1655,7 @@ mod tests {
         ImageWriter::save(path, &meta, &[pixels]).unwrap();
     }
 
+    #[cfg(feature = "gpl")]
     fn push_i32(buf: &mut Vec<u8>, value: i32) {
         buf.extend_from_slice(&value.to_le_bytes());
     }
@@ -1720,10 +1749,12 @@ mod tests {
         std::fs::remove_file(path).ok();
     }
 
+    #[cfg(feature = "gpl")]
     fn put_i32(buf: &mut [u8], offset: usize, value: i32) {
         buf[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
     }
 
+    #[cfg(feature = "gpl")]
     fn push_utf16le_fixed_ascii(buf: &mut Vec<u8>, text: &str, chars: usize) {
         let bytes = text.as_bytes();
         for i in 0..chars {
@@ -1732,6 +1763,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "gpl")]
     fn append_leica_block(buf: &mut Vec<u8>, payload: &[u8]) -> i32 {
         let offset = buf.len();
         buf.resize(offset + 12, 0);
@@ -1740,6 +1772,7 @@ mod tests {
         offset as i32
     }
 
+    #[cfg(feature = "gpl")]
     fn minimal_lei(filename: &str, declared_x: i32, declared_y: i32) -> Vec<u8> {
         const SERIES: i32 = 10;
         const IMAGES: i32 = 15;
@@ -3151,6 +3184,7 @@ mod tests {
         zip.finish().unwrap();
     }
 
+    #[cfg(feature = "gpl")]
     fn write_minimal_ndpi_tiff(path: &PathBuf, magnification: f32) {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(b"II");
@@ -3181,6 +3215,7 @@ mod tests {
         std::fs::write(path, bytes).unwrap();
     }
 
+    #[cfg(feature = "gpl")]
     fn write_minimal_tiff_with_software(path: &PathBuf, software: &str) {
         let mut soft = software.as_bytes().to_vec();
         soft.push(0);
@@ -3220,6 +3255,7 @@ mod tests {
         std::fs::write(path, bytes).unwrap();
     }
 
+    #[cfg(feature = "gpl")]
     fn write_minimal_faas_pyramid_tiff(path: &PathBuf) {
         let software = b"Faas\0";
         let ifd_entry_count = 11u32;
@@ -3365,6 +3401,7 @@ mod tests {
         std::fs::write(path, bytes).unwrap();
     }
 
+    #[cfg(feature = "gpl")]
     fn write_minimal_dng_cfa_tiff(path: &PathBuf) {
         let make = b"Canon\0";
         let software = b"Canon Digital Camera\0";

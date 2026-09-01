@@ -180,6 +180,7 @@ pub(crate) fn zstd_decode_all(data: &[u8]) -> Result<Vec<u8>> {
 
 /// Compress data with Zstd using the pure-Rust `zstd-pure-rs` backend.
 #[cfg(test)]
+#[cfg(feature = "gpl")]
 pub(crate) fn zstd_encode_all(data: &[u8], level: i32) -> Result<Vec<u8>> {
     use zstd_pure_rs::prelude::*;
     let mut dst = vec![0u8; ZSTD_compressBound(data.len())];

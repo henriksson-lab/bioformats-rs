@@ -3,28 +3,38 @@
 //! Includes FlowSightReader with binary header inspection plus explicit
 //! unsupported detectors and bounded native readers.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufReader, ErrorKind, Read, Seek};
+use std::io::{BufReader, ErrorKind, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::common::error::{BioFormatsError, Result};
+use crate::common::io::read_bytes_at;
+use crate::common::metadata::{ImageMetadata, MetadataValue, ModuloAnnotation};
+use crate::common::pixel_type::PixelType;
+use crate::common::reader::FormatReader;
+use crate::common::region::crop_full_plane;
+use crate::tiff::ifd::{tag, Ifd};
+use crate::tiff::parser::TiffParser;
+
+// Used only by the GPL-gated readers in this mixed module.
+#[cfg(feature = "gpl")]
 use crate::common::codec::{decompress_deflate, decompress_lzw, decompress_packbits};
+#[cfg(feature = "gpl")]
 use crate::common::compressed::{
     mode_allowed, CompressedBytes, CompressedExtractionConstraint, CompressedExtractionSupport,
     CompressedLevelInfo, CompressedTile, CompressedTileMode, Jpeg2000Container, JpegColorSpace,
     LossyCodec,
 };
-use crate::common::error::{BioFormatsError, Result};
-use crate::common::io::read_bytes_at;
-use crate::common::metadata::{
-    DimensionOrder, ImageMetadata, MetadataLevel, MetadataOptions, MetadataValue, ModuloAnnotation,
-};
-use crate::common::pixel_type::PixelType;
-use crate::common::reader::FormatReader;
-use crate::common::region::crop_full_plane;
-use crate::tiff::ifd::{tag, Compression, Ifd, IfdValue};
-use crate::tiff::parser::TiffParser;
+#[cfg(feature = "gpl")]
+use crate::common::metadata::{DimensionOrder, MetadataLevel, MetadataOptions};
+#[cfg(feature = "gpl")]
+use crate::tiff::ifd::{Compression, IfdValue};
+#[cfg(feature = "gpl")]
+use std::collections::HashSet;
+#[cfg(feature = "gpl")]
+use std::io::Seek;
 
 // ---------------------------------------------------------------------------
 // Macros
@@ -873,6 +883,7 @@ impl FormatReader for FlowSightReader {
 // ---------------------------------------------------------------------------
 const SYNTHETIC_IM3_MAGIC: &[u8] = b"BIOFORMATS-RS-SYNTHETIC-IM3-RAW-V1\0";
 const SYNTHETIC_SLIDEBOOK7_MAGIC: &[u8] = b"BIOFORMATS-RS-SYNTHETIC-SLIDEBOOK7-RAW-V1\0";
+#[cfg(feature = "gpl")]
 const SYNTHETIC_IVISION_MAGIC: &[u8] = b"BIOFORMATS-RS-SYNTHETIC-IVISION-IPM-RAW-V1\0";
 const SYNTHETIC_RAW_TRAILER_LEN: usize = 24;
 const SYNTHETIC_RAW_U8: u16 = 1;
@@ -918,10 +929,12 @@ fn im3_native_cookie(header: &[u8]) -> bool {
         .is_some_and(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()) == 1985)
 }
 
+#[cfg(feature = "gpl")]
 fn ivision_native_header(header: &[u8]) -> bool {
     ivision_structural_header(header) && header[5] <= 8
 }
 
+#[cfg(feature = "gpl")]
 fn ivision_structural_header(header: &[u8]) -> bool {
     if header.len() < 6 {
         return false;
@@ -5928,8 +5941,11 @@ pub struct NdpisReader {
     resolution_meta: Option<ImageMetadata>,
 }
 
+#[cfg(feature = "gpl")]
 const NDPI_TAG_CHANNEL: u16 = 65434;
+#[cfg(feature = "gpl")]
 const NDPI_TAG_EMISSION_WAVELENGTH: u16 = 65451;
+#[cfg(feature = "gpl")]
 const NDPI_TAG_METADATA: u16 = 65449;
 
 #[cfg(feature = "gpl")]
@@ -10856,6 +10872,7 @@ fn xlef_lms_resolve_storage_path(lms_path: &Path, storage_reference: &str) -> Pa
     crate::formats::gpl::leica_lms::parse_file_path(dir, storage_reference.trim())
 }
 
+#[cfg(feature = "gpl")]
 const XLEF_LMS_GRAPH_CAPTURE_LIMIT: usize = 16;
 
 #[cfg(feature = "gpl")]
@@ -11944,6 +11961,7 @@ impl FormatReader for XlefReader {
 // correct dimensions and pixels.
 
 /// 16-byte magic identifier for native Olympus OIR files.
+#[cfg(feature = "gpl")]
 const OIR_IDENTIFIER: &[u8] = b"OLYMPUSRAWFORMAT";
 
 /// A single raw pixel block within an OIR (companion) file.
@@ -13921,21 +13939,35 @@ struct VsiPyramidMeta {
     named_tags: Vec<(String, String)>,
 }
 
+#[cfg(feature = "gpl")]
 const ETS_RAW: i32 = 0;
+#[cfg(feature = "gpl")]
 const ETS_JPEG: i32 = 2;
+#[cfg(feature = "gpl")]
 const ETS_JPEG_2000: i32 = 3;
+#[cfg(feature = "gpl")]
 const ETS_JPEG_LOSSLESS: i32 = 5;
+#[cfg(feature = "gpl")]
 const ETS_PNG: i32 = 8;
+#[cfg(feature = "gpl")]
 const ETS_BMP: i32 = 9;
 
 // ETS pixel type codes (CellSensReader.java:80-90 / convertPixelType).
+#[cfg(feature = "gpl")]
 const ETS_PT_CHAR: i32 = 1;
+#[cfg(feature = "gpl")]
 const ETS_PT_UCHAR: i32 = 2;
+#[cfg(feature = "gpl")]
 const ETS_PT_SHORT: i32 = 3;
+#[cfg(feature = "gpl")]
 const ETS_PT_USHORT: i32 = 4;
+#[cfg(feature = "gpl")]
 const ETS_PT_INT: i32 = 5;
+#[cfg(feature = "gpl")]
 const ETS_PT_UINT: i32 = 6;
+#[cfg(feature = "gpl")]
 const ETS_PT_FLOAT: i32 = 9;
+#[cfg(feature = "gpl")]
 const ETS_PT_DOUBLE: i32 = 10;
 
 /// Map an ETS pixel type code to a [`PixelType`]. Mirrors Java
@@ -15081,113 +15113,200 @@ fn cellsens_unix_seconds_to_iso8601(unix_seconds: i64) -> String {
 // and mirrored into both overview summary metadata and ETS logical series.
 
 // Real field types (CellSensReader.java:80-126).
+#[cfg(feature = "gpl")]
 const VSI_CHAR: i32 = 1;
+#[cfg(feature = "gpl")]
 const VSI_UCHAR: i32 = 2;
+#[cfg(feature = "gpl")]
 const VSI_SHORT: i32 = 3;
+#[cfg(feature = "gpl")]
 const VSI_USHORT: i32 = 4;
+#[cfg(feature = "gpl")]
 const VSI_INT: i32 = 5;
+#[cfg(feature = "gpl")]
 const VSI_UINT: i32 = 6;
+#[cfg(feature = "gpl")]
 const VSI_LONG: i32 = 7;
+#[cfg(feature = "gpl")]
 const VSI_ULONG: i32 = 8;
+#[cfg(feature = "gpl")]
 const VSI_FLOAT: i32 = 9;
+#[cfg(feature = "gpl")]
 const VSI_DOUBLE: i32 = 10;
+#[cfg(feature = "gpl")]
 const VSI_BOOLEAN: i32 = 12;
+#[cfg(feature = "gpl")]
 const VSI_TCHAR: i32 = 13;
+#[cfg(feature = "gpl")]
 const VSI_DWORD: i32 = 14;
+#[cfg(feature = "gpl")]
 const VSI_TIMESTAMP: i32 = 17;
+#[cfg(feature = "gpl")]
 const VSI_DATE: i32 = 18;
+#[cfg(feature = "gpl")]
 const VSI_DOUBLE_2: i32 = 261;
+#[cfg(feature = "gpl")]
 const VSI_FIELD_TYPE: i32 = 271;
+#[cfg(feature = "gpl")]
 const VSI_MEM_MODEL: i32 = 272;
+#[cfg(feature = "gpl")]
 const VSI_COLOR_SPACE: i32 = 273;
+#[cfg(feature = "gpl")]
 const VSI_UNICODE_TCHAR: i32 = 8192;
+#[cfg(feature = "gpl")]
 const VSI_RGB: i32 = 269;
+#[cfg(feature = "gpl")]
 const VSI_BGR: i32 = 270;
 
 // Volume / structural field types (CellSensReader.java:129-132).
+#[cfg(feature = "gpl")]
 const VSI_NEW_VOLUME_HEADER: i32 = 0;
+#[cfg(feature = "gpl")]
 const VSI_PROPERTY_SET_VOLUME: i32 = 1;
+#[cfg(feature = "gpl")]
 const VSI_NEW_MDIM_VOLUME_HEADER: i32 = 2;
 
 // Tags (CellSensReader.java:139-303).
+#[cfg(feature = "gpl")]
 const VSI_IMAGE_FRAME_VOLUME: i32 = 2002;
+#[cfg(feature = "gpl")]
 const VSI_DIMENSION_DESCRIPTION_VOLUME: i32 = 2007;
+#[cfg(feature = "gpl")]
 const VSI_CHANNEL_PROPERTIES: i32 = 2008;
+#[cfg(feature = "gpl")]
 const VSI_EXTERNAL_FILE_PROPERTIES: i32 = 2018;
+#[cfg(feature = "gpl")]
 const VSI_DOCUMENT_PROPERTIES: i32 = 2109;
+#[cfg(feature = "gpl")]
 const VSI_SLIDE_PROPERTIES: i32 = 2452;
+#[cfg(feature = "gpl")]
 const VSI_IMAGE_BOUNDARY: i32 = 2053;
+#[cfg(feature = "gpl")]
 const VSI_TILE_ORIGIN: i32 = 2410;
 // RWC_FRAME_SCALE: physical pixel size (doubleValues[0]/[1]) in micrometres
 // (CellSensReader.java:300, 1853-1858).
+#[cfg(feature = "gpl")]
 const VSI_RWC_FRAME_SCALE: i32 = 2019;
 // RWC_FRAME_ORIGIN: stage origin position (doubleValues[0]/[1]) in micrometres
 // (CellSensReader.java:300, 1859-1863). Numerically equal to
 // EXTERNAL_FILE_PROPERTIES (2018); the two are disambiguated by context exactly
 // as in Java (the metadata-index bump checks the tag against IMAGE_FRAME_VOLUME,
 // while the origin capture lives in the DOUBLE-array leaf switch).
+#[cfg(feature = "gpl")]
 const VSI_RWC_FRAME_ORIGIN: i32 = 2018;
+#[cfg(feature = "gpl")]
 const VSI_HAS_EXTERNAL_FILE: i32 = 20005;
+#[cfg(feature = "gpl")]
 const VSI_Z_START: i32 = 2012;
+#[cfg(feature = "gpl")]
 const VSI_TIME_START: i32 = 2100;
+#[cfg(feature = "gpl")]
 const VSI_DIMENSION_VALUE_ID: i32 = 2027;
+#[cfg(feature = "gpl")]
 const VSI_LAMBDA_START: i32 = 2039;
+#[cfg(feature = "gpl")]
 const VSI_DIMENSION_MEANING: i32 = 2023;
 
 // Non-geometry metadata tags (CellSensReader.java:139-376). Captured into the
 // pyramid's metadata for inclusion in series_metadata (CellSensReader.java:1881-1989).
+#[cfg(feature = "gpl")]
 const VSI_EXPOSURE_TIME: i32 = 100002;
+#[cfg(feature = "gpl")]
 const VSI_CAMERA_GAIN: i32 = 100003;
+#[cfg(feature = "gpl")]
 const VSI_CAMERA_OFFSET: i32 = 100004;
+#[cfg(feature = "gpl")]
 const VSI_RED_GAIN: i32 = 100007;
+#[cfg(feature = "gpl")]
 const VSI_GREEN_GAIN: i32 = 100008;
+#[cfg(feature = "gpl")]
 const VSI_BLUE_GAIN: i32 = 100009;
+#[cfg(feature = "gpl")]
 const VSI_RED_OFFSET: i32 = 100010;
+#[cfg(feature = "gpl")]
 const VSI_GREEN_OFFSET: i32 = 100011;
+#[cfg(feature = "gpl")]
 const VSI_BLUE_OFFSET: i32 = 100012;
+#[cfg(feature = "gpl")]
 const VSI_X_BINNING: i32 = 100015;
+#[cfg(feature = "gpl")]
 const VSI_Y_BINNING: i32 = 100016;
+#[cfg(feature = "gpl")]
 const VSI_BIT_DEPTH: i32 = 100049;
+#[cfg(feature = "gpl")]
 const VSI_STACK_TYPE: i32 = 2074;
 // Prefix-gated VALUE metadata and the volume tags that build the tag-name prefix
 // (CellSensReader.java:1899-1979, 2081-2108).
+#[cfg(feature = "gpl")]
 const VSI_VALUE: i32 = 268435458;
+#[cfg(feature = "gpl")]
 const VSI_Z_INCREMENT: i32 = 2013;
+#[cfg(feature = "gpl")]
 const VSI_Z_VALUE: i32 = 2014;
+#[cfg(feature = "gpl")]
 const VSI_TIME_VALUE: i32 = 2017;
+#[cfg(feature = "gpl")]
 const VSI_CHANNEL_NAME: i32 = 2419;
+#[cfg(feature = "gpl")]
 const VSI_STACK_NAME: i32 = 2030;
+#[cfg(feature = "gpl")]
 const VSI_DEFAULT_BACKGROUND_COLOR: i32 = 2034;
+#[cfg(feature = "gpl")]
 const VSI_OPTICAL_PATH: i32 = 2043;
+#[cfg(feature = "gpl")]
 const VSI_CALIBRATION: i32 = 20051;
 // Volume tags whose getVolumeName(tag) yields the empty (structural) prefix
 // (CellSensReader.java:2083-2094).
+#[cfg(feature = "gpl")]
 const VSI_COLLECTION_VOLUME: i32 = 2000;
+#[cfg(feature = "gpl")]
 const VSI_MULTIDIM_IMAGE_VOLUME: i32 = 2001;
+#[cfg(feature = "gpl")]
 const VSI_DIMENSION_SIZE: i32 = 2003;
+#[cfg(feature = "gpl")]
 const VSI_IMAGE_COLLECTION_PROPERTIES: i32 = 2004;
+#[cfg(feature = "gpl")]
 const VSI_MULTIDIM_STACK_PROPERTIES: i32 = 2005;
+#[cfg(feature = "gpl")]
 const VSI_FRAME_PROPERTIES: i32 = 2006;
+#[cfg(feature = "gpl")]
 const VSI_DISPLAY_MAPPING_VOLUME: i32 = 2011;
+#[cfg(feature = "gpl")]
 const VSI_LAYER_INFO_PROPERTIES: i32 = 2012;
 // Volume tag 2417 maps to the "Channel Wavelength " prefix (CellSensReader.java:2097).
+#[cfg(feature = "gpl")]
 const VSI_CHANNEL_WAVELENGTH_VOLUME: i32 = 2417;
+#[cfg(feature = "gpl")]
 const VSI_OBJECTIVE_MAG: i32 = 120060;
+#[cfg(feature = "gpl")]
 const VSI_NUMERICAL_APERTURE: i32 = 120061;
+#[cfg(feature = "gpl")]
 const VSI_WORKING_DISTANCE: i32 = 120062;
+#[cfg(feature = "gpl")]
 const VSI_OBJECTIVE_NAME: i32 = 120063;
+#[cfg(feature = "gpl")]
 const VSI_OBJECTIVE_TYPE: i32 = 120064;
+#[cfg(feature = "gpl")]
 const VSI_REFRACTIVE_INDEX: i32 = 120079;
+#[cfg(feature = "gpl")]
 const VSI_DEVICE_NAME: i32 = 120116;
+#[cfg(feature = "gpl")]
 const VSI_DEVICE_ID: i32 = 120129;
+#[cfg(feature = "gpl")]
 const VSI_DEVICE_SUBTYPE: i32 = 120130;
+#[cfg(feature = "gpl")]
 const VSI_DEVICE_MANUFACTURER: i32 = 120133;
+#[cfg(feature = "gpl")]
 const VSI_CREATION_TIME: i32 = 2015;
 
 // DIMENSION_MEANING enum values (CellSensReader.java:285-290).
+#[cfg(feature = "gpl")]
 const VSI_DIM_Z: i64 = 1;
+#[cfg(feature = "gpl")]
 const VSI_DIM_T: i64 = 2;
+#[cfg(feature = "gpl")]
 const VSI_DIM_LAMBDA: i64 = 3;
+#[cfg(feature = "gpl")]
 const VSI_DIM_C: i64 = 4;
 
 /// Stateful walk over the VSI metadata tag-tree. Ported (focused) from
@@ -15717,14 +15836,23 @@ impl<'a> VsiTagParser<'a> {
 
 // Stack-type enum values (CellSensReader.java:315-323), translated by
 // `get_stack_type`.
+#[cfg(feature = "gpl")]
 const VSI_STACK_DEFAULT_IMAGE: i64 = 0;
+#[cfg(feature = "gpl")]
 const VSI_STACK_OVERVIEW_IMAGE: i64 = 1;
+#[cfg(feature = "gpl")]
 const VSI_STACK_SAMPLE_MASK: i64 = 2;
+#[cfg(feature = "gpl")]
 const VSI_STACK_FOCUS_IMAGE: i64 = 4;
+#[cfg(feature = "gpl")]
 const VSI_STACK_EFI_SHARPNESS_MAP: i64 = 8;
+#[cfg(feature = "gpl")]
 const VSI_STACK_EFI_HEIGHT_MAP: i64 = 16;
+#[cfg(feature = "gpl")]
 const VSI_STACK_EFI_TEXTURE_MAP: i64 = 32;
+#[cfg(feature = "gpl")]
 const VSI_STACK_EFI_STACK: i64 = 64;
+#[cfg(feature = "gpl")]
 const VSI_STACK_MACRO_IMAGE: i64 = 256;
 
 /// Translate a STACK_TYPE numeric code to a human-readable label. Mirrors
@@ -17346,8 +17474,10 @@ pub struct VolocityClippingReader {
     little_endian: bool,
 }
 
+#[cfg(feature = "gpl")]
 const VOLOCITY_CLIPPING_MAGIC: &str = "FFCA";
 /// `AISF` as produced by a big-endian `readInt` over the four ASCII bytes.
+#[cfg(feature = "gpl")]
 const VOLOCITY_AISF: u32 = 0x4653_4941;
 
 #[cfg(feature = "gpl")]
@@ -18217,11 +18347,17 @@ pub struct SlidebookTiffReader {
     ome: Option<crate::common::ome_metadata::OmeMetadata>,
 }
 
+#[cfg(feature = "gpl")]
 const SLIDEBOOK_X_POS_TAG: u16 = 65000;
+#[cfg(feature = "gpl")]
 const SLIDEBOOK_Y_POS_TAG: u16 = 65001;
+#[cfg(feature = "gpl")]
 const SLIDEBOOK_Z_POS_TAG: u16 = 65002;
+#[cfg(feature = "gpl")]
 const SLIDEBOOK_CHANNEL_TAG: u16 = 65004;
+#[cfg(feature = "gpl")]
 const SLIDEBOOK_MAGNIFICATION_TAG: u16 = 65005;
+#[cfg(feature = "gpl")]
 const SLIDEBOOK_PHYSICAL_SIZE_TAG: u16 = 65007;
 
 #[cfg(feature = "gpl")]
@@ -18709,13 +18845,16 @@ impl FormatReader for SlidebookTiffReader {
 // ===========================================================================
 
 /// Setup file text field strings. (Java: `TAC_RANGE`.)
+#[cfg(feature = "gpl")]
 const SPC_TAC_RANGE: &str = "SP_TAC_R";
 /// Setup file text field strings. (Java: `TAC_GAIN`.)
+#[cfg(feature = "gpl")]
 const SPC_TAC_GAIN: &str = "SP_TAC_G";
 
 /// Number of bits by which the ADC value is shifted. There are 12 bits in the
 /// file format so shifting by 6 bits leaves 6 bits of resolution, i.e. 64
 /// timebins. (Java: `adcResShift`.)
+#[cfg(feature = "gpl")]
 const SPC_ADC_RES_SHIFT: i32 = 6;
 
 /// Becker & Hickl SPC FIFO reader. (Java: `class SPCReader`.)
@@ -19570,6 +19709,7 @@ mod tests {
     use std::io::Write;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    #[cfg(feature = "gpl")]
     fn temp_path(name: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -19578,6 +19718,7 @@ mod tests {
         std::env::temp_dir().join(format!("bioformats_flim2_{nanos}_{name}"))
     }
 
+    #[cfg(feature = "gpl")]
     fn synthetic_biorad_scn(xml: &str, pixels: &[u8], declared_pixel_len: usize) -> Vec<u8> {
         let mut data = Vec::new();
         data.extend_from_slice(b"Generated by Image Lab\n");
@@ -19739,6 +19880,7 @@ mod tests {
         assert_eq!(instrument.objectives[0].lens_na, Some(0.8));
     }
 
+    #[cfg(feature = "gpl")]
     fn push_oir_u32(buf: &mut Vec<u8>, value: u32) {
         buf.extend_from_slice(&value.to_le_bytes());
     }
@@ -19750,6 +19892,7 @@ mod tests {
         push_oir_u32(buf, 0);
     }
 
+    #[cfg(feature = "gpl")]
     fn push_oir_xml_block(buf: &mut Vec<u8>, xml: &str) {
         let total = 48 + xml.len() as u32;
         push_oir_u32(buf, total);
@@ -19759,11 +19902,13 @@ mod tests {
         buf.extend_from_slice(xml.as_bytes());
     }
 
+    #[cfg(feature = "gpl")]
     fn push_empty_oir_xml_block(buf: &mut Vec<u8>) {
         push_oir_u32(buf, 8);
         push_oir_u32(buf, 0);
     }
 
+    #[cfg(feature = "gpl")]
     fn push_oir_pixel_block(buf: &mut Vec<u8>, uid: &str, pixels: &[u8]) {
         push_oir_u32(buf, uid.len() as u32 + 12);
         push_oir_u32(buf, 3);
@@ -19775,6 +19920,7 @@ mod tests {
         buf.extend_from_slice(pixels);
     }
 
+    #[cfg(feature = "gpl")]
     fn minimal_oir_metadata_xml() -> String {
         "<?xml version=\"1.0\"?>\
          <imageProperties>\
@@ -20333,6 +20479,7 @@ EndClass: 0
         std::fs::write(path, bytes).unwrap();
     }
 
+    #[cfg(feature = "gpl")]
     fn write_native_ivision(
         path: &Path,
         data_type: u8,
@@ -20355,14 +20502,17 @@ EndClass: 0
         std::fs::write(path, bytes).unwrap();
     }
 
+    #[cfg(feature = "gpl")]
     fn push_tiff_u16(out: &mut Vec<u8>, value: u16) {
         out.extend_from_slice(&value.to_le_bytes());
     }
 
+    #[cfg(feature = "gpl")]
     fn push_tiff_u32(out: &mut Vec<u8>, value: u32) {
         out.extend_from_slice(&value.to_le_bytes());
     }
 
+    #[cfg(feature = "gpl")]
     fn push_tiff_short(out: &mut Vec<u8>, tag: u16, value: u16) {
         push_tiff_u16(out, tag);
         push_tiff_u16(out, 3);
@@ -20371,6 +20521,7 @@ EndClass: 0
         push_tiff_u16(out, 0);
     }
 
+    #[cfg(feature = "gpl")]
     fn push_tiff_long(out: &mut Vec<u8>, tag: u16, value: u32) {
         push_tiff_u16(out, tag);
         push_tiff_u16(out, 4);
@@ -20378,6 +20529,7 @@ EndClass: 0
         push_tiff_u32(out, value);
     }
 
+    #[cfg(feature = "gpl")]
     fn push_tiff_ascii_at_offset(out: &mut Vec<u8>, tag: u16, value: &str, offset: u32) {
         push_tiff_u16(out, tag);
         push_tiff_u16(out, 2);
@@ -20385,6 +20537,7 @@ EndClass: 0
         push_tiff_u32(out, offset);
     }
 
+    #[cfg(feature = "gpl")]
     fn write_afi_svs_with_label_macro(
         path: &Path,
         bits_per_sample: u16,
@@ -22627,6 +22780,7 @@ theUnknownAnnotation70ListSize: 0
         }
     }
 
+    #[cfg(feature = "gpl")]
     fn short_vec_entry(tag: u16, values: &[u16]) -> TestEntry {
         TestEntry {
             tag,
@@ -22656,6 +22810,7 @@ theUnknownAnnotation70ListSize: 0
         }
     }
 
+    #[cfg(feature = "gpl")]
     fn double_entry(tag: u16, value: f64) -> TestEntry {
         TestEntry {
             tag,
@@ -22991,6 +23146,7 @@ theUnknownAnnotation70ListSize: 0
         file.write_all(&data).unwrap();
     }
 
+    #[cfg(feature = "gpl")]
     fn write_one_pixel_tiff(path: &Path, value: u8) {
         let mut entries = vec![
             long_entry(tag::IMAGE_WIDTH, 1),
@@ -23021,6 +23177,7 @@ theUnknownAnnotation70ListSize: 0
     /// direct/fast path, which planarizes chunky RGB itself (`split_channels`)
     /// before returning. `chunky_rgb` must be `width*height*3` bytes in
     /// row-major RGBRGB... order (the on-disk layout for PlanarConfiguration=1).
+    #[cfg(feature = "gpl")]
     fn write_rgb_chunky_uncompressed_tiff(path: &Path, width: u32, height: u32, chunky_rgb: &[u8]) {
         assert_eq!(chunky_rgb.len(), (width * height * 3) as usize);
         let mut entries = vec![
@@ -23049,6 +23206,7 @@ theUnknownAnnotation70ListSize: 0
         file.write_all(&data).unwrap();
     }
 
+    #[cfg(feature = "gpl")]
     fn write_one_pixel_tiff_with_description(path: &Path, value: u8, description: &str) {
         let mut entries = vec![
             long_entry(tag::IMAGE_WIDTH, 1),
@@ -23075,6 +23233,7 @@ theUnknownAnnotation70ListSize: 0
         file.write_all(&data).unwrap();
     }
 
+    #[cfg(feature = "gpl")]
     fn write_two_channel_imaris_tiff_with_description(
         path: &Path,
         description: &str,
@@ -23220,11 +23379,13 @@ theUnknownAnnotation70ListSize: 0
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[cfg(feature = "gpl")]
     fn write_one_pixel_png(path: &Path, value: u8) {
         let image = image::GrayImage::from_raw(1, 1, vec![value]).unwrap();
         image.save(path).unwrap();
     }
 
+    #[cfg(feature = "gpl")]
     fn write_one_pixel_bmp(path: &Path, red: u8, green: u8, blue: u8) {
         let mut data = Vec::new();
         data.extend_from_slice(b"BM");
@@ -23247,11 +23408,13 @@ theUnknownAnnotation70ListSize: 0
         std::fs::write(path, data).unwrap();
     }
 
+    #[cfg(feature = "gpl")]
     fn write_one_pixel_jpeg(path: &Path, red: u8, green: u8, blue: u8) {
         let image = image::RgbImage::from_raw(1, 1, vec![red, green, blue]).unwrap();
         image::DynamicImage::ImageRgb8(image).save(path).unwrap();
     }
 
+    #[cfg(feature = "gpl")]
     fn utf16le(value: &str) -> Vec<u8> {
         value
             .encode_utf16()
@@ -23259,6 +23422,7 @@ theUnknownAnnotation70ListSize: 0
             .collect()
     }
 
+    #[cfg(feature = "gpl")]
     fn build_xlef_test_lof(width: u32, height: u32, pixels: &[u8]) -> Vec<u8> {
         let xml = format!(
             "<Image><ImageDescription>\
@@ -23292,6 +23456,7 @@ theUnknownAnnotation70ListSize: 0
         b
     }
 
+    #[cfg(feature = "gpl")]
     fn build_xlef_strict_lms(width: u32, height: u32, pixel_type: u16, payload: &[u8]) -> Vec<u8> {
         let mut data = b"BIOFORMATS-RS-ZEISS-LMS-STRICT-RAW-V1\n".to_vec();
         data.extend_from_slice(&width.to_le_bytes());
@@ -24690,6 +24855,7 @@ RecordingDate=2024-01-02 03:04:05.678\n",
     // ---- VSI tag-tree parser tests -------------------------------------
 
     /// One leaf field for the synthetic VSI tag stream.
+    #[cfg(feature = "gpl")]
     struct VsiField {
         field_type: i32,
         tag: i32,
@@ -24699,6 +24865,7 @@ RecordingDate=2024-01-02 03:04:05.678\n",
 
     /// Build a VSI tag container starting at byte offset 8 from a list of leaf
     /// fields, wiring `nextField` to chain them and a terminating `nextField=0`.
+    #[cfg(feature = "gpl")]
     fn build_vsi_tag_stream(fields: &[VsiField]) -> Vec<u8> {
         // 0..8: filler (parser starts at offset 8).
         let mut out = vec![0u8; 8];
@@ -24739,6 +24906,7 @@ RecordingDate=2024-01-02 03:04:05.678\n",
         out
     }
 
+    #[cfg(feature = "gpl")]
     fn int_rect(vals: [i32; 4]) -> Vec<u8> {
         let mut v = Vec::new();
         for x in vals {
@@ -24747,6 +24915,7 @@ RecordingDate=2024-01-02 03:04:05.678\n",
         v
     }
 
+    #[cfg(feature = "gpl")]
     fn double_values(vals: &[f64]) -> Vec<u8> {
         let mut v = Vec::new();
         for x in vals {
@@ -25252,6 +25421,7 @@ RecordingDate=2024-01-02 03:04:05.678\n",
         )
     }
 
+    #[cfg(feature = "gpl")]
     fn build_synthetic_ets_with_compression(
         n_dimensions: u32,
         pixel_type_code: i32,
@@ -26217,25 +26387,30 @@ RecordingDate=2024-01-02 03:04:05.678\n",
     /// One 32-bit FIFO word. `b3` is the byte examined at offset `bb` (its
     /// high nibble selects photon/marker); `b1` is `bb-2` (its high nibble is
     /// the routing/mark nibble or the photon channel).
+    #[cfg(feature = "gpl")]
     fn spc_word(b0: u8, b1: u8, b2: u8, b3: u8) -> [u8; 4] {
         [b0, b1, b2, b3]
     }
 
     /// Frame-clock marker word (0x90 init pattern, rout nibble 0x40).
+    #[cfg(feature = "gpl")]
     fn spc_frame() -> [u8; 4] {
         spc_word(0, 0x40, 0, 0x90)
     }
     /// Line-clock marker word (0x90 init pattern, rout nibble 0x20).
+    #[cfg(feature = "gpl")]
     fn spc_line() -> [u8; 4] {
         spc_word(0, 0x20, 0, 0x90)
     }
     /// Pixel-clock marker word (0x90 init pattern, rout nibble 0x10).
+    #[cfg(feature = "gpl")]
     fn spc_pixel() -> [u8; 4] {
         spc_word(0, 0x10, 0, 0x90)
     }
 
     /// Build a synthetic .spc FIFO stream tracing a 2-line x 2-pixel x 2-frame
     /// geometry (so nFrames = currentFrame - 1 = 1).
+    #[cfg(feature = "gpl")]
     fn build_spc_stream() -> Vec<u8> {
         // 3 macro-time bytes + 1 routing byte (nChannels=1 => routing 0x08).
         let mut data = vec![0u8, 0u8, 0u8, 0x08u8];
@@ -26268,6 +26443,7 @@ RecordingDate=2024-01-02 03:04:05.678\n",
     /// Build a matching .set file: 8-byte pad, i32 setuppos, i16 setupcount,
     /// a 600-byte region containing "module SPC-830", then the setup text with
     /// SP_TAC_R / SP_TAC_G tags at `setuppos`.
+    #[cfg(feature = "gpl")]
     fn build_set_file() -> Vec<u8> {
         let setup_text = b"#SP [SP_TAC_R,F,50.000] [SP_TAC_G,I,4]";
         let setup_count = setup_text.len() as i16;
@@ -26294,6 +26470,7 @@ RecordingDate=2024-01-02 03:04:05.678\n",
         buf
     }
 
+    #[cfg(feature = "gpl")]
     fn unique_spc_base() -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
