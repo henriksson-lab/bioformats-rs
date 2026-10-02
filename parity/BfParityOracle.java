@@ -34,6 +34,7 @@ import loci.formats.meta.IMetadata;
 import loci.formats.services.OMEXMLService;
 import loci.common.services.ServiceFactory;
 import loci.common.DebugTools;
+import ome.units.UNITS;
 import java.util.zip.CRC32;
 
 public class BfParityOracle {
@@ -193,8 +194,11 @@ public class BfParityOracle {
             sb.append("{");
             sb.append("\"name\":").append(jstr(safeImageName(ome, i)));
             sb.append(",\"physicalSizeX\":").append(lengthVal(() -> ome.getPixelsPhysicalSizeX(ii0) == null ? null : ome.getPixelsPhysicalSizeX(ii0).value().doubleValue()));
+            sb.append(",\"physicalSizeXUm\":").append(lengthVal(() -> ome.getPixelsPhysicalSizeX(ii0) == null ? null : ome.getPixelsPhysicalSizeX(ii0).value(UNITS.MICROMETER).doubleValue()));
             sb.append(",\"physicalSizeY\":").append(lengthVal(() -> ome.getPixelsPhysicalSizeY(ii0) == null ? null : ome.getPixelsPhysicalSizeY(ii0).value().doubleValue()));
+            sb.append(",\"physicalSizeYUm\":").append(lengthVal(() -> ome.getPixelsPhysicalSizeY(ii0) == null ? null : ome.getPixelsPhysicalSizeY(ii0).value(UNITS.MICROMETER).doubleValue()));
             sb.append(",\"physicalSizeZ\":").append(lengthVal(() -> ome.getPixelsPhysicalSizeZ(ii0) == null ? null : ome.getPixelsPhysicalSizeZ(ii0).value().doubleValue()));
+            sb.append(",\"physicalSizeZUm\":").append(lengthVal(() -> ome.getPixelsPhysicalSizeZ(ii0) == null ? null : ome.getPixelsPhysicalSizeZ(ii0).value(UNITS.MICROMETER).doubleValue()));
             sb.append(",\"timeIncrement\":").append(lengthVal(() -> ome.getPixelsTimeIncrement(ii0) == null ? null : ome.getPixelsTimeIncrement(ii0).value().doubleValue()));
             sb.append(",\"channels\":[");
             int cc = 0;

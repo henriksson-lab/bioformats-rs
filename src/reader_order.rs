@@ -1079,7 +1079,7 @@ fn java_reader_for_class(class: &str) -> Option<Box<dyn FormatReader>> {
         "loci.formats.in.TecanReader" => {
             #[cfg(feature = "gpl")]
             {
-                Box::new(crate::formats::gpl::hcs2::TecanReader::new())
+                Box::new(crate::formats::gpl::tecan::TecanReader::new())
             }
             #[cfg(not(feature = "gpl"))]
             {

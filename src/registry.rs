@@ -498,9 +498,12 @@ fn open_reader_with_options_and_metadata(
         }
     }
 
-    // 1. Magic bytes
+    // 1. Magic bytes (Java isThisType(name, open): suffixNecessary readers
+    // only get a stream check when the suffix matches)
     for mut r in all_readers() {
-        if r.is_this_type_by_bytes(&header) {
+        if r.is_this_type_by_bytes(&header)
+            && (!r.suffix_necessary() || r.is_this_type_by_name(path))
+        {
             match set_reader_id(&mut r, path, &options, metadata_options) {
                 Ok(()) => return Ok(r),
                 Err(err @ BioFormatsError::UnsupportedFormat(_))
@@ -744,7 +747,9 @@ pub(crate) fn detect_reader_without_set_id(path: &Path) -> Result<Box<dyn Format
     }
 
     for r in all_readers() {
-        if r.is_this_type_by_bytes(&header) {
+        if r.is_this_type_by_bytes(&header)
+            && (!r.suffix_necessary() || r.is_this_type_by_name(path))
+        {
             return Ok(r);
         }
     }

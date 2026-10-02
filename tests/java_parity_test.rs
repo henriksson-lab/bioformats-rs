@@ -1096,21 +1096,33 @@ fn java_parity() {
                         ri.name
                     ));
                 }
-                if !approx(jf64(&ji["physicalSizeX"]), ri.physical_size_x) {
+                // Java may store a non-micrometre unit (e.g. Tecan stores nm); the
+                // Rust model is micrometres, so also accept the converted value.
+                if !approx(jf64(&ji["physicalSizeX"]), ri.physical_size_x)
+                    && !approx(jf64(&ji["physicalSizeXUm"]), ri.physical_size_x)
+                {
                     ome_diffs.push(format!(
                         "img{ii} physX: java={:?} rust={:?}",
                         jf64(&ji["physicalSizeX"]),
                         ri.physical_size_x
                     ));
                 }
-                if !approx(jf64(&ji["physicalSizeY"]), ri.physical_size_y) {
+                // Java may store a non-micrometre unit (e.g. Tecan stores nm); the
+                // Rust model is micrometres, so also accept the converted value.
+                if !approx(jf64(&ji["physicalSizeY"]), ri.physical_size_y)
+                    && !approx(jf64(&ji["physicalSizeYUm"]), ri.physical_size_y)
+                {
                     ome_diffs.push(format!(
                         "img{ii} physY: java={:?} rust={:?}",
                         jf64(&ji["physicalSizeY"]),
                         ri.physical_size_y
                     ));
                 }
-                if !approx(jf64(&ji["physicalSizeZ"]), ri.physical_size_z) {
+                // Java may store a non-micrometre unit (e.g. Tecan stores nm); the
+                // Rust model is micrometres, so also accept the converted value.
+                if !approx(jf64(&ji["physicalSizeZ"]), ri.physical_size_z)
+                    && !approx(jf64(&ji["physicalSizeZUm"]), ri.physical_size_z)
+                {
                     ome_diffs.push(format!(
                         "img{ii} physZ: java={:?} rust={:?}",
                         jf64(&ji["physicalSizeZ"]),

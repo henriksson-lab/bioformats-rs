@@ -103,12 +103,14 @@ needless_late_init = "allow"
 items_after_test_module = "allow"
 
 [features]
-default = ["jpegxr", "zarr", "tissuefaxs", "gpl"]
+default = ["jpegxr", "zarr", "tissuefaxs", "tecan", "gpl"]
 jpegxr = ["dep:jpegxr"]
 openslide = ["dep:openslide-pure-rs"]
 zarr = ["dep:zarrs"]
 # TissueFAXS (.aqproj/.tfcyto) reads SQLite project databases.
 tissuefaxs = ["dep:rusqlite"]
+# Tecan Spark Cyto (.db) reads SQLite plate databases (GPL reader; also needs `gpl`).
+tecan = ["dep:rusqlite"]
 # Readers ported from upstream Bio-Formats' GPL-2.0-or-later `formats-gpl`
 # module. Disabling this (via --no-default-features) excludes all GPL-derived
 # reader source from compilation, leaving only the BSD-2-Clause readers

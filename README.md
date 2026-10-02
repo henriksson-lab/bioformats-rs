@@ -12,6 +12,7 @@ The internal Metakit table reader used for Volocity is translated from
 `b8b3a629a6dd9bf422949f6b175b9e310ba6e252`.
 
 
+* 2026-10-02: Tecan spark file format retranslated
 * 2026-08-14: Continued audit for ND2, fixed parity issues. also audit for several other file formats (blocked on test data for remaining ones)
 * 2026-08-13: Broad audit: fixed metadata handling. Translation updated to track latest Bioformats at commit `d87eb853f0f8d1496aec29ace384cdc5b963096a`
 * 2026-08-04: fixed error handling + speed regression

@@ -124,7 +124,9 @@ impl SeriesParse {
                 if let Some(next) = lines.get(i + 1) {
                     value = next.trim().to_string();
                     if value.starts_with('<') && value.len() >= 2 {
-                        value = value[1..value.len() - 1].to_string();
+                        let mut chars = value[1..].chars();
+                        chars.next_back();
+                        value = chars.as_str().to_string();
                     }
                 }
             }
@@ -902,10 +904,11 @@ impl MicroCtVffReader {
                 // (drops the trailing ';'). Use the trimmed line so the dropped
                 // character is the ';' rather than a stray '\r'.
                 let after = &line[eq + 1..];
-                let value = if after.is_empty() {
-                    after
-                } else {
-                    &after[..after.len() - 1]
+                // substring works on characters, not bytes: drop the last char.
+                let value = {
+                    let mut chars = after.chars();
+                    chars.next_back();
+                    chars.as_str()
                 };
 
                 self.process_key(key, value);
@@ -1442,6 +1445,18 @@ mod tests {
         assert!(!img.planes.is_empty());
         assert_eq!(img.planes[0].exposure_time, Some(0.5)); // 500 ms -> 0.5 s
 
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn microct_header_value_ending_in_multibyte_char_does_not_panic() {
+        // Java substring(eq + 1, length - 1) drops one character; a byte slice
+        // panicked when that character was multi-byte UTF-8.
+        let root = unique_dir();
+        let vff = root.join("scan.vff");
+        fs::write(&vff, "ncaa\ntitle=caf\u{e9}\nfoo=<b\u{e9}>\n\n").unwrap();
+        let mut reader = MicroCtVffReader::new();
+        let _ = reader.set_id(&vff);
         let _ = fs::remove_dir_all(&root);
     }
 }

@@ -1246,6 +1246,11 @@ impl FormatReader for SpeReader {
         header.len() >= 4
     }
 
+    fn suffix_necessary(&self) -> bool {
+        // Java SPEReader keeps the FormatReader default suffixNecessary = true.
+        true
+    }
+
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.close()?;
         let mut f = File::open(path).map_err(BioFormatsError::Io)?;
@@ -1581,6 +1586,29 @@ mod tests {
                 ..
             }]
         ));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn registry_does_not_route_non_spe_suffix_to_spe_byte_probe() {
+        // Java SPEReader.isThisType(stream) accepts any 4-byte stream, but the
+        // default suffixNecessary = true means only `.spe` paths reach it.
+        assert!(SpeReader::new().suffix_necessary());
+        let path = std::env::temp_dir().join(format!(
+            "bioformats_spe_not_{}_garbage.bin",
+            std::process::id()
+        ));
+        let mut x: u32 = 0x1234_5678;
+        let bytes: Vec<u8> = (0..8192)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                x as u8
+            })
+            .collect();
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(crate::registry::ImageReader::open(&path).is_err());
         let _ = std::fs::remove_file(path);
     }
 }

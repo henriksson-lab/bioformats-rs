@@ -8303,24 +8303,6 @@ fn misc4_raw_payload_readers_crop_real_pixels() {
 }
 
 #[test]
-fn tecan_reader_rejects_nonnumeric_rows() {
-    let asc_path = tmp("bad_tecan.asc");
-    std::fs::write(&asc_path, b"1\t2\n3\tbad\n").unwrap();
-    let mut asc = bioformats::formats::gpl::hcs2::TecanReader::new();
-    assert_eq!(asc.series_count(), 0);
-    assert!(matches!(
-        asc.set_series(0),
-        Err(BioFormatsError::NotInitialized)
-    ));
-    let err = asc.set_id(&asc_path).unwrap_err();
-    assert!(
-        err.to_string().contains("non-numeric cell"),
-        "unexpected Tecan error: {err}"
-    );
-    assert_eq!(asc.series_count(), 0);
-}
-
-#[test]
 fn hcs2_binary_and_text_readers_clear_failed_reopen() {
     let valid = tmp("valid.frm");
     let mut data = vec![0u8; 6];

@@ -21,6 +21,14 @@ pub fn uninitialized_metadata() -> &'static ImageMetadata {
 pub trait FormatReader: Send + Sync {
     fn is_this_type_by_name(&self, path: &Path) -> bool;
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool;
+    /// Java `FormatReader.suffixNecessary`: when true, the registry only
+    /// consults [`FormatReader::is_this_type_by_bytes`] for paths that also
+    /// match [`FormatReader::is_this_type_by_name`], as Java
+    /// `isThisType(name, open)` does. Defaults to false so readers keep their
+    /// existing byte-probe routing unless they opt in.
+    fn suffix_necessary(&self) -> bool {
+        false
+    }
     fn set_id(&mut self, path: &Path) -> Result<()>;
     fn close(&mut self) -> Result<()>;
     fn series_count(&self) -> usize;

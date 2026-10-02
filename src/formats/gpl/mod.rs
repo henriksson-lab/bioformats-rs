@@ -37,6 +37,7 @@ pub mod sif;
 pub mod spe;
 pub mod spm;
 pub mod svs;
+pub mod tecan;
 pub mod tiff_wrappers;
 pub mod visitech;
 pub mod volocity;

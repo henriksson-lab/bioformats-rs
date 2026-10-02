@@ -777,7 +777,9 @@ impl FormatReader for FlowSightReader {
     }
 
     fn metadata(&self) -> &ImageMetadata {
-        &self.metas[self.current_series]
+        self.metas
+            .get(self.current_series)
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -7483,6 +7485,10 @@ impl AfiReader {
         p: u32,
         region: Option<(u32, u32, u32, u32)>,
     ) -> Result<Vec<u8>> {
+        // FormatTools.checkPlaneParameters -> assertId: no file is open.
+        if self.metas.is_empty() || self.readers.is_empty() {
+            return Err(BioFormatsError::NotInitialized);
+        }
         let extra = 2usize.min(self.metas.len());
         if self.current_series + extra >= self.metas.len() {
             self.readers[0].set_series(self.current_series)?;
@@ -7597,6 +7603,10 @@ impl FormatReader for AfiReader {
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
         header.len() >= 4
     }
+    fn suffix_necessary(&self) -> bool {
+        // Java AFIReader keeps the FormatReader default suffixNecessary = true.
+        true
+    }
     fn set_id(&mut self, path: &Path) -> Result<()> {
         let xml = std::fs::read_to_string(path).map_err(BioFormatsError::Io)?;
         let parent = path.parent().map(Path::to_path_buf).unwrap_or_default();
@@ -7689,7 +7699,9 @@ impl FormatReader for AfiReader {
         self.current_series
     }
     fn metadata(&self) -> &ImageMetadata {
-        &self.metas[self.current_series]
+        self.metas
+            .get(self.current_series)
+            .unwrap_or(crate::common::reader::uninitialized_metadata())
     }
     fn open_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
         self.open_assembled_plane(p, None)
@@ -18734,7 +18746,12 @@ impl SlidebookTiffReader {
             return Err(BioFormatsError::PlaneOutOfRange(no));
         }
         let size_t = meta.size_t.max(1);
-        Ok(((no / size_t) as usize, no % size_t))
+        let file = (no / size_t) as usize;
+        // FormatTools.checkPlaneParameters -> assertId: no file is open.
+        if file >= self.readers.len() {
+            return Err(BioFormatsError::NotInitialized);
+        }
+        Ok((file, no % size_t))
     }
 
     /// Java `getSeriesUsedFiles(false)`: all same-timestamp sibling TIFFs.
@@ -26789,5 +26806,35 @@ RecordingDate=2024-01-02 03:04:05.678\n",
         }
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[cfg(feature = "gpl")]
+    #[test]
+    fn afi_flowsight_slidebook_do_not_panic_without_open_file() {
+        let garbage = temp_path("garbage.bin");
+        std::fs::write(&garbage, [0xffu8, 0xfe, 0x00, 0x01, 0x80, 0x81]).unwrap();
+
+        let mut afi = AfiReader::new();
+        assert!(matches!(
+            afi.open_bytes(0),
+            Err(BioFormatsError::NotInitialized)
+        ));
+        assert!(afi.set_id(&garbage).is_err());
+        let _ = afi.metadata();
+        assert!(afi.open_bytes(0).is_err());
+        assert!(afi.suffix_necessary());
+
+        let mut flowsight = FlowSightReader::new();
+        assert!(flowsight.set_id(&garbage).is_err());
+        let _ = flowsight.metadata();
+
+        let mut slidebook = SlidebookTiffReader::new();
+        assert!(matches!(
+            slidebook.open_bytes(0),
+            Err(BioFormatsError::NotInitialized)
+        ));
+        assert!(slidebook.open_bytes_region(0, 0, 0, 1, 1).is_err());
+
+        let _ = std::fs::remove_file(&garbage);
     }
 }
