@@ -5118,7 +5118,8 @@ impl SlideBook7Reader {
                 }
             }
             if let Some(align) = extras.align_manips.first() {
-                for (key, value) in [("slidebook7.align_manip.0.manip_id", align.manip_id)] {
+                {
+                    let (key, value) = ("slidebook7.align_manip.0.manip_id", align.manip_id);
                     if let Some(value) = value {
                         meta.series_metadata.insert(
                             key.into(),
