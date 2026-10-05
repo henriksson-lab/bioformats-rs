@@ -14120,7 +14120,10 @@ impl EtsVolume {
             }
 
             // Java would throw ArrayIndexOutOfBounds for these; skip instead.
-            let Some(res) = usize::try_from(resolution).ok().filter(|&r| r < max_resolution) else {
+            let Some(res) = usize::try_from(resolution)
+                .ok()
+                .filter(|&r| r < max_resolution)
+            else {
                 continue;
             };
             let at = |i: i32| usize::try_from(i).ok().and_then(|i| coord.get(i).copied());
@@ -14140,7 +14143,8 @@ impl EtsVolume {
         // decodeTile places Z/C/T at `dimensionOrdering + 2` of the final map
         // (CellSensReader.java 9.0.0-rc1:1124-1137).
         let to_slot = |v: Option<i32>| -> Option<usize> {
-            v.and_then(|v| usize::try_from(v + 2).ok()).filter(|&i| i < ndim)
+            v.and_then(|v| usize::try_from(v + 2).ok())
+                .filter(|&i| i < ndim)
         };
         self.dim_t = to_slot(self.dim_order.t);
         self.dim_z = to_slot(self.dim_order.z);
@@ -15553,7 +15557,10 @@ impl<'a> VsiTagParser<'a> {
                         let key = format!("{tag_prefix}{name}");
                         if self.metadata_index >= 0 {
                             let idx = self.metadata_index as usize;
-                            self.pyramids[idx].meta.named_tags.push((key.clone(), v.clone()));
+                            self.pyramids[idx]
+                                .meta
+                                .named_tags
+                                .push((key.clone(), v.clone()));
                         }
                         // else: global metadata (tag != VALUE || prefix non-empty);
                         // the per-ETS reader has no global series store, so unlike
@@ -16523,7 +16530,10 @@ impl CellSensReader {
                 let mut ifds: Vec<usize> = (0..single.len()).collect();
                 let mut series_count = ifds.len();
                 if ifds.len() > 1 {
-                    let samples_1 = self.inner.ifd(ifds[1]).map_or(1, |ifd| ifd.samples_per_pixel());
+                    let samples_1 = self
+                        .inner
+                        .ifd(ifds[1])
+                        .map_or(1, |ifd| ifd.samples_per_pixel());
                     if samples_1 == 1 {
                         series_count = 2;
                         if channel_count == 0 && z_count == 0 {
@@ -16576,12 +16586,19 @@ impl CellSensReader {
             // are named "macro image".
             let ignored_pyramids = pyramids
                 .iter()
-                .filter(|p| !p.meta.name.as_deref().is_some_and(|n| n.eq_ignore_ascii_case("Overview")))
+                .filter(|p| {
+                    !p.meta
+                        .name
+                        .as_deref()
+                        .is_some_and(|n| n.eq_ignore_ascii_case("Overview"))
+                })
                 .count();
             let mut next_pyramid = 0;
             for s in 0..self.tiff_series {
                 let pyramid = if !(ignored_pyramids > 0
-                    && s < self.tiff_series.saturating_sub(pyramids.len() - ignored_pyramids))
+                    && s < self
+                        .tiff_series
+                        .saturating_sub(pyramids.len() - ignored_pyramids))
                     && next_pyramid < pyramids.len()
                 {
                     next_pyramid += 1;
@@ -25345,7 +25362,12 @@ RecordingDate=2024-01-02 03:04:05.678\n",
             // DIMENSION_MEANING below.
             (VSI_INT, 10019, 4, 4i32.to_le_bytes().to_vec()),
             // Inline DIMENSION_MEANING: dimension 1 (Z) carried in dataSize.
-            (INLINE | VSI_INT, VSI_DIMENSION_MEANING, VSI_DIM_Z as i32, Vec::new()),
+            (
+                INLINE | VSI_INT,
+                VSI_DIMENSION_MEANING,
+                VSI_DIM_Z as i32,
+                Vec::new(),
+            ),
         ]);
         let mut parser = VsiTagParser::new(&stream);
         parser.pyramids.push(VsiPyramid::default());
@@ -25395,7 +25417,10 @@ RecordingDate=2024-01-02 03:04:05.678\n",
                 long_entry(tag::IMAGE_LENGTH, *height),
                 short_vec_entry(tag::BITS_PER_SAMPLE, &vec![*bps; *spp as usize]),
                 short_entry(tag::COMPRESSION, 1),
-                short_entry(tag::PHOTOMETRIC_INTERPRETATION, if *spp > 1 { 2 } else { 1 }),
+                short_entry(
+                    tag::PHOTOMETRIC_INTERPRETATION,
+                    if *spp > 1 { 2 } else { 1 },
+                ),
                 short_entry(tag::SAMPLES_PER_PIXEL, *spp),
                 long_entry(tag::ROWS_PER_STRIP, *height),
                 long_entry(tag::STRIP_BYTE_COUNTS, pixels.len() as u32),
@@ -25425,7 +25450,9 @@ RecordingDate=2024-01-02 03:04:05.678\n",
         let path = temp_flim2_path("single-file-channels.vsi");
         let mut pages = vec![(2, 2, 3, 8, vec![7u8; 12])];
         for c in 0..5u16 {
-            let plane: Vec<u8> = (0..16u16).flat_map(|i| (c * 100 + i).to_le_bytes()).collect();
+            let plane: Vec<u8> = (0..16u16)
+                .flat_map(|i| (c * 100 + i).to_le_bytes())
+                .collect();
             pages.push((4, 4, 1, 16, plane));
         }
         write_multi_page_tiff(&path, &pages);
@@ -25446,10 +25473,18 @@ RecordingDate=2024-01-02 03:04:05.678\n",
         assert_eq!(m.image_count, 5);
         assert_eq!(m.dimension_order, DimensionOrder::XYZCT);
         assert_eq!(m.pixel_type, PixelType::Uint16);
-        assert!(m.thumbnail, "Java marks every series after the first as thumbnail");
+        assert!(
+            m.thumbnail,
+            "Java marks every series after the first as thumbnail"
+        );
         for c in 0..5u16 {
             let plane = reader.open_bytes(c as u32).unwrap();
-            assert_eq!(&plane[..2], &(c * 100).to_le_bytes(), "plane {c} reads IFD {}", c + 1);
+            assert_eq!(
+                &plane[..2],
+                &(c * 100).to_le_bytes(),
+                "plane {c} reads IFD {}",
+                c + 1
+            );
         }
 
         let _ = std::fs::remove_file(path);
@@ -25848,7 +25883,10 @@ RecordingDate=2024-01-02 03:04:05.678\n",
 
         let vol = CellSensReader::parse_ets(&path).unwrap();
         assert_eq!(vol.background.len(), 50, "full sizeC * bpp color is kept");
-        assert!(vol.use_pyramid, "usePyramid is read right after the 50-byte color");
+        assert!(
+            vol.use_pyramid,
+            "usePyramid is read right after the 50-byte color"
+        );
 
         let _ = std::fs::remove_file(path);
     }

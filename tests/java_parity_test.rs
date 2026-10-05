@@ -916,7 +916,11 @@ fn java_parity() {
                 if let Some(jb) = jb64 {
                     let jbytes = b64_decode(jb);
                     if jbytes.len() == rbuf.len() {
-                        let n = if jbytes.len() % sample_bytes == 0 { sample_bytes } else { 1 };
+                        let n = if jbytes.len() % sample_bytes == 0 {
+                            sample_bytes
+                        } else {
+                            1
+                        };
                         let sample = |chunk: &[u8]| {
                             let fold = |acc: u64, b: &u8| (acc << 8) | *b as u64;
                             if little_endian {
