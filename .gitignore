@@ -19,3 +19,4 @@ testdata/
 parity/target/
 .claude/
 zarrreader/
+examples/
