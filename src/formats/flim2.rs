@@ -5118,7 +5118,8 @@ impl SlideBook7Reader {
                 }
             }
             if let Some(align) = extras.align_manips.first() {
-                for (key, value) in [("slidebook7.align_manip.0.manip_id", align.manip_id)] {
+                {
+                    let (key, value) = ("slidebook7.align_manip.0.manip_id", align.manip_id);
                     if let Some(value) = value {
                         meta.series_metadata.insert(
                             key.into(),
@@ -13789,6 +13790,10 @@ pub struct CellSensReader {
     /// Path to the base `.vsi` file (needed to read embedded-TIFF JPEG strips
     /// directly when the inner reader cannot merge the JPEGTables tag).
     vsi_path: Option<PathBuf>,
+    /// Single-file VSI (no ETS): every parsed `Pyramid`, and the pyramid
+    /// assigned to each public series (CellSensReader.java:956-965).
+    vsi_pyramids: Vec<VsiPyramidMeta>,
+    tiff_pyramids: Vec<Option<usize>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -14027,143 +14032,124 @@ impl EtsVolume {
             1
         };
 
-        // Determine C/Z/T coordinate slots, porting the full Java collision-shift
-        // heuristics (CellSensReader.java:1370-1444). The base slot for a logical
-        // dimension is `tag + 2`; from there Java applies a series of fixups that
-        // shift indices when they collide with the resolution slot or fall outside
-        // the coordinate length. All tiles in one ETS volume share the same
-        // coordinate length (== ndim) and the same `usePyramid`, so Java's per-tile
-        // recomputation converges to a single result; we compute it once here.
-        //
-        // `tv`/`zv`/`cv` track the raw dimension tag (Java's dimOrder values), and
-        // `t_index`/`z_index`/`c_index` are the corresponding coordinate slots
-        // (can go negative, exactly as Java allows). `None` for the *v variables
-        // mirrors Java's `null`.
+        // Per-tile C/Z/T slot computation (CellSensReader.java 9.0.0-rc1:
+        // 1453-1544). Java re-reads `dimOrder` (the pyramid's dimensionOrdering)
+        // for every tile and mutates it while iterating, so later tiles can see
+        // shifted values; mirror that literally. A slot is `tag + 2` and may go
+        // negative, exactly as Java allows; `None` mirrors Java's `null`.
         let len = ndim as i32;
-        let mut tv: Option<i32> = self.dim_order.t;
-        let mut zv: Option<i32> = self.dim_order.z;
-        let cv: Option<i32> = self.dim_order.c;
-
-        let mut t_index: i32 = tv.map_or(-1, |v| v + 2);
-        let mut z_index: i32 = zv.map_or(-1, |v| v + 2);
-        let mut c_index: i32 = cv.map_or(-1, |v| v + 2);
-
-        // Slots that collide with the resolution slot (last) are not real axes
-        // (CellSensReader.java:1381-1388). Only T and Z get this treatment.
-        if self.use_pyramid && t_index == len - 1 {
-            tv = None;
-            t_index = -1;
-        }
-        if self.use_pyramid && z_index == len - 1 {
-            zv = None;
-            z_index = -1;
-        }
-
-        let upper_limit = if self.use_pyramid { len - 1 } else { len };
-        // All three indices outside the valid range: shift them down by one and
-        // push the shifted tag back into the ordering (CellSensReader.java:1391-1407).
-        if (t_index < 0 || t_index >= upper_limit)
-            && (z_index < 0 || z_index >= upper_limit)
-            && (c_index < 0 || c_index >= upper_limit)
-        {
-            t_index -= 1;
-            z_index -= 1;
-            c_index -= 1;
-            if self.dim_order.t.is_some() {
-                self.dim_order.t = Some(t_index - 2);
-            }
-            if self.dim_order.z.is_some() {
-                self.dim_order.z = Some(z_index - 2);
-            }
-            if self.dim_order.c.is_some() {
-                self.dim_order.c = Some(c_index - 2);
-            }
-        }
-
-        // No T and no Z ordering: infer C/T/Z slots from the coordinate length
-        // (CellSensReader.java:1409-1444).
-        if tv.is_none() && zv.is_none() {
-            if len > 4 && cv.is_none() {
-                c_index = 2;
-                self.dim_order.c = Some(c_index - 2);
-            }
-
-            if len > 4 {
-                if cv.is_none() {
-                    t_index = 3;
-                } else {
-                    t_index = c_index + 2;
-                }
-                if t_index < len {
-                    self.dim_order.t = Some(t_index - 2);
-                } else {
-                    t_index = -1;
-                }
-            }
-
-            if len > 5 {
-                if cv.is_none() {
-                    z_index = 4;
-                } else {
-                    z_index = c_index + 1;
-                }
-                if z_index < len {
-                    self.dim_order.z = Some(z_index - 2);
-                } else {
-                    z_index = -1;
-                }
-            }
-        }
-
-        // Translate final indices to optional slots; negative/out-of-range -> None.
-        let to_slot = |i: i32| -> Option<usize> {
-            if i >= 0 && i < len {
-                Some(i as usize)
-            } else {
-                None
-            }
-        };
-        self.dim_t = to_slot(t_index);
-        self.dim_z = to_slot(z_index);
-        self.dim_c = to_slot(c_index);
-
         let mut max_x = vec![0i32; max_resolution];
         let mut max_y = vec![0i32; max_resolution];
         let mut max_z = vec![0i32; max_resolution];
         let mut max_c = vec![0i32; max_resolution];
         let mut max_t = vec![0i32; max_resolution];
-
+        let dim_order = &mut self.dim_order;
         for (coord, _, _) in &self.tiles {
-            let res = if self.use_pyramid {
-                coord.last().copied().unwrap_or(0).max(0) as usize
+            let resolution = if self.use_pyramid {
+                coord.last().copied().unwrap_or(0)
             } else {
                 0
             };
-            if res >= max_resolution {
+
+            let mut tv = dim_order.t;
+            let mut zv = dim_order.z;
+            let cv = dim_order.c;
+
+            let mut t_index = tv.map_or(-1, |v| v + 2);
+            let mut z_index = zv.map_or(-1, |v| v + 2);
+            let mut c_index = cv.map_or(-1, |v| v + 2);
+
+            if self.use_pyramid && t_index == len - 1 {
+                tv = None;
+                t_index = -1;
+            }
+            if self.use_pyramid && z_index == len - 1 {
+                zv = None;
+                z_index = -1;
+            }
+
+            let upper_limit = if self.use_pyramid { len - 1 } else { len };
+            if (t_index < 0 || t_index >= upper_limit)
+                && (z_index < 0 || z_index >= upper_limit)
+                && (c_index < 0 || c_index >= upper_limit)
+            {
+                t_index -= 1;
+                z_index -= 1;
+                c_index -= 1;
+                if dim_order.t.is_some() {
+                    dim_order.t = Some(t_index - 2);
+                }
+                if dim_order.z.is_some() {
+                    dim_order.z = Some(z_index - 2);
+                }
+                if dim_order.c.is_some() {
+                    dim_order.c = Some(c_index - 2);
+                }
+            }
+
+            if tv.is_none() && zv.is_none() {
+                if len > 4 && cv.is_none() {
+                    c_index = 2;
+                    dim_order.c = Some(c_index - 2);
+                }
+
+                if len > 4 {
+                    if cv.is_none() {
+                        t_index = 3;
+                    } else {
+                        t_index = c_index + 2;
+                    }
+                    if t_index < len {
+                        dim_order.t = Some(t_index - 2);
+                    } else {
+                        t_index = -1;
+                    }
+                }
+
+                if len > 5 {
+                    if cv.is_none() {
+                        z_index = 4;
+                    } else {
+                        z_index = c_index + 1;
+                    }
+                    if z_index < len {
+                        dim_order.z = Some(z_index - 2);
+                    } else {
+                        z_index = -1;
+                    }
+                }
+            }
+
+            // Java would throw ArrayIndexOutOfBounds for these; skip instead.
+            let Some(res) = usize::try_from(resolution)
+                .ok()
+                .filter(|&r| r < max_resolution)
+            else {
                 continue;
+            };
+            let at = |i: i32| usize::try_from(i).ok().and_then(|i| coord.get(i).copied());
+            max_x[res] = max_x[res].max(coord[0]);
+            max_y[res] = max_y[res].max(coord[1]);
+            if let Some(v) = at(t_index) {
+                max_t[res] = max_t[res].max(v);
             }
-            if coord[0] > max_x[res] {
-                max_x[res] = coord[0];
+            if let Some(v) = at(z_index) {
+                max_z[res] = max_z[res].max(v);
             }
-            if coord[1] > max_y[res] {
-                max_y[res] = coord[1];
-            }
-            if let Some(ci) = self.dim_c {
-                if ci < coord.len() && coord[ci] > max_c[res] {
-                    max_c[res] = coord[ci];
-                }
-            }
-            if let Some(ti) = self.dim_t {
-                if ti < coord.len() && coord[ti] > max_t[res] {
-                    max_t[res] = coord[ti];
-                }
-            }
-            if let Some(zi) = self.dim_z {
-                if zi < coord.len() && coord[zi] > max_z[res] {
-                    max_z[res] = coord[zi];
-                }
+            if let Some(v) = at(c_index) {
+                max_c[res] = max_c[res].max(v);
             }
         }
+
+        // decodeTile places Z/C/T at `dimensionOrdering + 2` of the final map
+        // (CellSensReader.java 9.0.0-rc1:1124-1137).
+        let to_slot = |v: Option<i32>| -> Option<usize> {
+            v.and_then(|v| usize::try_from(v + 2).ok())
+                .filter(|&i| i < ndim)
+        };
+        self.dim_t = to_slot(self.dim_order.t);
+        self.dim_z = to_slot(self.dim_order.z);
+        self.dim_c = to_slot(self.dim_order.c);
 
         // Level 0 (full resolution): exact size from the VSI `Pyramid` block when
         // available (CellSensReader.java:1463-1464: ms.sizeX = pyramid.width),
@@ -15332,9 +15318,11 @@ struct VsiTagParser<'a> {
     in_dimension_properties: bool,
     dimension_tag: i32,
     found_channel_tag: bool,
-    /// last stored leaf value as a string (for DIMENSION_MEANING parsing).
-    stored_value: Option<String>,
     expect_ets: bool,
+    /// Java `channelCount` / `zCount`: number of populated "Channel Wavelength
+    /// Value" / "Z valueValue" leaves (CellSensReader.java:2117-2123).
+    channel_count: i32,
+    z_count: i32,
     /// recursion guard.
     depth: u32,
 }
@@ -15350,8 +15338,9 @@ impl<'a> VsiTagParser<'a> {
             in_dimension_properties: false,
             dimension_tag: 0,
             found_channel_tag: false,
-            stored_value: None,
             expect_ets: false,
+            channel_count: 0,
+            z_count: 0,
             depth: 0,
         }
     }
@@ -15473,6 +15462,12 @@ impl<'a> VsiTagParser<'a> {
                 self.pyramids.push(VsiPyramid::default());
             }
 
+            // Java stream position after this field's body, needed when the
+            // dimension-ordering block below aborts the container.
+            let stream_pos;
+            // Java's per-tag `storedValue` (CellSensReader.java:1714): only set by
+            // a leaf field, and only for that field.
+            let mut stored_value: Option<String> = None;
             if extended_field && real_type == VSI_NEW_VOLUME_HEADER {
                 if tag == VSI_DIMENSION_DESCRIPTION_VOLUME {
                     self.dimension_tag = second_tag;
@@ -15484,13 +15479,18 @@ impl<'a> VsiTagParser<'a> {
                 let mut child = cur;
                 while child < end_pointer && child < self.len() {
                     let start = child;
-                    let end = self.read_tags(child, true, child_prefix);
+                    let end = self.read_tags(
+                        child,
+                        populate || self.in_dimension_properties,
+                        child_prefix,
+                    );
                     // Mirror Java's start >= end guard (CellSensReader.java:1692).
                     if end <= start {
                         break;
                     }
                     child = end;
                 }
+                stream_pos = child;
                 if tag == VSI_DIMENSION_DESCRIPTION_VOLUME {
                     self.in_dimension_properties = false;
                     self.found_channel_tag = false;
@@ -15514,16 +15514,24 @@ impl<'a> VsiTagParser<'a> {
                         _ => {}
                     }
                 }
-                self.read_tags(cur, tag != 2037, &child_prefix);
+                stream_pos = self.read_tags(cur, tag != 2037, &child_prefix);
             } else {
+                stream_pos = if !inline_data && data_size > 0 {
+                    cur + data_size as i64
+                } else {
+                    cur
+                };
                 // Leaf field: read the value for the types we care about.
+                // Inline fields carry their value in dataSize
+                // (CellSensReader.java:1800: inlineData ? String.valueOf(dataSize)).
                 let mut value: Option<String> = None;
-                if !inline_data && data_size > 0 {
+                if inline_data {
+                    value = Some(data_size.to_string());
+                } else if data_size > 0 {
                     value = self.read_leaf_value(real_type, cur, data_size, tag, tag_prefix);
                 }
-                if let Some(v) = &value {
-                    self.stored_value = Some(v.clone());
-                }
+                // Java's value defaults to " " for types it does not decode.
+                stored_value = Some(value.clone().unwrap_or_else(|| " ".to_string()));
                 if tag == VSI_HAS_EXTERNAL_FILE {
                     if let Some(v) = &value {
                         if v.trim() == "1" {
@@ -15550,16 +15558,30 @@ impl<'a> VsiTagParser<'a> {
                         let key = format!("{tag_prefix}{name}");
                         if self.metadata_index >= 0 {
                             let idx = self.metadata_index as usize;
-                            self.pyramids[idx].meta.named_tags.push((key, v.clone()));
+                            self.pyramids[idx]
+                                .meta
+                                .named_tags
+                                .push((key.clone(), v.clone()));
                         }
                         // else: global metadata (tag != VALUE || prefix non-empty);
                         // the per-ETS reader has no global series store, so unlike
                         // Java these are not surfaced here.
+                        if key == "Channel Wavelength Value" {
+                            self.channel_count += 1;
+                        } else if key == "Z valueValue" {
+                            self.z_count += 1;
+                        }
                     }
                 }
             }
 
-            // Dimension ordering (CellSensReader.java:2013-2061).
+            // Dimension ordering (CellSensReader.java:2013-2061). Java calls
+            // pyramids.get(metadataIndex) unconditionally here; with
+            // metadataIndex == -1 that throws, and the catch at the end of
+            // readTags abandons the rest of this container.
+            if self.in_dimension_properties && self.metadata_index < 0 {
+                return stream_pos;
+            }
             if self.in_dimension_properties && self.metadata_index >= 0 {
                 let dtag = self.dimension_tag;
                 let idx = self.metadata_index as usize;
@@ -15580,15 +15602,16 @@ impl<'a> VsiTagParser<'a> {
                 } else if tag == VSI_CHANNEL_PROPERTIES {
                     self.found_channel_tag = true;
                 } else if tag == VSI_DIMENSION_MEANING {
-                    if let Some(sv) = &self.stored_value {
-                        if let Ok(dim) = sv.trim().parse::<i64>() {
-                            match dim {
-                                VSI_DIM_Z => p.dim_order.z = Some(dtag),
-                                VSI_DIM_T => p.dim_order.t = Some(dtag),
-                                VSI_DIM_LAMBDA => p.dim_order.l = Some(dtag),
-                                VSI_DIM_C => p.dim_order.c = Some(dtag),
-                                _ => {}
-                            }
+                    if let Some(sv) = &stored_value {
+                        // Java: Integer.parseInt(storedValue), -1 on failure.
+                        match sv.parse::<i64>().unwrap_or(-1) {
+                            VSI_DIM_Z => p.dim_order.z = Some(dtag),
+                            VSI_DIM_T => p.dim_order.t = Some(dtag),
+                            VSI_DIM_LAMBDA => p.dim_order.l = Some(dtag),
+                            VSI_DIM_C => p.dim_order.c = Some(dtag),
+                            // PHASE and anything else throw FormatException,
+                            // which abandons the rest of this container.
+                            _ => return stream_pos,
                         }
                     }
                 }
@@ -15791,8 +15814,8 @@ impl<'a> VsiTagParser<'a> {
                 }
                 Some(format!("{vals:?}"))
             }
-            // DOUBLE array family (260..=266, 268, 279, 280).
-            260..=266 | 268 | 279 | 280 => {
+            // DOUBLE array family incl. COMPLEX (11, CellSensReader.java:1915-1925).
+            11 | 260..=266 | 268 | 279 | 280 => {
                 let n_values = (data_size / 8).max(0) as usize;
                 let mut vals = Vec::with_capacity(n_values);
                 for v in 0..n_values {
@@ -16150,20 +16173,23 @@ impl CellSensReader {
             current: 0,
             flattened_resolutions: true,
             vsi_path: None,
+            vsi_pyramids: Vec::new(),
+            tiff_pyramids: Vec::new(),
         }
     }
 
     /// Parse the proprietary VSI tag-tree (from byte offset 8) and return the
     /// ordered `Pyramid` blocks. Mirrors `initFile`'s `readTags(vsi, false, "")`
     /// call (CellSensReader.java:684-685).
-    fn parse_vsi_pyramids(vsi_path: &Path) -> Vec<VsiPyramid> {
+    /// Returns the parsed pyramids plus Java's `channelCount` and `zCount`.
+    fn parse_vsi_pyramids(vsi_path: &Path) -> (Vec<VsiPyramid>, i32, i32) {
         let Ok(bytes) = std::fs::read(vsi_path) else {
-            return Vec::new();
+            return (Vec::new(), 0, 0);
         };
         let mut parser = VsiTagParser::new(&bytes);
         // initFile calls readTags(vsi, false, "") (CellSensReader.java:684-685).
         parser.read_tags(8, false, "");
-        parser.pyramids
+        (parser.pyramids, parser.channel_count, parser.z_count)
     }
 
     /// Locate `frame_*.ets` files in the `_<name>_/<stack>/` pixel directories
@@ -16181,15 +16207,24 @@ impl CellSensReader {
         let Ok(stacks) = std::fs::read_dir(&pixels_dir) else {
             return out;
         };
+        // Location.list(true) leaves out hidden entries (CellSensReader.java
+        // 9.0.0-rc1:708, 714).
+        let not_hidden = |p: &PathBuf| {
+            !p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with('.'))
+        };
         let mut stack_dirs: Vec<PathBuf> = stacks
             .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.is_dir())
+            .filter(|p| p.is_dir() && not_hidden(p))
             .collect();
         stack_dirs.sort();
         for stack in stack_dirs {
             if let Ok(files) = std::fs::read_dir(&stack) {
-                let mut paths: Vec<PathBuf> =
-                    files.filter_map(|e| e.ok().map(|e| e.path())).collect();
+                let mut paths: Vec<PathBuf> = files
+                    .filter_map(|e| e.ok().map(|e| e.path()))
+                    .filter(not_hidden)
+                    .collect();
                 paths.sort();
                 for p in paths {
                     let name = p.file_name().and_then(|n| n.to_str()).unwrap_or_default();
@@ -16336,12 +16371,15 @@ impl CellSensReader {
         }
         let pixel_type = convert_ets_pixel_type(pixel_type_code)?;
         let bpp = pixel_type.bytes_per_sample();
-        // color region begins at base + 32 + 68 = base + 100, always 40 bytes.
+        // color region begins at base + 32 + 68 = base + 100. Java then calls
+        // skipBytes(4 * 10 - color.length), which does nothing when negative,
+        // so componentOrder follows at max(40, color.length).
         let color_start = base + 32 + 4 * 17;
-        let color_len = (size_c as usize).saturating_mul(bpp).min(40);
+        let color_len = (size_c as usize).saturating_mul(bpp);
         let background = read_exact_at(&mut reader, path, color_start, color_len)?;
-        let component_order = i32_at(&mut reader, path, color_start + 40)?;
-        let use_pyramid = i32_at(&mut reader, path, color_start + 44)? != 0;
+        let component_offset = color_start + color_len.max(40) as u64;
+        let component_order = i32_at(&mut reader, path, component_offset)?;
+        let use_pyramid = i32_at(&mut reader, path, component_offset + 4)? != 0;
         let bgr = component_order == 1 && compression == ETS_RAW;
 
         // Used-chunk table at usedChunkOffset. Each entry:
@@ -16468,7 +16506,7 @@ impl CellSensReader {
         // ETS count) and matches each ETS volume to an as-yet-unclaimed pyramid by
         // width/height range, dropping any ETS that finds no match
         // (CellSensReader.java:782, 1329-1364).
-        let pyramids = Self::parse_vsi_pyramids(vsi_path);
+        let (pyramids, channel_count, z_count) = Self::parse_vsi_pyramids(vsi_path);
         // If the VSI tag-tree yielded no `Pyramid` blocks at all, there is nothing
         // to match against and nothing to crop to: keep every ETS volume and
         // derive geometry purely from the tile grid (compute_levels falls back to
@@ -16481,19 +16519,116 @@ impl CellSensReader {
             // (CellSensReader.java:706-773). Do not leave a valid `.vsi`
             // initialized with zero logical series just because no ETS companions
             // were found or parsed.
+            //
+            // Regroup the IFDs into series the way Java does for a single-file
+            // VSI (CellSensReader.java 9.0.0-rc1:736-760, 829-855) instead of
+            // keeping the generic TIFF grouping, which would stack same-sized
+            // channel IFDs along T.
+            let mut channel_count = channel_count;
+            let mut z_count = z_count;
+            if self.inner.split_ifds_into_single_ifd_series_xyczt().is_ok() {
+                let single = self.inner.series_list().to_vec();
+                let mut ifds: Vec<usize> = (0..single.len()).collect();
+                let mut series_count = ifds.len();
+                if ifds.len() > 1 {
+                    let samples_1 = self
+                        .inner
+                        .ifd(ifds[1])
+                        .map_or(1, |ifd| ifd.samples_per_pixel());
+                    if samples_1 == 1 {
+                        series_count = 2;
+                        if channel_count == 0 && z_count == 0 {
+                            channel_count = ifds.len() as i32 - 1;
+                        } else if z_count > 0 {
+                            z_count /= 2;
+                            channel_count = (ifds.len() as i32 - 1) / z_count;
+                        }
+                    } else {
+                        if ifds.len() > 2 {
+                            ifds.remove(2);
+                        }
+                        series_count = ifds.len().min(3);
+                    }
+                }
+
+                let mut series = Vec::with_capacity(series_count);
+                for s in 0..series_count {
+                    let mut ts = single[ifds[s]].clone();
+                    let m = &mut ts.metadata;
+                    m.size_t = 1;
+                    if channel_count > 0 && (channel_count as usize) < ifds.len() && s > 0 {
+                        let image_count = ifds.len() - 1;
+                        m.size_c *= channel_count as u32;
+                        m.size_z = (image_count / channel_count as usize) as u32;
+                        m.image_count = image_count as u32;
+                        m.dimension_order = crate::common::metadata::DimensionOrder::XYZCT;
+                        // Java reads plane `no` from ifds.get(getIFDIndex() + no).
+                        ts.ifd_indices = ifds[s..(s + image_count).min(ifds.len())].to_vec();
+                    } else {
+                        m.size_z = 1;
+                        m.image_count = 1;
+                        m.dimension_order = crate::common::metadata::DimensionOrder::XYCZT;
+                    }
+                    m.is_interleaved = false;
+                    m.thumbnail = s != 0;
+                    series.push(ts);
+                }
+                self.inner.replace_series(series);
+                self.tiff_series = self.inner.series_count();
+            }
             self.ets.clear();
             self.series_map.clear();
             self.series_names.clear();
             self.series_phys.clear();
+            self.tiff_pyramids.clear();
+            // Pyramid per series and image name (CellSensReader.java
+            // 9.0.0-rc1:914-1043): non-"Overview" pyramids belong to the leading
+            // series, the rest are handed out in order; series without a pyramid
+            // are named "macro image".
+            let ignored_pyramids = pyramids
+                .iter()
+                .filter(|p| {
+                    !p.meta
+                        .name
+                        .as_deref()
+                        .is_some_and(|n| n.eq_ignore_ascii_case("Overview"))
+                })
+                .count();
+            let mut next_pyramid = 0;
             for s in 0..self.tiff_series {
-                self.series_map.push(CellSensTarget::Tiff(s));
-                self.series_names.push(if s == 0 {
-                    filename.clone()
+                let pyramid = if !(ignored_pyramids > 0
+                    && s < self
+                        .tiff_series
+                        .saturating_sub(pyramids.len() - ignored_pyramids))
+                    && next_pyramid < pyramids.len()
+                {
+                    next_pyramid += 1;
+                    Some(next_pyramid - 1)
                 } else {
-                    format!("{filename} #{}", s + 1)
-                });
+                    None
+                };
+                let name = match pyramid.and_then(|p| pyramids[p].meta.name.clone()) {
+                    Some(name) => {
+                        let duplicate = pyramids.iter().enumerate().any(|(q, other)| {
+                            Some(q) != pyramid && other.meta.name.as_deref() == Some(&name)
+                        });
+                        if name == "Overview" || name == "Label" {
+                            name.to_lowercase()
+                        } else if duplicate {
+                            format!("{name} #{s}")
+                        } else {
+                            name
+                        }
+                    }
+                    None if pyramid.is_some() => format!("{filename} #{}", s + 1),
+                    None => "macro image".to_string(),
+                };
+                self.series_map.push(CellSensTarget::Tiff(s));
+                self.series_names.push(name);
                 self.series_phys.push(None);
+                self.tiff_pyramids.push(pyramid);
             }
+            self.vsi_pyramids = pyramids.into_iter().map(|p| p.meta).collect();
             return;
         } else if pyramids.is_empty() {
             for vol in volumes.iter_mut() {
@@ -16554,6 +16689,15 @@ impl CellSensReader {
                 vol.physical_size_y = p.physical_size_y;
                 vol.compute_levels();
             }
+        }
+        // With ETS files, Java's last series is the first IFD on its own, flagged
+        // as a thumbnail (CellSensReader.java 9.0.0-rc1:829-852), not the generic
+        // TIFF grouping of the IFDs.
+        if self.inner.split_ifds_into_single_ifd_series_xyczt().is_ok() {
+            if let Some(first) = self.inner.series_list_mut().first_mut() {
+                first.metadata.thumbnail = true;
+            }
+            self.tiff_series = self.inner.series_count();
         }
         // Record ETS summary in the first series' metadata.
         if let Some(s) = self.inner.series_list_mut().first_mut() {
@@ -16746,86 +16890,96 @@ impl CellSensReader {
     ) -> Vec<crate::common::ome_metadata::OmeChannel> {
         use crate::common::ome_metadata::OmeChannel;
 
-        match target {
+        // MetadataTools.populatePixels gives one channel per effective C with
+        // SamplesPerPixel = RGB channel count; the pyramid assigned to the image
+        // (if any) then fills the per-channel settings (CellSensReader.java:967-1001).
+        let (spp, size_c, pyramid) = match target {
             CellSensTarget::Ets { volume, resolution } => {
                 let Some(vol) = self.ets.get(volume) else {
                     return Vec::new();
                 };
-                let spp = vol.rgb_channels().max(1);
                 let size_c = vol
                     .levels
                     .get(resolution)
                     .map(|level| level.size_c)
-                    .unwrap_or(vol.size_c)
-                    .max(1);
-                let channel_count = if spp > 1 { 1 } else { size_c.max(1) } as usize;
-                if resolution != 0 {
-                    return (0..channel_count)
-                        .map(|_| OmeChannel {
-                            samples_per_pixel: spp,
-                            ..OmeChannel::default()
-                        })
-                        .collect();
-                }
-                let mut channels = Vec::with_capacity(channel_count);
-                for c in 0..channel_count {
-                    let detector_gain = match c {
-                        0 => vol.meta.red_gain,
-                        1 => vol.meta.green_gain,
-                        2 => vol.meta.blue_gain,
-                        _ => None,
-                    };
-                    let detector_offset = match c {
-                        0 => vol.meta.red_offset,
-                        1 => vol.meta.green_offset,
-                        2 => vol.meta.blue_offset,
-                        _ => None,
-                    };
-                    channels.push(OmeChannel {
-                        name: vol.meta.channel_names.get(c).cloned(),
-                        samples_per_pixel: spp,
-                        emission_wavelength: vol.meta.channel_wavelengths.get(c).copied(),
-                        detector_ref: Some(crate::common::ome_metadata::create_lsid(
-                            "Detector",
-                            &[0, volume],
-                        )),
-                        detector_settings_binning: cellsens_binning(&vol.meta),
-                        detector_settings_gain: detector_gain,
-                        detector_settings_offset: detector_offset,
-                        ..OmeChannel::default()
-                    });
-                }
-                channels
+                    .unwrap_or(vol.size_c);
+                // Only the full-resolution image carries the pyramid settings.
+                let pyramid = (resolution == 0).then_some((&vol.meta, volume));
+                (vol.rgb_channels().max(1), size_c.max(1), pyramid)
             }
             CellSensTarget::Tiff(ts) => {
-                let spp = self.inner.series_list().get(ts).map_or(1, |s| {
-                    if s.metadata.is_rgb {
-                        s.metadata.size_c.max(1)
-                    } else {
-                        1
-                    }
-                });
-                vec![OmeChannel {
+                let Some(series) = self.inner.series_list().get(ts) else {
+                    return Vec::new();
+                };
+                let m = &series.metadata;
+                let pyramid = self
+                    .tiff_pyramids
+                    .get(ts)
+                    .copied()
+                    .flatten()
+                    .and_then(|p| Some((self.vsi_pyramids.get(p)?, p)));
+                let spp = if m.is_rgb { m.size_c.max(1) } else { 1 };
+                (spp, m.size_c.max(1), pyramid)
+            }
+        };
+        let channel_count = if spp > 1 { 1 } else { size_c } as usize;
+        let mut channels = Vec::with_capacity(channel_count);
+        for c in 0..channel_count {
+            let Some((meta, detector)) = pyramid else {
+                channels.push(OmeChannel {
                     samples_per_pixel: spp,
                     ..OmeChannel::default()
-                }]
-            }
+                });
+                continue;
+            };
+            let detector_gain = match c {
+                0 => meta.red_gain,
+                1 => meta.green_gain,
+                2 => meta.blue_gain,
+                _ => None,
+            };
+            let detector_offset = match c {
+                0 => meta.red_offset,
+                1 => meta.green_offset,
+                2 => meta.blue_offset,
+                _ => None,
+            };
+            channels.push(OmeChannel {
+                name: meta.channel_names.get(c).cloned(),
+                samples_per_pixel: spp,
+                emission_wavelength: meta.channel_wavelengths.get(c).copied(),
+                detector_ref: Some(crate::common::ome_metadata::create_lsid(
+                    "Detector",
+                    &[0, detector],
+                )),
+                detector_settings_binning: cellsens_binning(meta),
+                detector_settings_gain: detector_gain,
+                detector_settings_offset: detector_offset,
+                ..OmeChannel::default()
+            });
         }
+        channels
     }
 
     fn ome_instrument(&self) -> Option<crate::common::ome_metadata::OmeInstrument> {
         use crate::common::ome_metadata::{create_lsid, OmeDetector, OmeInstrument, OmeObjective};
 
-        if self.ets.is_empty() {
+        if self.series_map.is_empty() {
             return None;
         }
+        // Java always creates Instrument:0, with one Objective and Detector per
+        // Pyramid (CellSensReader.java:917-953).
         let mut instrument = OmeInstrument {
             id: Some(create_lsid("Instrument", &[0])),
             ..Default::default()
         };
+        let metas: Vec<&VsiPyramidMeta> = if self.ets.is_empty() {
+            self.vsi_pyramids.iter().collect()
+        } else {
+            self.ets.iter().map(|vol| &vol.meta).collect()
+        };
 
-        for (i, vol) in self.ets.iter().enumerate() {
-            let m = &vol.meta;
+        for (i, m) in metas.into_iter().enumerate() {
             let model = m
                 .objective_types
                 .iter()
@@ -17115,6 +17269,8 @@ impl FormatReader for CellSensReader {
         self.series_phys.clear();
         self.current = 0;
         self.vsi_path = None;
+        self.vsi_pyramids.clear();
+        self.tiff_pyramids.clear();
         self.inner.close()
     }
     fn series_count(&self) -> usize {
@@ -17130,7 +17286,11 @@ impl FormatReader for CellSensReader {
                 // (planar) with dimensionOrder XYCZT (CellSensReader.java:845, 851).
                 let mut om = self.inner.metadata().clone();
                 om.is_interleaved = false;
-                om.dimension_order = crate::common::metadata::DimensionOrder::XYCZT;
+                // Without ETS files the series were regrouped in enrich_metadata
+                // and already carry Java's dimension order (XYZCT for channels).
+                if !self.ets.is_empty() {
+                    om.dimension_order = crate::common::metadata::DimensionOrder::XYCZT;
+                }
                 self.ets_meta = Some(om);
                 self.current = s;
                 Ok(())
@@ -17434,7 +17594,8 @@ impl FormatReader for CellSensReader {
             };
             if let CellSensTarget::Ets { volume, resolution } = *target {
                 self.enrich_ome_image_from_ets(&mut image, volume, resolution);
-            } else if !self.ets.is_empty() {
+            } else {
+                // store.setImageInstrumentRef for every image (CellSensReader.java:1036).
                 image.instrument_ref = Some(0);
             }
             if let Some(meta) = self.logical_series_metadata_for_ome(*target) {
@@ -25157,6 +25318,179 @@ RecordingDate=2024-01-02 03:04:05.678\n",
         assert!(parser.expect_ets, "HAS_EXTERNAL_FILE=1 must set expect_ets");
     }
 
+    /// Like `build_vsi_tag_stream`, but each field is `(fieldType, tag,
+    /// dataSize, data)` so inline fields (value carried in `dataSize`, no data
+    /// bytes) can be expressed.
+    #[cfg(feature = "gpl")]
+    fn build_vsi_tag_stream_sized(fields: &[(i32, i32, i32, Vec<u8>)]) -> Vec<u8> {
+        let mut out = vec![0u8; 8];
+        out.extend_from_slice(&24i16.to_le_bytes());
+        out.extend_from_slice(&21321i16.to_le_bytes());
+        out.extend_from_slice(&0i32.to_le_bytes());
+        out.extend_from_slice(&24i64.to_le_bytes());
+        out.extend_from_slice(&(fields.len() as i32).to_le_bytes());
+        out.extend_from_slice(&0i32.to_le_bytes());
+        let mut rel = 24i64;
+        let mut starts = Vec::with_capacity(fields.len());
+        for (_, _, _, data) in fields {
+            starts.push(rel);
+            rel += 16 + data.len() as i64;
+        }
+        for (i, (field_type, tag, data_size, data)) in fields.iter().enumerate() {
+            let next_field = starts.get(i + 1).copied().unwrap_or(0);
+            out.extend_from_slice(&field_type.to_le_bytes());
+            out.extend_from_slice(&tag.to_le_bytes());
+            out.extend_from_slice(&(next_field as u32).to_le_bytes());
+            out.extend_from_slice(&data_size.to_le_bytes());
+            out.extend_from_slice(data);
+        }
+        // Trailing bytes, as in a real file: Java stops reading a field that
+        // ends within 16 bytes of EOF.
+        out.extend_from_slice(&[0u8; 32]);
+        out
+    }
+
+    /// Regression (B2_0003.vsi read Z=1 instead of Z=5): Java's `storedValue`
+    /// is local to each tag and an inline field's value is its `dataSize`
+    /// (CellSensReader.java:1714, 1800). An inline DIMENSION_MEANING must use
+    /// its own value, not a value left over from an earlier leaf.
+    #[cfg(feature = "gpl")]
+    #[test]
+    fn vsi_inline_dimension_meaning_uses_its_own_value() {
+        const INLINE: i32 = 0x4000_0000;
+        let stream = build_vsi_tag_stream_sized(&[
+            // An earlier leaf whose value (4 == DIM C) must not leak into the
+            // DIMENSION_MEANING below.
+            (VSI_INT, 10019, 4, 4i32.to_le_bytes().to_vec()),
+            // Inline DIMENSION_MEANING: dimension 1 (Z) carried in dataSize.
+            (
+                INLINE | VSI_INT,
+                VSI_DIMENSION_MEANING,
+                VSI_DIM_Z as i32,
+                Vec::new(),
+            ),
+        ]);
+        let mut parser = VsiTagParser::new(&stream);
+        parser.pyramids.push(VsiPyramid::default());
+        parser.metadata_index = 0;
+        parser.in_dimension_properties = true;
+        parser.dimension_tag = 1;
+        parser.read_tags(8, true, "");
+
+        let order = parser.pyramids[0].dim_order;
+        assert_eq!(order.z, Some(1), "inline DIMENSION_MEANING=Z assigns Z");
+        assert_eq!(order.c, None, "stale earlier value must not assign C");
+    }
+
+    /// Regression (A1_Maximum_Z.vsi counted 4 channels where Java counts 0):
+    /// inside dimension properties Java calls `pyramids.get(metadataIndex)`
+    /// unconditionally; with metadataIndex == -1 that throws and the catch in
+    /// readTags abandons the rest of the container, so later leaves are never
+    /// populated or counted.
+    #[cfg(feature = "gpl")]
+    #[test]
+    fn vsi_dimension_properties_without_pyramid_abort_container_like_java() {
+        let wavelength = |nm: f64| (VSI_DOUBLE, VSI_VALUE, 8, nm.to_le_bytes().to_vec());
+        let stream = build_vsi_tag_stream_sized(&[wavelength(767.0), wavelength(575.0)]);
+        let mut parser = VsiTagParser::new(&stream);
+        parser.metadata_index = -1;
+        parser.in_dimension_properties = true;
+        parser.read_tags(8, true, "Channel Wavelength ");
+
+        assert_eq!(
+            parser.channel_count, 1,
+            "only the leaf before Java's exception is counted"
+        );
+    }
+
+    /// Writes a little-endian, uncompressed, multi-page TIFF; each page is
+    /// `(width, height, samplesPerPixel, bitsPerSample, pixels)`.
+    #[cfg(feature = "gpl")]
+    fn write_multi_page_tiff(path: &Path, pages: &[(u32, u32, u16, u16, Vec<u8>)]) {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"II");
+        data.extend_from_slice(&42u16.to_le_bytes());
+        data.extend_from_slice(&8u32.to_le_bytes());
+        for (i, (width, height, spp, bps, pixels)) in pages.iter().enumerate() {
+            let ifd_offset = data.len();
+            let mut entries = vec![
+                long_entry(tag::IMAGE_WIDTH, *width),
+                long_entry(tag::IMAGE_LENGTH, *height),
+                short_vec_entry(tag::BITS_PER_SAMPLE, &vec![*bps; *spp as usize]),
+                short_entry(tag::COMPRESSION, 1),
+                short_entry(
+                    tag::PHOTOMETRIC_INTERPRETATION,
+                    if *spp > 1 { 2 } else { 1 },
+                ),
+                short_entry(tag::SAMPLES_PER_PIXEL, *spp),
+                long_entry(tag::ROWS_PER_STRIP, *height),
+                long_entry(tag::STRIP_BYTE_COUNTS, pixels.len() as u32),
+                short_entry(tag::PLANAR_CONFIGURATION, 1),
+            ];
+            let strip_offset =
+                ifd_offset + ifd_table_len(entries.len() + 1) + ifd_extra_len(&entries);
+            entries.push(long_entry(tag::STRIP_OFFSETS, strip_offset as u32));
+            let next_ifd = if i + 1 < pages.len() {
+                (strip_offset + pixels.len()) as u32
+            } else {
+                0
+            };
+            write_test_ifd(&mut data, &entries, ifd_offset, next_ifd);
+            data.resize(strip_offset, 0);
+            data.extend_from_slice(pixels);
+        }
+        File::create(path).unwrap().write_all(&data).unwrap();
+    }
+
+    /// Regression (A1_Maximum_Z.vsi series 1 read as C=1,T=5 instead of C=5):
+    /// a single-file VSI groups its IFDs like Java (CellSensReader.java:759-901),
+    /// not like the generic TIFF reader, which stacks same-sized pages along T.
+    #[cfg(feature = "gpl")]
+    #[test]
+    fn cellsens_vsi_without_ets_groups_channel_ifds_like_java() {
+        let path = temp_flim2_path("single-file-channels.vsi");
+        let mut pages = vec![(2, 2, 3, 8, vec![7u8; 12])];
+        for c in 0..5u16 {
+            let plane: Vec<u8> = (0..16u16)
+                .flat_map(|i| (c * 100 + i).to_le_bytes())
+                .collect();
+            pages.push((4, 4, 1, 16, plane));
+        }
+        write_multi_page_tiff(&path, &pages);
+
+        let mut reader = CellSensReader::new();
+        reader.set_id(&path).unwrap();
+        assert_eq!(reader.series_count(), 2);
+
+        reader.set_series(0).unwrap();
+        let m = reader.metadata();
+        assert_eq!((m.size_x, m.size_c, m.image_count), (2, 3, 1));
+        assert!(m.is_rgb);
+
+        reader.set_series(1).unwrap();
+        let m = reader.metadata().clone();
+        assert_eq!((m.size_x, m.size_y), (4, 4));
+        assert_eq!((m.size_z, m.size_c, m.size_t), (1, 5, 1));
+        assert_eq!(m.image_count, 5);
+        assert_eq!(m.dimension_order, DimensionOrder::XYZCT);
+        assert_eq!(m.pixel_type, PixelType::Uint16);
+        assert!(
+            m.thumbnail,
+            "Java marks every series after the first as thumbnail"
+        );
+        for c in 0..5u16 {
+            let plane = reader.open_bytes(c as u32).unwrap();
+            assert_eq!(
+                &plane[..2],
+                &(c * 100).to_le_bytes(),
+                "plane {c} reads IFD {}",
+                c + 1
+            );
+        }
+
+        let _ = std::fs::remove_file(path);
+    }
+
     /// Exact pyramid width/height from the tag-tree overrides the tile-grid
     /// extent for level 0 (CellSensReader.java:1463-1464).
     #[cfg(feature = "gpl")]
@@ -25530,6 +25864,30 @@ RecordingDate=2024-01-02 03:04:05.678\n",
             }
             other => panic!("expected file range, got {other:?}"),
         }
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// With more than 40 bytes of background color (here 25 uint16 channels),
+    /// Java's `skipBytes(4 * 10 - color.length)` is negative and skips nothing,
+    /// so componentOrder/usePyramid follow the color directly
+    /// (CellSensReader.java 9.0.0-rc1:1385-1392).
+    #[cfg(feature = "gpl")]
+    #[test]
+    fn cellsens_ets_wide_background_color_shifts_component_order() {
+        let path = temp_flim2_path("wide-background.ets");
+        let mut bytes = build_synthetic_ets(2, ETS_PT_USHORT, 25, 1, 1, 50, 50);
+        let color_start = 64 + 8 + 32 + 4 * 17;
+        let component_offset = color_start + 25 * 2;
+        bytes[component_offset + 4..component_offset + 8].copy_from_slice(&1i32.to_le_bytes());
+        std::fs::write(&path, bytes).unwrap();
+
+        let vol = CellSensReader::parse_ets(&path).unwrap();
+        assert_eq!(vol.background.len(), 50, "full sizeC * bpp color is kept");
+        assert!(
+            vol.use_pyramid,
+            "usePyramid is read right after the 50-byte color"
+        );
 
         let _ = std::fs::remove_file(path);
     }
