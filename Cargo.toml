@@ -126,6 +126,10 @@ name = "java_parity_test"
 path = "tests/java_parity_test.rs"
 
 [[test]]
+name = "local_regression_test"
+path = "tests/local_regression_test.rs"
+
+[[test]]
 name = "write_test"
 path = "tests/write_test.rs"
 

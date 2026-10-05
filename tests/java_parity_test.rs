@@ -900,6 +900,14 @@ fn java_parity() {
                     }
                 }};
             }
+            // Integer samples wider than a byte are compared by value, so a ±1
+            // decoder rounding that carries across a byte (0x08FF vs 0x0900) is
+            // not reported as a byte difference of 255.
+            let sample_bytes = match m.pixel_type {
+                PixelType::Float32 | PixelType::Float64 => 1,
+                pt => pt.bytes_per_sample(),
+            };
+            let little_endian = m.is_little_endian;
             let cmp = |rbuf: &[u8], jcrc: u64, jlen: u64, jb64: Option<&str>, label: &str| -> Out {
                 let rcrc = crc32_ieee(rbuf) as u64;
                 if rcrc == jcrc && rbuf.len() as u64 == jlen {
@@ -908,19 +916,27 @@ fn java_parity() {
                 if let Some(jb) = jb64 {
                     let jbytes = b64_decode(jb);
                     if jbytes.len() == rbuf.len() {
-                        let maxd = jbytes
-                            .iter()
-                            .zip(rbuf)
-                            .map(|(a, b)| a.abs_diff(*b))
-                            .max()
-                            .unwrap_or(0);
-                        if maxd <= PIXEL_TOL {
-                            return Out::Tol(maxd);
+                        let n = if jbytes.len() % sample_bytes == 0 { sample_bytes } else { 1 };
+                        let sample = |chunk: &[u8]| {
+                            let fold = |acc: u64, b: &u8| (acc << 8) | *b as u64;
+                            if little_endian {
+                                chunk.iter().rev().fold(0, fold)
+                            } else {
+                                chunk.iter().fold(0, fold)
+                            }
+                        };
+                        let diffs = jbytes
+                            .chunks(n)
+                            .zip(rbuf.chunks(n))
+                            .map(|(a, b)| sample(a).abs_diff(sample(b)));
+                        let maxd = diffs.clone().max().unwrap_or(0);
+                        if maxd <= PIXEL_TOL as u64 {
+                            return Out::Tol(maxd as u8);
                         }
-                        let ndiff = jbytes.iter().zip(rbuf).filter(|(a, b)| a != b).count();
+                        let ndiff = diffs.filter(|&d| d != 0).count();
                         return Out::Bad(format!(
-                            "{label}: maxdiff={maxd} over {ndiff}/{} bytes",
-                            rbuf.len()
+                            "{label}: maxdiff={maxd} over {ndiff}/{} samples",
+                            rbuf.len() / n
                         ));
                     }
                 }
