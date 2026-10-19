@@ -5118,13 +5118,11 @@ impl SlideBook7Reader {
                 }
             }
             if let Some(align) = extras.align_manips.first() {
-                for (key, value) in [("slidebook7.align_manip.0.manip_id", align.manip_id)] {
-                    if let Some(value) = value {
-                        meta.series_metadata.insert(
-                            key.into(),
-                            crate::common::metadata::MetadataValue::Int(value),
-                        );
-                    }
+                if let Some(manip_id) = align.manip_id {
+                    meta.series_metadata.insert(
+                        "slidebook7.align_manip.0.manip_id".into(),
+                        crate::common::metadata::MetadataValue::Int(manip_id),
+                    );
                 }
                 for (key, value) in [
                     ("slidebook7.align_manip.0.x_offset", align.x_offset),
