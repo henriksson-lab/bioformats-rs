@@ -68,9 +68,9 @@ impl ZipReader {
         !base.is_empty() && name.starts_with(base)
     }
 
-    fn extract_entry(
+    fn extract_entry<R: std::io::Read>(
         entry_index: usize,
-        entry: &mut zip::read::ZipFile<'_>,
+        entry: &mut zip::read::ZipFile<'_, R>,
         dir: &Path,
         inner_base: &str,
         extracted_files: &mut Vec<PathBuf>,
