@@ -795,23 +795,33 @@ impl TiffReader {
                     modulo_c: None,
                     modulo_t: None,
                 };
-                if let Some(value) = tiff_physical_size(
-                    ifds.get(ifd_indices[0]),
-                    crate::tiff::ifd::tag::X_RESOLUTION,
-                ) {
-                    meta.series_metadata.insert(
-                        "PhysicalSizeX".to_string(),
-                        crate::common::metadata::MetadataValue::Float(value),
-                    );
-                }
-                if let Some(value) = tiff_physical_size(
-                    ifds.get(ifd_indices[0]),
-                    crate::tiff::ifd::tag::Y_RESOLUTION,
-                ) {
-                    meta.series_metadata.insert(
-                        "PhysicalSizeY".to_string(),
-                        crate::common::metadata::MetadataValue::Float(value),
-                    );
+                // BaseTiffReader.initMetadataStore: the pixel size from the
+                // first IFD's resolution tags, in the unit named by the
+                // comment's `unit=` unless RESOLUTION_UNIT says cm.
+                if let Some(first_ifd) = ifds.get(ifd_indices[0]) {
+                    let pix_x = first_ifd.get_x_resolution();
+                    let pix_y = first_ifd.get_y_resolution();
+                    let mut unit = None;
+                    // "3" indicates cm
+                    if first_ifd.get_u16(crate::tiff::ifd::tag::RESOLUTION_UNIT) != Some(3) {
+                        unit = get_resolution_unit_from_comment(first_ifd);
+                    }
+                    for (axis, size) in [("X", pix_x), ("Y", pix_y)] {
+                        if let Some((value, unit)) =
+                            crate::common::ome_metadata::get_physical_size(size, unit)
+                        {
+                            meta.series_metadata.insert(
+                                format!("PhysicalSize{axis}"),
+                                crate::common::metadata::MetadataValue::Float(value),
+                            );
+                            if let Some(unit) = unit {
+                                meta.series_metadata.insert(
+                                    format!("PhysicalSize{axis}Unit"),
+                                    crate::common::metadata::MetadataValue::String(unit),
+                                );
+                            }
+                        }
+                    }
                 }
 
                 // Store image description in metadata
@@ -3248,23 +3258,20 @@ fn is_interleaved_rgb(info: &IfdInfo) -> bool {
     info.samples_per_pixel <= 1
 }
 
-fn tiff_physical_size(ifd: Option<&Ifd>, tag: u16) -> Option<f64> {
-    let ifd = ifd?;
-    let resolution = ifd
-        .get(tag)
-        .and_then(|value| value.as_vec_f64().first().copied())
-        .filter(|value| *value > 0.0)?;
-    // Java IFD.getX/YResolution() converts TIFF ResolutionUnit to microns per
-    // pixel before BaseTiffReader passes it to FormatTools.getPhysicalSizeX/Y.
-    match ifd
-        .get(crate::tiff::ifd::tag::RESOLUTION_UNIT)
-        .and_then(|value| value.as_u16())
-        .unwrap_or(2)
-    {
-        2 => Some(25_400.0 / resolution),
-        3 => Some(10_000.0 / resolution),
-        _ => Some(resolution),
+/// Java `BaseTiffReader.getResolutionUnitFromComment`: group 2 of
+/// `(.*)unit=(\w+)(.*)` (DOTALL), so the last `unit=` followed by an ASCII
+/// word character, and that run of word characters.
+fn get_resolution_unit_from_comment(ifd: &Ifd) -> Option<&str> {
+    let comment = ifd.get_str(crate::tiff::ifd::tag::IMAGE_DESCRIPTION)?;
+    if comment.trim().is_empty() {
+        return None;
     }
+    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    comment.rmatch_indices("unit=").find_map(|(at, key)| {
+        let value = &comment[at + key.len()..];
+        let len = value.bytes().take_while(|b| is_word(*b)).count();
+        (len > 0).then(|| &value[..len])
+    })
 }
 
 fn should_planarize_chunky_rgb(info: &IfdInfo, _path: Option<&Path>) -> bool {
@@ -5420,10 +5427,29 @@ impl crate::common::reader::FormatReader for TiffReader {
             {
                 image.physical_size_x = Some(*value);
             }
+            if let Some(crate::common::metadata::MetadataValue::String(unit)) =
+                meta.series_metadata.get("PhysicalSizeXUnit")
+            {
+                image.physical_size_x_unit = Some(unit.clone());
+            }
             if let Some(crate::common::metadata::MetadataValue::Float(value)) =
                 meta.series_metadata.get("PhysicalSizeY")
             {
                 image.physical_size_y = Some(*value);
+            }
+            if let Some(crate::common::metadata::MetadataValue::String(unit)) =
+                meta.series_metadata.get("PhysicalSizeYUnit")
+            {
+                image.physical_size_y_unit = Some(unit.clone());
+            }
+            // TiffReader.populateMetadataStoreImageJ: setPixelsPhysicalSizeZ
+            // from the ImageJ `spacing=` value (stored by parse_comment_imagej).
+            if let Some(crate::common::metadata::MetadataValue::Float(value)) =
+                meta.series_metadata.get("PhysicalSizeZ")
+            {
+                // FormatTools.getPhysicalSizeZ(zDepth): micrometres, null for 0
+                image.physical_size_z =
+                    crate::common::ome_metadata::get_physical_size(*value, None).map(|(v, _)| v);
             }
         }
         Some(ome)
@@ -5436,6 +5462,48 @@ mod tests {
     use crate::common::reader::FormatReader;
     use crate::common::writer::FormatWriter;
     use std::fs;
+
+    #[test]
+    fn ifd_x_resolution_matches_java_get_x_resolution() {
+        use crate::tiff::ifd::{tag, IfdValue};
+        let ifd_with = |unit: Option<u16>| {
+            let mut ifd = Ifd::default();
+            // 0.5 pixels per unit, as an ImageJ "unit=pixel" stack stores it
+            ifd.entries.insert(
+                tag::X_RESOLUTION,
+                IfdValue::Rational(vec![(500_000, 1_000_000)]),
+            );
+            if let Some(unit) = unit {
+                ifd.entries
+                    .insert(tag::RESOLUTION_UNIT, IfdValue::Short(vec![unit]));
+            }
+            ifd
+        };
+        let size = |unit| ifd_with(unit).get_x_resolution();
+        assert_eq!(size(Some(1)), 2.0); // none: 1 / resolution
+        assert_eq!(size(None), 2.0); // missing tag: Java multiplier 1, not inch
+        assert_eq!(size(Some(2)), 50_800.0); // inch
+        assert_eq!(size(Some(3)), 20_000.0); // cm
+        assert_eq!(Ifd::default().get_x_resolution(), 0.0);
+    }
+
+    #[test]
+    fn resolution_unit_from_comment_matches_java_regex() {
+        use crate::tiff::ifd::{tag, IfdValue};
+        let unit = |comment: &str| {
+            let mut ifd = Ifd::default();
+            ifd.entries
+                .insert(tag::IMAGE_DESCRIPTION, IfdValue::Ascii(comment.to_string()));
+            get_resolution_unit_from_comment(&ifd).map(str::to_string)
+        };
+        assert_eq!(
+            unit("ImageJ=1.53t\nunit=pixel\nspacing=2.0\n").as_deref(),
+            Some("pixel")
+        );
+        assert_eq!(unit("unit=micron\ncunit=nm\n").as_deref(), Some("nm")); // greedy: last
+        assert_eq!(unit("unit=nm\nunit=µm\n").as_deref(), Some("nm")); // µ is not \w
+        assert_eq!(unit("spacing=2.0"), None);
+    }
 
     fn push_u16_le(data: &mut Vec<u8>, value: u16) {
         data.extend_from_slice(&value.to_le_bytes());

@@ -16,6 +16,8 @@ pub mod tag {
     pub const X_RESOLUTION: u16 = 282;
     pub const Y_RESOLUTION: u16 = 283;
     pub const PLANAR_CONFIGURATION: u16 = 284;
+    pub const X_POSITION: u16 = 286;
+    pub const Y_POSITION: u16 = 287;
     pub const RESOLUTION_UNIT: u16 = 296;
     pub const SOFTWARE: u16 = 305;
     pub const DATE_TIME: u16 = 306;
@@ -345,6 +347,38 @@ impl Ifd {
     }
 
     // Convenience accessors for common structural tags
+
+    /// Java `IFD.getResolutionMultiplier()`: microns per RESOLUTION_UNIT, or 1
+    /// when the unit is none or missing (`getIFDIntValue` defaults to -1, not
+    /// the TIFF spec default of inch).
+    pub fn get_resolution_multiplier(&self) -> f64 {
+        let resolution_unit = self.get_u16(tag::RESOLUTION_UNIT);
+        let mut multiplier = 1.0;
+        if resolution_unit == Some(2) {
+            multiplier = 25_400.0;
+        } else if resolution_unit == Some(3) {
+            multiplier = 10_000.0;
+        }
+        multiplier
+    }
+
+    /// Java `IFD.getXResolution()`: the pixel width, 0 when the tag is absent.
+    pub fn get_x_resolution(&self) -> f64 {
+        let x = self
+            .get(tag::X_RESOLUTION)
+            .and_then(|value| value.as_vec_f64().first().copied())
+            .map_or(0.0, |resolution| 1.0 / resolution);
+        x * self.get_resolution_multiplier()
+    }
+
+    /// Java `IFD.getYResolution()`: the pixel height, 0 when the tag is absent.
+    pub fn get_y_resolution(&self) -> f64 {
+        let y = self
+            .get(tag::Y_RESOLUTION)
+            .and_then(|value| value.as_vec_f64().first().copied())
+            .map_or(0.0, |resolution| 1.0 / resolution);
+        y * self.get_resolution_multiplier()
+    }
 
     pub fn image_width(&self) -> Option<u32> {
         self.get_u32(tag::IMAGE_WIDTH)

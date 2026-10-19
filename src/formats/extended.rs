@@ -931,13 +931,34 @@ impl VectraReader {
                 "image_name".to_string(),
                 MetadataValue::String(qptiff_image_name(core_index, pyramid_depth, ifd_count)),
             );
-            if let Some(value) = qptiff_physical_size(ifd, crate::tiff::ifd::tag::X_RESOLUTION) {
+            // VectraReader.initMetadataStore: ifd.getX/YResolution() into
+            // FormatTools.getPhysicalSizeX/Y(value), i.e. micrometres.
+            let x = ifd.get_x_resolution();
+            let y = ifd.get_y_resolution();
+            if let Some((value, _)) = crate::common::ome_metadata::get_physical_size(x, None) {
                 meta.series_metadata
                     .insert("PhysicalSizeX".to_string(), MetadataValue::Float(value));
             }
-            if let Some(value) = qptiff_physical_size(ifd, crate::tiff::ifd::tag::Y_RESOLUTION) {
+            if let Some((value, _)) = crate::common::ome_metadata::get_physical_size(y, None) {
                 meta.series_metadata
                     .insert("PhysicalSizeY".to_string(), MetadataValue::Float(value));
+            }
+            // ... and each plane's position: X/Y_POSITION times
+            // getResolutionMultiplier(), through getPhysicalSizeX/Y(position).
+            let unit_multiplier = ifd.get_resolution_multiplier();
+            for (tag, key) in [
+                (crate::tiff::ifd::tag::X_POSITION, "PlanePositionX"),
+                (crate::tiff::ifd::tag::Y_POSITION, "PlanePositionY"),
+            ] {
+                if let Some(position) = ifd.get(tag).and_then(|v| v.as_vec_f64().first().copied()) {
+                    let position = position * unit_multiplier;
+                    if let Some((value, _)) =
+                        crate::common::ome_metadata::get_physical_size(position, None)
+                    {
+                        meta.series_metadata
+                            .insert(key.to_string(), MetadataValue::Float(value));
+                    }
+                }
             }
             for (channel, &channel_ifd) in plane_ifds.iter().enumerate() {
                 if let Some(name) = self.inner.ifd(channel_ifd).and_then(qptiff_channel_name) {
@@ -1021,14 +1042,6 @@ fn qptiff_pixel_type(ifd: &crate::tiff::ifd::Ifd) -> PixelType {
 }
 
 #[cfg(feature = "gpl")]
-fn qptiff_physical_size(ifd: &crate::tiff::ifd::Ifd, tag: u16) -> Option<f64> {
-    ifd.get(tag)
-        .and_then(|value| value.as_vec_f64().first().copied())
-        .filter(|value| *value > 0.0)
-        .map(|value| 10_000.0 / value)
-}
-
-#[cfg(feature = "gpl")]
 fn qptiff_xml_text(xml: &str, tag: &str) -> Option<String> {
     let open = format!("<{tag}>");
     let close = format!("</{tag}>");
@@ -1094,7 +1107,7 @@ mod qptiff_tests {
             .collect();
 
         let ifd_count = 5usize;
-        let entries = 13u32;
+        let entries = 18u32;
         let ifd_size = 2 + entries * 12 + 4;
         let ifd_offsets: Vec<u32> = (0..ifd_count).map(|i| 8 + i as u32 * ifd_size).collect();
         let software_offset = ifd_offsets[ifd_count - 1] + ifd_size;
@@ -1105,6 +1118,9 @@ mod qptiff_tests {
         let pixel2 = pixel1 + 4;
         let pixel3 = pixel2 + 1;
         let pixel4 = pixel3 + 1;
+        // XResolution, YResolution, XPosition, YPosition (8-byte rationals, cm)
+        let rationals = (pixel4 + 2) & !1;
+        let rational = |i: u32| rationals + 8 * i;
 
         let specs = [
             (
@@ -1165,7 +1181,12 @@ mod qptiff_tests {
             push_entry(&mut bytes, 277, 3, 1, 1);
             push_entry(&mut bytes, 278, 4, 1, *h);
             push_entry(&mut bytes, 279, 4, 1, *byte_count);
+            push_entry(&mut bytes, 282, 5, 1, rational(0));
+            push_entry(&mut bytes, 283, 5, 1, rational(1));
             push_entry(&mut bytes, 284, 3, 1, 1);
+            push_entry(&mut bytes, 286, 5, 1, rational(2));
+            push_entry(&mut bytes, 287, 5, 1, rational(3));
+            push_entry(&mut bytes, 296, 3, 1, 3);
             push_entry(
                 &mut bytes,
                 305,
@@ -1188,6 +1209,12 @@ mod qptiff_tests {
         bytes.push(30);
         bytes.push(40);
         bytes.push(50);
+        bytes.resize(rationals as usize, 0);
+        // 20000 px/cm = 0.5 µm, 10000 px/cm = 1 µm, 1.5 cm, 0.25 cm
+        for (numerator, denominator) in [(20_000u32, 1u32), (10_000, 1), (3, 2), (1, 4)] {
+            bytes.extend_from_slice(&numerator.to_le_bytes());
+            bytes.extend_from_slice(&denominator.to_le_bytes());
+        }
         std::fs::write(path, bytes).unwrap();
     }
 
@@ -1239,6 +1266,27 @@ mod qptiff_tests {
         reader.set_series(1).unwrap();
         assert_eq!(reader.resolution_count(), 1);
         assert_eq!(reader.open_bytes(0).unwrap(), vec![30]);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn qptiff_physical_sizes_and_plane_positions_like_java_vectra() {
+        let path = temp_path("calibrated", "qptiff");
+        write_qptiff_two_channel_pyramid(&path);
+
+        let mut reader = VectraReader::new();
+        reader.set_flattened_resolutions(false).unwrap();
+        reader.set_id(&path).unwrap();
+        let ome = reader.ome_metadata().unwrap();
+        let image = &ome.images[0];
+        assert_eq!(image.physical_size_x, Some(0.5));
+        assert_eq!(image.physical_size_y, Some(1.0));
+        assert_eq!(image.planes.len(), 2);
+        for plane in &image.planes {
+            assert_eq!(plane.position_x, Some(15_000.0));
+            assert_eq!(plane.position_y, Some(2_500.0));
+        }
 
         let _ = std::fs::remove_file(path);
     }
@@ -1960,6 +2008,14 @@ impl FormatReader for VectraReader {
                             ..Default::default()
                         });
                     }
+                }
+                let position = |key: &str| match meta.series_metadata.get(key) {
+                    Some(MetadataValue::Float(value)) => Some(*value),
+                    _ => None,
+                };
+                for plane in &mut image.planes {
+                    plane.position_x = position("PlanePositionX");
+                    plane.position_y = position("PlanePositionY");
                 }
             }
         }

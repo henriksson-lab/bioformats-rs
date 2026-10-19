@@ -41,12 +41,22 @@ pub struct OmeImage {
     pub description: Option<String>,
     /// Acquisition timestamp/date string as represented in OME-XML.
     pub acquisition_date: Option<String>,
-    /// Physical pixel size in X (micrometres).
+    /// Physical pixel size in X (micrometres, unless `physical_size_x_unit`).
     pub physical_size_x: Option<f64>,
-    /// Physical pixel size in Y (micrometres).
+    /// Physical pixel size in Y (micrometres, unless `physical_size_y_unit`).
     pub physical_size_y: Option<f64>,
-    /// Physical pixel size in Z / z-step (micrometres).
+    /// Physical pixel size in Z / z-step (micrometres, unless `physical_size_z_unit`).
     pub physical_size_z: Option<f64>,
+    /// Unit of `physical_size_x` when it is not a length convertible to
+    /// micrometres: `"pixel"` or `"reference frame"`. `None` means µm.
+    #[serde(default)]
+    pub physical_size_x_unit: Option<String>,
+    /// Unit of `physical_size_y`; see `physical_size_x_unit`.
+    #[serde(default)]
+    pub physical_size_y_unit: Option<String>,
+    /// Unit of `physical_size_z`; see `physical_size_x_unit`.
+    #[serde(default)]
+    pub physical_size_z_unit: Option<String>,
     /// Time between frames (seconds).
     pub time_increment: Option<f64>,
     /// `<ImagingEnvironment>` temperature (degrees Celsius). Set by readers such
@@ -665,13 +675,16 @@ impl OmeMetadata {
             );
 
             if let Some(v) = img.physical_size_x {
-                let _ = write!(xml, r#" PhysicalSizeX="{v}" PhysicalSizeXUnit="µm""#);
+                let unit = img.physical_size_x_unit.as_deref().unwrap_or("µm");
+                let _ = write!(xml, r#" PhysicalSizeX="{v}" PhysicalSizeXUnit="{unit}""#);
             }
             if let Some(v) = img.physical_size_y {
-                let _ = write!(xml, r#" PhysicalSizeY="{v}" PhysicalSizeYUnit="µm""#);
+                let unit = img.physical_size_y_unit.as_deref().unwrap_or("µm");
+                let _ = write!(xml, r#" PhysicalSizeY="{v}" PhysicalSizeYUnit="{unit}""#);
             }
             if let Some(v) = img.physical_size_z {
-                let _ = write!(xml, r#" PhysicalSizeZ="{v}" PhysicalSizeZUnit="µm""#);
+                let unit = img.physical_size_z_unit.as_deref().unwrap_or("µm");
+                let _ = write!(xml, r#" PhysicalSizeZ="{v}" PhysicalSizeZUnit="{unit}""#);
             }
             if let Some(v) = img.time_increment {
                 let _ = write!(xml, r#" TimeIncrement="{v}" TimeIncrementUnit="s""#);
@@ -1495,9 +1508,12 @@ impl OmeMetadata {
                     let psz_u = xml_attr(pt, "PhysicalSizeZUnit").unwrap_or_else(|| "µm".into());
                     let ti_u = xml_attr(pt, "TimeIncrementUnit").unwrap_or_else(|| "s".into());
                     (
-                        psx.filter(|v| *v > 0.0).map(|v| to_microns(v, &psx_u)),
-                        psy.filter(|v| *v > 0.0).map(|v| to_microns(v, &psy_u)),
-                        psz.filter(|v| *v > 0.0).map(|v| to_microns(v, &psz_u)),
+                        psx.filter(|v| *v > 0.0)
+                            .and_then(|v| get_physical_size(v, Some(&psx_u))),
+                        psy.filter(|v| *v > 0.0)
+                            .and_then(|v| get_physical_size(v, Some(&psy_u))),
+                        psz.filter(|v| *v > 0.0)
+                            .and_then(|v| get_physical_size(v, Some(&psz_u))),
                         ti.map(|v| to_seconds(v, &ti_u)),
                     )
                 } else {
@@ -1538,9 +1554,12 @@ impl OmeMetadata {
                 name,
                 description,
                 acquisition_date,
-                physical_size_x,
-                physical_size_y,
-                physical_size_z,
+                physical_size_x: physical_size_x.as_ref().map(|(v, _)| *v),
+                physical_size_y: physical_size_y.as_ref().map(|(v, _)| *v),
+                physical_size_z: physical_size_z.as_ref().map(|(v, _)| *v),
+                physical_size_x_unit: physical_size_x.and_then(|(_, u)| u),
+                physical_size_y_unit: physical_size_y.and_then(|(_, u)| u),
+                physical_size_z_unit: physical_size_z.and_then(|(_, u)| u),
                 time_increment,
                 stage_label,
                 channels,
@@ -3717,14 +3736,60 @@ fn xml_unescape(s: &str) -> String {
 
 // ─── Unit conversions ─────────────────────────────────────────────────────────
 
-fn to_microns(value: f64, unit: &str) -> f64 {
-    match unit {
-        "m" => value * 1e6,
-        "mm" => value * 1e3,
-        "nm" => value * 1e-3,
-        "pm" => value * 1e-6,
-        _ => value, // assume µm
+/// Java `FormatTools.getPhysicalSize(value, unit)`, normalised to this
+/// crate's convention: a length in any `UnitsLength` unit becomes micrometres
+/// with unit `None`; `"pixel"` and `"reference frame"` keep their value and
+/// unit; an unrecognised or absent unit means µm, as Java's
+/// `EnumerationException` fallback does. `None` for 0 and infinite values.
+pub fn get_physical_size(value: f64, unit: Option<&str>) -> Option<(f64, Option<String>)> {
+    if value == 0.0 || value >= f64::INFINITY || value.is_nan() {
+        return None;
     }
+    match unit {
+        Some(unit @ ("pixel" | "reference frame")) => Some((value, Some(unit.to_string()))),
+        Some(unit) => Some((microns_per_unit(unit).map_or(value, |m| value * m), None)),
+        None => Some((value, None)),
+    }
+}
+
+/// Micrometres per `UnitsLength` unit (ome-xml symbols); `None` for units that
+/// are not convertible lengths or are unknown.
+fn microns_per_unit(unit: &str) -> Option<f64> {
+    Some(match unit {
+        "Ym" => 1e30,
+        "Zm" => 1e27,
+        "Em" => 1e24,
+        "Pm" => 1e21,
+        "Tm" => 1e18,
+        "Gm" => 1e15,
+        "Mm" => 1e12,
+        "km" => 1e9,
+        "hm" => 1e8,
+        "dam" => 1e7,
+        "m" => 1e6,
+        "dm" => 1e5,
+        "cm" => 1e4,
+        "mm" => 1e3,
+        "µm" => 1.0,
+        "nm" => 1e-3,
+        "pm" => 1e-6,
+        "fm" => 1e-9,
+        "am" => 1e-12,
+        "zm" => 1e-15,
+        "ym" => 1e-18,
+        "Å" => 1e-4,
+        "thou" => 25.4,
+        "li" => 25_400.0 / 12.0,
+        "in" => 25_400.0,
+        "ft" => 304_800.0,
+        "yd" => 914_400.0,
+        "mi" => 1_609_344_000.0,
+        "ua" => 1.495_978_707e17,
+        "ly" => 9.460_730_472_580_8e21,
+        "pc" => 3.085_677_581_491_367e22,
+        "pt" => 25_400.0 / 72.0,
+        _ => return None,
+    })
 }
 
 fn to_seconds(value: f64, unit: &str) -> f64 {
@@ -3877,6 +3942,44 @@ mod tests {
         assert_eq!(ome.images[0].channels[0].name.as_deref(), Some("DAPI"));
         assert_eq!(ome.images[0].channels[1].samples_per_pixel, 1);
         assert_eq!(ome.images[0].channels[2].samples_per_pixel, 1);
+    }
+
+    #[test]
+    fn get_physical_size_matches_java_units() {
+        assert_eq!(
+            get_physical_size(2.0, Some("pixel")),
+            Some((2.0, Some("pixel".into())))
+        );
+        assert_eq!(get_physical_size(2.0, Some("nm")), Some((0.002, None)));
+        assert_eq!(get_physical_size(2.0, Some("in")), Some((50_800.0, None)));
+        // not UnitsLength symbols: Java falls back to µm
+        assert_eq!(get_physical_size(2.0, Some("micron")), Some((2.0, None)));
+        assert_eq!(get_physical_size(2.0, Some("inch")), Some((2.0, None)));
+        assert_eq!(get_physical_size(2.0, None), Some((2.0, None)));
+        assert_eq!(get_physical_size(0.0, Some("pixel")), None);
+        assert_eq!(get_physical_size(f64::INFINITY, None), None);
+    }
+
+    #[test]
+    fn ome_xml_keeps_non_length_physical_size_units() {
+        let xml = r#"
+<OME>
+  <Image ID="Image:0">
+    <Pixels ID="Pixels:0" DimensionOrder="XYZCT" Type="uint16" SizeX="2" SizeY="2" SizeZ="1" SizeC="1" SizeT="1"
+      PhysicalSizeX="2.0" PhysicalSizeXUnit="pixel" PhysicalSizeY="500" PhysicalSizeYUnit="nm" PhysicalSizeZ="2.0">
+      <Channel ID="Channel:0:0" SamplesPerPixel="1"/>
+    </Pixels>
+  </Image>
+</OME>"#;
+
+        let ome = OmeMetadata::from_ome_xml(xml);
+        let image = &ome.images[0];
+        assert_eq!(image.physical_size_x, Some(2.0));
+        assert_eq!(image.physical_size_x_unit.as_deref(), Some("pixel"));
+        assert_eq!(image.physical_size_y, Some(0.5));
+        assert_eq!(image.physical_size_y_unit, None);
+        assert_eq!(image.physical_size_z, Some(2.0));
+        assert_eq!(image.physical_size_z_unit, None);
     }
 
     #[test]
