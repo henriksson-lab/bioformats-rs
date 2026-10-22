@@ -142,10 +142,6 @@ name = "non_upstream_readers_test"
 path = "tests/non_upstream_readers_test.rs"
 
 [[test]]
-name = "lavision_stage_test"
-path = "tests/lavision_stage_test.rs"
-
-[[test]]
 name = "stub_cellworx_test"
 path = "tests/stub_cellworx_test.rs"
 

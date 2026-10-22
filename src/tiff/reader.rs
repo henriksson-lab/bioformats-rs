@@ -1071,18 +1071,6 @@ impl TiffReader {
                 crate::common::metadata::MetadataValue::String(xml.to_string()),
             );
 
-            // DEVIATION FROM JAVA BIO-FORMATS (intentional).
-            // LaVision UltraMicroscope writes a self-declaring OME-TIFF whose
-            // OME-XML has no <Plane> and no <StageLabel>, so Java's
-            // OMETiffReader reports no stage position at all. The positions are
-            // in the file, inside the vendor block in <Description>, which Java
-            // treats as opaque text. We parse them out. Gated on LaVision
-            // markers, so every other OME-TIFF is unaffected.
-            // See src/tiff/lavision.rs and README.md.
-            if let Some(stage) = crate::tiff::lavision::parse_lavision_stage(xml) {
-                crate::tiff::lavision::populate_series_metadata(&stage, &mut meta.series_metadata);
-            }
-
             // Only keep the external-plane vector if it actually references a
             // companion file; otherwise leave it empty (pure single-file case).
             let external_planes = if external_planes.iter().any(Option::is_some) {

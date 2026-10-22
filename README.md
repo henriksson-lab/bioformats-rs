@@ -358,67 +358,6 @@ they happen to live in a file whose other readers are GPL (noted below).
 | PCO B16 | `.b16` | N/A | Synthetic header and pixel tests. | Raw uint16 PCO camera files. Only compiled under `gpl`: lives alongside GPL readers in `formats::gpl::camera2`. |
 | PicoQuant PTU/PHU | `.ptu` `.phu` `.pqres` | N/A | Synthetic metadata/reconstruction tests plus optional real fixture. | Set `BIOFORMATS_RS_PICOQUANT_FIXTURE` for local PTU/PQRes coverage. Only compiled under `gpl`: lives alongside GPL readers in `formats::gpl::spm`. |
 
-## Intentional deviations from Java Bio-Formats
-
-Everything else in this crate aims to reproduce Bio-Formats' behaviour, including
-its quirks. The entries below **deliberately do not**, because Java loses
-information that is demonstrably present in the file. Each was verified against
-`bioformats_package.jar` before being written, and each is gated so that files
-without the relevant vendor markers behave exactly as Java does.
-
-If you are diffing this crate against Java, these are the differences you should
-expect to see. Do not "fix" them back to parity without reading the rationale.
-
-| Deviation | Java Bio-Formats | This crate | Where |
-|---|---|---|---|
-| LaVision UltraMicroscope stage positions | reports none — `getPlanePositionX(0,0)` throws `IndexOutOfBoundsException`, `getStageLabelX(0)` is null | recovers the per-file stage offset and the acquisition-wide tile layout into `series_metadata` under `LaVision *` keys | [`src/tiff/lavision.rs`](src/tiff/lavision.rs), `tests/lavision_stage_test.rs` |
-
-### LaVision UltraMicroscope stage positions
-
-LaVision's UltraII writes a self-declaring OME-TIFF, so Bio-Formats dispatches to
-`OMETiffReader`, which trusts the OME-XML. That XML has **no `<Plane>` elements
-and no `<StageLabel>`** — the standard slots for stage geometry — so Java
-correctly reports nothing. This is not a Java defect; it is a file that does not
-populate the standard fields.
-
-The positions are nonetheless in the file, as **structured XML** in two
-`<CustomAttributes>` elements in LaVision's own namespace
-(`Schemas/CA/2008-02`) — `OME/Image/CustomAttributes`, holding the stage
-geometry, and `OME/CustomAttributes`, holding a `<PropArray>` of ~844 instrument
-properties. `OMETiffReader` reads the OME schema and walks past both:
-
-```xml
-<Offset Offset_0="-1861.449219" Offset_1="-5300.662598" Offset_2="0.0" .../>
-<TileConfiguration TileConfiguration="3
-..._UltraII[00 x 00]_C00_UltraII Filter0000.ome.tif;;(-4815.699219, 4234.837402, 0.000000)
-..."/>
-```
-
-We parse those out and publish them as `LaVision StagePositionX/Y/Z`,
-`LaVision TileCount`, and `LaVision Tile<N> FileName/PositionX/PositionY/PositionZ`.
-The keys carry a vendor prefix so they cannot collide with anything Java emits,
-and detection requires *both* the `xyz-Table` stage marker and an `<Offset>`
-element — `<Offset>` alone is far too generic to gate on.
-
-Why it is worth the divergence: absolute tile coordinates are not otherwise
-recoverable from these files through any standard OME field. Every file in the
-set repeats the whole `TileConfiguration`, so any single tile can reconstruct
-the mosaic.
-
-**It is not the tile overlap.** That is a separate property,
-`xyz-Table_X_Overlap` / `_Y_Overlap` in the root `PropArray`, and the file states
-it outright (65.650002 um; `xyz-Table_XY_Overlap` = 10 %). Read that property
-rather than deriving overlap from these offsets. The two do agree — tiles
-`[05 x 05]` and `[05 x 06]` differ in `Offset_0` by 590.85 um against a 656.5 um
-tile (404 px x 1.625 um/px), a 10.0 % overlap — which is a useful cross-check,
-not a reason to prefer the derivation.
-
-Real-fixture coverage is opt-in, since the files live outside the repository:
-
-```bash
-BIOFORMATS_RS_LAVISION=1 cargo test --test lavision_stage_test
-```
-
 ## API overview
 
 ### `ImageReader` — auto-detecting reader
