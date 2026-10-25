@@ -1106,6 +1106,10 @@ impl FormatReader for PerkinElmerReader {
                     plane.position_x = Some(self.origin_x);
                     plane.position_y = Some(self.origin_y);
                     plane.position_z = Some(self.origin_z);
+                    // PerkinElmerReader: new Length(..., UNITS.REFERENCEFRAME)
+                    plane.position_x_unit = Some("reference frame".to_string());
+                    plane.position_y_unit = Some("reference frame".to_string());
+                    plane.position_z_unit = Some("reference frame".to_string());
                 }
                 if let Some(spp) = seconds_per_plane {
                     plane.delta_t = Some(i as f64 * spp);
@@ -1885,6 +1889,9 @@ impl FormatReader for PhotonDynamicsReader {
             if let Some(plane) = img.planes.get_mut(0) {
                 plane.position_x = self.x_pos;
                 plane.position_y = self.y_pos;
+                // PDSReader: new Length(number, UNITS.REFERENCEFRAME)
+                plane.position_x_unit = self.x_pos.map(|_| "reference frame".to_string());
+                plane.position_y_unit = self.y_pos.map(|_| "reference frame".to_string());
             }
         }
         Some(ome)
@@ -2140,6 +2147,10 @@ mod photon_dynamics_tests {
         assert_eq!(image.physical_size_y, Some(0.75));
         assert_eq!(image.planes[0].position_x, Some(12.5));
         assert_eq!(image.planes[0].position_y, Some(7.25));
+        assert_eq!(
+            image.planes[0].position_x_unit.as_deref(),
+            Some("reference frame")
+        );
 
         let _ = std::fs::remove_file(hdr);
         let _ = std::fs::remove_file(img);
@@ -2395,6 +2406,11 @@ mod perkinelmer_metadata_tests {
         assert_eq!(img.planes[0].position_x, Some(11.0));
         assert_eq!(img.planes[0].position_y, Some(22.0));
         assert_eq!(img.planes[0].position_z, Some(3.0));
+        assert_eq!(
+            img.planes[0].position_z_unit.as_deref(),
+            Some("reference frame")
+        );
+
         assert_eq!(img.planes[0].delta_t, Some(0.0));
 
         let _ = std::fs::remove_dir_all(dir);

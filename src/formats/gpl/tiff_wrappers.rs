@@ -672,6 +672,10 @@ impl NdpiReader {
                             position_x,
                             position_y,
                             position_z,
+                            // NDPIReader: FormatTools.getStagePosition(.., UNITS.NANOMETRE)
+                            position_x_unit: position_x.map(|_| "nm".to_string()),
+                            position_y_unit: position_y.map(|_| "nm".to_string()),
+                            position_z_unit: position_z.map(|_| "nm".to_string()),
                             ..Default::default()
                         }])
                     } else {
@@ -4693,13 +4697,23 @@ fn nd2handler_apply_to_ome(
         if let Some(t) = handler.exposure_time.get(c) {
             plane.exposure_time.get_or_insert(*t);
         }
+        // ND2Handler.java:515/520/525: new Length(number, UNITS.MICROMETER)
         if let Some(x) = handler.pos_x.get(i) {
+            if plane.position_x.is_none() {
+                plane.position_x_unit = Some("µm".to_string());
+            }
             plane.position_x.get_or_insert(*x);
         }
         if let Some(y) = handler.pos_y.get(i) {
+            if plane.position_y.is_none() {
+                plane.position_y_unit = Some("µm".to_string());
+            }
             plane.position_y.get_or_insert(*y);
         }
         if let Some(z) = handler.pos_z.get(i) {
+            if plane.position_z.is_none() {
+                plane.position_z_unit = Some("µm".to_string());
+            }
             plane.position_z.get_or_insert(*z);
         }
     }
@@ -5654,6 +5668,11 @@ impl FeiTiffReader {
             position_x: self.stage_x,
             position_y: self.stage_y,
             position_z: self.stage_z,
+            // FEITiffReader.java:203-249/408-416: new Length(number, UNITS.REFERENCEFRAME)
+            // (Java stores these as StageLabelX/Y/Z, :319-321)
+            position_x_unit: self.stage_x.map(|_| "reference frame".to_string()),
+            position_y_unit: self.stage_y.map(|_| "reference frame".to_string()),
+            position_z_unit: self.stage_z.map(|_| "reference frame".to_string()),
             ..Default::default()
         });
 
@@ -7283,13 +7302,17 @@ impl MetamorphTiffReader {
                     plane.exposure_time = Some(*exp);
                 }
                 // Single series: stage X/Y from the first parsed position.
+                // MetamorphHandler.java:252/258: new Length(doubleValue, UNITS.REFERENCEFRAME)
                 if let Some(x) = handler.position_x {
                     plane.position_x = Some(x);
+                    plane.position_x_unit = Some("reference frame".to_string());
                 }
                 if let Some(y) = handler.position_y {
                     plane.position_y = Some(y);
+                    plane.position_y_unit = Some("reference frame".to_string());
                 }
                 image.planes.push(plane);
+
                 img_idx += 1;
             }
         }

@@ -1361,6 +1361,10 @@ fn lsm_populate_java_planes(
             position_x: position.map(|p| p[0]),
             position_y: position.map(|p| p[1]),
             position_z: position.map(|p| p[2]),
+            // ZeissLSMReader.java:1380/1386/1392: new Length(coord, UNITS.REFERENCEFRAME)
+            position_x_unit: position.map(|_| "reference frame".to_string()),
+            position_y_unit: position.map(|_| "reference frame".to_string()),
+            position_z_unit: position.map(|_| "reference frame".to_string()),
         });
     }
 }

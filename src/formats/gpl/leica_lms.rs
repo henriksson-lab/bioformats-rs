@@ -3164,16 +3164,24 @@ fn emit_lms_planes(extractor: &LmsMetadataExtractor, meta: &mut ImageMetadata) {
         // posX/posY (field positions override; series 0 here), swap/flip handling.
         let mut x_pos = buffer.pos_x;
         let mut y_pos = buffer.pos_y;
+        // The Length unit travels with the value: posX/posY are
+        // new Length(number, UNITS.REFERENCEFRAME) (LMSMetadataExtractor.java:692/698),
+        // fieldPosX/Y are new Length(number, UNITS.METER) (:386/396/428/434).
+        let mut x_unit = "reference frame";
+        let mut y_unit = "reference frame";
         // fieldPos override only applies for series < fieldPos.size(); single image
         // (series 0) — use index 0 if present.
         if let Some(Some(fx)) = buffer.field_pos_x.first() {
             x_pos = Some(*fx);
+            x_unit = "m";
         }
         if let Some(Some(fy)) = buffer.field_pos_y.first() {
             y_pos = Some(*fy);
+            y_unit = "m";
         }
         if buffer.swap_xy {
             std::mem::swap(&mut x_pos, &mut y_pos);
+            std::mem::swap(&mut x_unit, &mut y_unit);
         }
         if buffer.flip_x {
             x_pos = x_pos.map(|v| -v);
@@ -3185,14 +3193,27 @@ fn emit_lms_planes(extractor: &LmsMetadataExtractor, meta: &mut ImageMetadata) {
         if let Some(x) = x_pos {
             meta.series_metadata
                 .insert(format!("{prefix}.position_x"), MetadataValue::Float(x));
+            meta.series_metadata.insert(
+                format!("{prefix}.position_x_unit"),
+                MetadataValue::String(x_unit.to_string()),
+            );
         }
         if let Some(y) = y_pos {
             meta.series_metadata
                 .insert(format!("{prefix}.position_y"), MetadataValue::Float(y));
+            meta.series_metadata.insert(
+                format!("{prefix}.position_y_unit"),
+                MetadataValue::String(y_unit.to_string()),
+            );
         }
         if let Some(z) = buffer.pos_z {
             meta.series_metadata
                 .insert(format!("{prefix}.position_z"), MetadataValue::Float(z));
+            // posZ: new Length(number, UNITS.REFERENCEFRAME) (LMSMetadataExtractor.java:704)
+            meta.series_metadata.insert(
+                format!("{prefix}.position_z_unit"),
+                MetadataValue::String("reference frame".to_string()),
+            );
         }
 
         // deltaT from timestamps.

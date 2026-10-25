@@ -1286,6 +1286,8 @@ mod qptiff_tests {
         for plane in &image.planes {
             assert_eq!(plane.position_x, Some(15_000.0));
             assert_eq!(plane.position_y, Some(2_500.0));
+            assert_eq!(plane.position_x_unit.as_deref(), Some("µm"));
+            assert_eq!(plane.position_y_unit.as_deref(), Some("µm"));
         }
 
         let _ = std::fs::remove_file(path);
@@ -2016,6 +2018,9 @@ impl FormatReader for VectraReader {
                 for plane in &mut image.planes {
                     plane.position_x = position("PlanePositionX");
                     plane.position_y = position("PlanePositionY");
+                    // VectraReader: FormatTools.getPhysicalSizeX/Y(position), i.e. UNITS.MICROMETER
+                    plane.position_x_unit = plane.position_x.map(|_| "µm".to_string());
+                    plane.position_y_unit = plane.position_y.map(|_| "µm".to_string());
                 }
             }
         }
@@ -11117,6 +11122,9 @@ impl FormatReader for CellomicsReader {
                     position_x: None,
                     position_y: None,
                     position_z: None,
+                    position_x_unit: None,
+                    position_y_unit: None,
+                    position_z_unit: None,
                 });
             }
             ome.images.push(image);

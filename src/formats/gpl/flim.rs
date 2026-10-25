@@ -4077,6 +4077,9 @@ fn liflim_ome_planes(
                     position_x: None,
                     position_y: None,
                     position_z: None,
+                    position_x_unit: None,
+                    position_y_unit: None,
+                    position_z_unit: None,
                 });
             }
         }

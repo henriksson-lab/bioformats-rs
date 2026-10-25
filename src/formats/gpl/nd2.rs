@@ -6530,6 +6530,12 @@ impl FormatReader for Nd2Reader {
                         } else {
                             shared_exposure
                         };
+                        let position_z = self
+                            .plane_position_z
+                            .get(source_plane)
+                            .copied()
+                            .flatten()
+                            .or(plane_pos_z_value);
                         OmePlane {
                             the_z: z,
                             the_c: c,
@@ -6541,12 +6547,12 @@ impl FormatReader for Nd2Reader {
                                 }),
                             position_x: plane_pos_x,
                             position_y: plane_pos_y,
-                            position_z: self
-                                .plane_position_z
-                                .get(source_plane)
-                                .copied()
-                                .flatten()
-                                .or(plane_pos_z_value),
+                            position_z,
+                            // ND2Reader.java:1558/1569/1580 and ND2Handler.java:515/520/525:
+                            // new Length(number, UNITS.MICROMETER)
+                            position_x_unit: plane_pos_x.map(|_| "µm".to_string()),
+                            position_y_unit: plane_pos_y.map(|_| "µm".to_string()),
+                            position_z_unit: position_z.map(|_| "µm".to_string()),
                             exposure_time,
                         }
                     })

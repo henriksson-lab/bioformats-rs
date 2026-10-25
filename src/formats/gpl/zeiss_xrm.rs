@@ -161,6 +161,14 @@ impl FormatReader for ZeissXrmReader {
             image.physical_size_y = Some(pixel_size);
             image.physical_size_z = Some(pixel_size);
         }
+        if let Some(image) = ome.images.get_mut(0) {
+            // ZeissXRMReader.java:348-354: new Length(x/y/zPos[p], UNITS.MICROMETER)
+            for plane in &mut image.planes {
+                plane.position_x_unit = plane.position_x.map(|_| "µm".to_string());
+                plane.position_y_unit = plane.position_y.map(|_| "µm".to_string());
+                plane.position_z_unit = plane.position_z.map(|_| "µm".to_string());
+            }
+        }
         Some(ome)
     }
 }

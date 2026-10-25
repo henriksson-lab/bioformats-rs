@@ -1846,6 +1846,10 @@ impl FormatReader for JdceReader {
                     position_x: p.and_then(|p| p.position_x),
                     position_y: p.and_then(|p| p.position_y),
                     position_z: p.and_then(|p| p.position_z),
+                    // JDCEReader: FormatTools.getStagePosition(..., UNITS.MICROMETER)
+                    position_x_unit: p.and_then(|p| p.position_x).map(|_| "µm".to_string()),
+                    position_y_unit: p.and_then(|p| p.position_y).map(|_| "µm".to_string()),
+                    position_z_unit: p.and_then(|p| p.position_z).map(|_| "µm".to_string()),
                 });
             }
             ome.images.push(image);
@@ -2037,7 +2041,11 @@ mod jdce_tests {
         assert_eq!(image.planes[0].delta_t, Some(0.0));
         assert_eq!(image.planes[0].exposure_time, Some(25.0));
         assert_eq!(image.planes[0].position_x, Some(10.0));
+        assert_eq!(image.planes[0].position_x_unit.as_deref(), Some("µm"));
+        assert_eq!(image.planes[0].position_z_unit.as_deref(), Some("µm"));
+        assert_eq!(image.planes[1].position_x_unit, None);
         assert_eq!(image.planes[2].delta_t, Some(5.0));
+
         assert_eq!(image.planes[2].exposure_time, Some(30.0));
 
         assert_eq!(ome.plates.len(), 1);

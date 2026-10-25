@@ -1625,6 +1625,15 @@ impl FormatReader for LeicaReader {
         image.physical_size_y = metadata_float(meta, "physicalSizeY");
         image.physical_size_z = metadata_float(meta, "physicalSizeZ");
         image.time_increment = metadata_float(meta, "timeIncrement");
+        // LeicaReader.java:1495/1506/1515/1526: plane X/Y and stage label Z are
+        // new Length(number, UNITS.REFERENCEFRAME)
+        for plane in &mut image.planes {
+            plane.position_x_unit = plane.position_x.map(|_| "reference frame".to_string());
+            plane.position_y_unit = plane.position_y.map(|_| "reference frame".to_string());
+        }
+        if let Some(stage_label) = &mut image.stage_label {
+            stage_label.z_unit = stage_label.z.map(|_| "reference frame".to_string());
+        }
         for (channel_index, channel) in image.channels.iter_mut().enumerate() {
             if let Some(name) = metadata_string(meta, &format!("channel.{channel_index}.name")) {
                 channel.name = Some(name);
@@ -2458,6 +2467,11 @@ mod tests {
         series_metadata.insert("plane.0.exposure_time".into(), MetadataValue::Float(0.25));
         series_metadata.insert("plane.0.position_x".into(), MetadataValue::Float(123.25));
         series_metadata.insert("plane.0.position_y".into(), MetadataValue::Float(-45.5));
+        series_metadata.insert(
+            "image.stage_label.name".into(),
+            MetadataValue::String("Position".into()),
+        );
+        series_metadata.insert("image.stage_label.z".into(), MetadataValue::Float(88.75));
         let meta = ImageMetadata {
             size_x: 2,
             size_y: 2,
@@ -2495,7 +2509,17 @@ mod tests {
         assert_eq!(image.planes[0].exposure_time, Some(0.25));
         assert_eq!(image.planes[0].position_x, Some(123.25));
         assert_eq!(image.planes[0].position_y, Some(-45.5));
+        assert_eq!(
+            image.planes[0].position_x_unit.as_deref(),
+            Some("reference frame")
+        );
+        assert_eq!(image.planes[0].position_z_unit, None);
+        let stage_label = image.stage_label.as_ref().unwrap();
+        assert_eq!(stage_label.z, Some(88.75));
+        assert_eq!(stage_label.z_unit.as_deref(), Some("reference frame"));
+        assert_eq!(stage_label.x_unit, None);
         let channel = &image.channels[0];
+
         assert_eq!(channel.name.as_deref(), Some("DAPI"));
         assert_eq!(channel.emission_wavelength, Some(520.0));
         assert_eq!(channel.excitation_wavelength, Some(488.0));
@@ -2535,7 +2559,7 @@ mod tests {
             xml.contains(r#"<DetectorSettings ID="Detector:0:0" Offset="12.5" Voltage="650"/>"#)
         );
         assert!(xml.contains(
-            r#"<Plane TheZ="0" TheC="0" TheT="0" DeltaT="0" ExposureTime="0.25" PositionX="123.25" PositionY="-45.5"/>"#
+            r#"<Plane TheZ="0" TheC="0" TheT="0" DeltaT="0" ExposureTime="0.25" PositionX="123.25" PositionXUnit="reference frame" PositionY="-45.5" PositionYUnit="reference frame"/>"#
         ));
         assert!(xml.contains(r#"<EmissionFilterRef ID="Filter:0:0"/>"#));
         let original_metadata = ome

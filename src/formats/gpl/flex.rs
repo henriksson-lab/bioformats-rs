@@ -1237,6 +1237,11 @@ impl FlexReader {
                 p.position_x = self.plane_position_x.get(plane).copied();
                 p.position_y = self.plane_position_y.get(plane).copied();
                 p.position_z = self.plane_position_z.get(plane).copied();
+                // FlexReader.java:1639/1646/1653: new Length(v, UNITS.REFERENCEFRAME)
+                p.position_x_unit = p.position_x.map(|_| "reference frame".to_string());
+                p.position_y_unit = p.position_y.map(|_| "reference frame".to_string());
+                p.position_z_unit = p.position_z.map(|_| "reference frame".to_string());
+
                 p.delta_t = self.plane_delta_t.get(plane).copied();
                 if exp_idx >= 0 {
                     p.exposure_time = self.plane_exposure_time.get(exp_idx as usize).copied();
@@ -2564,6 +2569,11 @@ mod tests {
         // plane = 1*2 + image -> 2, 3.
         assert!((planes[0].position_x.unwrap() - 12.0).abs() < 1e-9);
         assert!((planes[1].position_x.unwrap() - 13.0).abs() < 1e-9);
+        assert_eq!(
+            planes[0].position_x_unit.as_deref(),
+            Some("reference frame")
+        );
+        assert_eq!(planes[0].position_y_unit, None);
     }
 
     #[test]

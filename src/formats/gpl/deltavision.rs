@@ -1479,6 +1479,10 @@ impl FormatReader for DeltavisionReader {
                         position_x: Some(h.stage_x as f64),
                         position_y: Some(h.stage_y as f64),
                         position_z: Some(h.stage_z as f64),
+                        // DeltavisionReader.java:3218-3220: new Length(.., UNITS.REFERENCEFRAME)
+                        position_x_unit: Some("reference frame".to_string()),
+                        position_y_unit: Some("reference frame".to_string()),
+                        position_z_unit: Some("reference frame".to_string()),
                     })
                 })
                 .collect();
@@ -2081,7 +2085,12 @@ mod tests {
         assert_eq!(planes[0].position_x, Some(10.0));
         assert_eq!(planes[1].the_t, 1);
         assert_eq!(planes[1].position_y, Some(21.0));
+        assert_eq!(
+            planes[1].position_y_unit.as_deref(),
+            Some("reference frame")
+        );
         assert_eq!(ome.images[0].channels[0].excitation_wavelength, Some(488.0));
+
         assert!(ome.annotations.is_empty());
 
         assert_eq!(reader.open_bytes(1).unwrap(), vec![9]);

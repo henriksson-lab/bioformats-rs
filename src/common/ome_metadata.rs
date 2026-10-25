@@ -93,6 +93,17 @@ pub struct OmeStageLabel {
     pub x: Option<f64>,
     pub y: Option<f64>,
     pub z: Option<f64>,
+    /// Unit of `x`, as Java's `getStageLabelX().unit().getSymbol()`: a
+    /// `UnitsLength` symbol (`"µm"`, `"mm"`, `"reference frame"`, ...), kept
+    /// unconverted as Java keeps it. `None`: the reader recorded none.
+    #[serde(default)]
+    pub x_unit: Option<String>,
+    /// Unit of `y`; see `x_unit`.
+    #[serde(default)]
+    pub y_unit: Option<String>,
+    /// Unit of `z`; see `x_unit`.
+    #[serde(default)]
+    pub z_unit: Option<String>,
 }
 
 /// Per-channel metadata.
@@ -410,6 +421,19 @@ pub struct OmePlane {
     pub position_x: Option<f64>,
     pub position_y: Option<f64>,
     pub position_z: Option<f64>,
+    /// Unit of `position_x`, as Java's `getPlanePositionX().unit().getSymbol()`:
+    /// a `UnitsLength` symbol (`"µm"`, `"mm"`, `"reference frame"`, ...).
+    /// Stage positions are not converted (`FormatTools.getStagePosition`
+    /// keeps the unit it is given), so the value is in this unit. `None`: the
+    /// reader recorded none.
+    #[serde(default)]
+    pub position_x_unit: Option<String>,
+    /// Unit of `position_y`; see `position_x_unit`.
+    #[serde(default)]
+    pub position_y_unit: Option<String>,
+    /// Unit of `position_z`; see `position_x_unit`.
+    #[serde(default)]
+    pub position_z_unit: Option<String>,
 }
 
 // ─── Serialisation ───────────────────────────────────────────────────────────
@@ -623,12 +647,21 @@ impl OmeMetadata {
                 }
                 if let Some(v) = stage_label.x {
                     let _ = write!(xml, r#" X="{v}""#);
+                    if let Some(unit) = &stage_label.x_unit {
+                        let _ = write!(xml, r#" XUnit="{}""#, xml_escape(unit));
+                    }
                 }
                 if let Some(v) = stage_label.y {
                     let _ = write!(xml, r#" Y="{v}""#);
+                    if let Some(unit) = &stage_label.y_unit {
+                        let _ = write!(xml, r#" YUnit="{}""#, xml_escape(unit));
+                    }
                 }
                 if let Some(v) = stage_label.z {
                     let _ = write!(xml, r#" Z="{v}""#);
+                    if let Some(unit) = &stage_label.z_unit {
+                        let _ = write!(xml, r#" ZUnit="{}""#, xml_escape(unit));
+                    }
                 }
                 xml.push_str("/>");
             }
@@ -855,12 +888,21 @@ impl OmeMetadata {
                 }
                 if let Some(v) = plane.position_x {
                     let _ = write!(xml, r#" PositionX="{v}""#);
+                    if let Some(unit) = &plane.position_x_unit {
+                        let _ = write!(xml, r#" PositionXUnit="{}""#, xml_escape(unit));
+                    }
                 }
                 if let Some(v) = plane.position_y {
                     let _ = write!(xml, r#" PositionY="{v}""#);
+                    if let Some(unit) = &plane.position_y_unit {
+                        let _ = write!(xml, r#" PositionYUnit="{}""#, xml_escape(unit));
+                    }
                 }
                 if let Some(v) = plane.position_z {
                     let _ = write!(xml, r#" PositionZ="{v}""#);
+                    if let Some(unit) = &plane.position_z_unit {
+                        let _ = write!(xml, r#" PositionZUnit="{}""#, xml_escape(unit));
+                    }
                 }
                 xml.push_str("/>");
             }
@@ -1482,11 +1524,30 @@ impl OmeMetadata {
                 .next()
                 .map(|p| {
                     let tag = start_tag_at(img_xml, p);
+                    let x = xml_attr(tag, "X").and_then(|s| s.parse::<f64>().ok());
+                    let y = xml_attr(tag, "Y").and_then(|s| s.parse::<f64>().ok());
+                    let z = xml_attr(tag, "Z").and_then(|s| s.parse::<f64>().ok());
                     OmeStageLabel {
                         name: xml_attr(tag, "Name"),
-                        x: xml_attr(tag, "X").and_then(|s| s.parse::<f64>().ok()),
-                        y: xml_attr(tag, "Y").and_then(|s| s.parse::<f64>().ok()),
-                        z: xml_attr(tag, "Z").and_then(|s| s.parse::<f64>().ok()),
+                        // StageLabel.update: XUnit, else getXUnitXsdDefault()
+                        x_unit: x.map(|_| {
+                            xml_attr(tag, "XUnit")
+                                .filter(|u| !u.is_empty())
+                                .unwrap_or_else(|| "reference frame".to_string())
+                        }),
+                        y_unit: y.map(|_| {
+                            xml_attr(tag, "YUnit")
+                                .filter(|u| !u.is_empty())
+                                .unwrap_or_else(|| "reference frame".to_string())
+                        }),
+                        z_unit: z.map(|_| {
+                            xml_attr(tag, "ZUnit")
+                                .filter(|u| !u.is_empty())
+                                .unwrap_or_else(|| "reference frame".to_string())
+                        }),
+                        x,
+                        y,
+                        z,
                     }
                 });
             let roi_refs = all_tag_positions(img_xml, "ROIRef")
@@ -1835,6 +1896,9 @@ fn parse_planes(pixels_xml: &str) -> Vec<OmePlane> {
         .into_iter()
         .map(|pos| {
             let tag = start_tag_at(pixels_xml, pos);
+            let position_x = xml_attr(tag, "PositionX").and_then(|s| s.parse().ok());
+            let position_y = xml_attr(tag, "PositionY").and_then(|s| s.parse().ok());
+            let position_z = xml_attr(tag, "PositionZ").and_then(|s| s.parse().ok());
             OmePlane {
                 the_z: xml_attr(tag, "TheZ")
                     .and_then(|s| s.parse().ok())
@@ -1847,9 +1911,27 @@ fn parse_planes(pixels_xml: &str) -> Vec<OmePlane> {
                     .unwrap_or(0),
                 delta_t: xml_attr(tag, "DeltaT").and_then(|s| s.parse().ok()),
                 exposure_time: xml_attr(tag, "ExposureTime").and_then(|s| s.parse().ok()),
-                position_x: xml_attr(tag, "PositionX").and_then(|s| s.parse().ok()),
-                position_y: xml_attr(tag, "PositionY").and_then(|s| s.parse().ok()),
-                position_z: xml_attr(tag, "PositionZ").and_then(|s| s.parse().ok()),
+                // Plane.update: PositionXUnit, else getPositionXUnitXsdDefault()
+                // ("reference frame"); Java's UnitsLength.fromString then throws
+                // on an unknown symbol, which is kept here for the caller to judge
+                position_x_unit: position_x.map(|_| {
+                    xml_attr(tag, "PositionXUnit")
+                        .filter(|u| !u.is_empty())
+                        .unwrap_or_else(|| "reference frame".to_string())
+                }),
+                position_y_unit: position_y.map(|_| {
+                    xml_attr(tag, "PositionYUnit")
+                        .filter(|u| !u.is_empty())
+                        .unwrap_or_else(|| "reference frame".to_string())
+                }),
+                position_z_unit: position_z.map(|_| {
+                    xml_attr(tag, "PositionZUnit")
+                        .filter(|u| !u.is_empty())
+                        .unwrap_or_else(|| "reference frame".to_string())
+                }),
+                position_x,
+                position_y,
+                position_z,
             }
         })
         .collect()
@@ -2723,7 +2805,13 @@ fn generic_stage_label_from_metadata(meta: &ImageMetadata) -> Option<OmeStageLab
     let y = metadata_finite_f64_by_suffix(&meta.series_metadata, &["image.stage_label.y"]);
     let z = metadata_finite_f64_by_suffix(&meta.series_metadata, &["image.stage_label.z"]);
     if name.is_some() || x.is_some() || y.is_some() || z.is_some() {
-        Some(OmeStageLabel { name, x, y, z })
+        Some(OmeStageLabel {
+            name,
+            x,
+            y,
+            z,
+            ..Default::default()
+        })
     } else {
         None
     }
@@ -2906,6 +2994,7 @@ fn generic_planes_from_metadata(meta: &ImageMetadata) -> Vec<OmePlane> {
                 position_x,
                 position_y,
                 position_z,
+                ..Default::default()
             });
         }
     }
@@ -3922,7 +4011,12 @@ mod tests {
         assert!(xml.contains(r#"<StageLabel Name="Position" Z="42.5"/>"#));
 
         let parsed = OmeMetadata::from_ome_xml(&xml);
-        assert_eq!(parsed.images[0].stage_label, ome.images[0].stage_label);
+        let parsed_label = parsed.images[0].stage_label.as_ref().unwrap();
+        assert_eq!(parsed_label.name.as_deref(), Some("Position"));
+        assert_eq!(parsed_label.z, Some(42.5));
+        // no ZUnit was recorded, so reading back yields the XSD default
+        // (StageLabel.getZUnitXsdDefault())
+        assert_eq!(parsed_label.z_unit.as_deref(), Some("reference frame"));
     }
 
     #[test]
@@ -4147,5 +4241,98 @@ mod tests {
                 (1, 1, 1),
             ]
         );
+    }
+
+    #[test]
+    fn ome_xml_plane_and_stage_label_position_units() {
+        let xml = r#"
+<OME>
+  <Image ID="Image:0">
+    <StageLabel Name="Pos" X="1.5" XUnit="mm" Y="2.5"/>
+    <Pixels ID="Pixels:0" DimensionOrder="XYZCT" Type="uint8" SizeX="1" SizeY="1" SizeZ="1" SizeC="1" SizeT="3">
+      <Channel ID="Channel:0:0" SamplesPerPixel="1"/>
+      <Plane TheZ="0" TheC="0" TheT="0" PositionX="1.5" PositionXUnit="mm" PositionY="2.5" PositionYUnit="µm"/>
+      <Plane TheZ="0" TheC="0" TheT="1" PositionX="3.0" PositionZ="4.0"/>
+      <Plane TheZ="0" TheC="0" TheT="2" DeltaT="1.0"/>
+    </Pixels>
+  </Image>
+</OME>"#;
+
+        let ome = OmeMetadata::from_ome_xml(xml);
+        let planes = &ome.images[0].planes;
+        assert_eq!(planes[0].position_x, Some(1.5));
+        assert_eq!(planes[0].position_x_unit.as_deref(), Some("mm"));
+        assert_eq!(planes[0].position_y_unit.as_deref(), Some("µm"));
+        assert_eq!(planes[0].position_z_unit, None);
+        // Plane.getPositionXUnitXsdDefault() is "reference frame"
+        assert_eq!(
+            planes[1].position_x_unit.as_deref(),
+            Some("reference frame")
+        );
+        assert_eq!(
+            planes[1].position_z_unit.as_deref(),
+            Some("reference frame")
+        );
+        assert_eq!(planes[1].position_y, None);
+        assert_eq!(planes[1].position_y_unit, None);
+        assert_eq!(planes[2].position_x, None);
+        assert_eq!(planes[2].position_x_unit, None);
+
+        // StageLabel.getXUnitXsdDefault() is "reference frame"
+        let stage_label = ome.images[0].stage_label.as_ref().unwrap();
+        assert_eq!(stage_label.x, Some(1.5));
+        assert_eq!(stage_label.x_unit.as_deref(), Some("mm"));
+        assert_eq!(stage_label.y_unit.as_deref(), Some("reference frame"));
+        assert_eq!(stage_label.z, None);
+        assert_eq!(stage_label.z_unit, None);
+    }
+
+    #[test]
+    fn ome_xml_roundtrips_plane_and_stage_label_position_units() {
+        let meta = ImageMetadata {
+            size_x: 1,
+            size_y: 1,
+            size_z: 1,
+            size_c: 1,
+            size_t: 1,
+            pixel_type: PixelType::Uint8,
+            bits_per_pixel: 8,
+            image_count: 1,
+            ..ImageMetadata::default()
+        };
+        let mut ome = OmeMetadata::from_image_metadata(&meta);
+        ome.images[0].planes = vec![OmePlane {
+            position_x: Some(1.5),
+            position_x_unit: Some("mm".into()),
+            position_y: Some(2.5),
+            position_y_unit: Some("µm".into()),
+            position_z: Some(3.5),
+            position_z_unit: Some("reference frame".into()),
+            ..Default::default()
+        }];
+        ome.images[0].stage_label = Some(OmeStageLabel {
+            name: Some("Position".into()),
+            x: Some(10.0),
+            x_unit: Some("nm".into()),
+            z: Some(30.0),
+            z_unit: Some("reference frame".into()),
+            ..Default::default()
+        });
+
+        let xml = ome.to_ome_xml(&meta);
+        assert!(xml.contains(r#"PositionXUnit="mm""#));
+        assert!(xml.contains(r#"XUnit="nm""#));
+        let parsed = OmeMetadata::from_ome_xml(&xml);
+        let plane = &parsed.images[0].planes[0];
+        assert_eq!(plane.position_x, Some(1.5));
+        assert_eq!(plane.position_x_unit.as_deref(), Some("mm"));
+        assert_eq!(plane.position_y_unit.as_deref(), Some("µm"));
+        assert_eq!(plane.position_z_unit.as_deref(), Some("reference frame"));
+        let stage_label = parsed.images[0].stage_label.as_ref().unwrap();
+        assert_eq!(stage_label.x, Some(10.0));
+        assert_eq!(stage_label.x_unit.as_deref(), Some("nm"));
+        assert_eq!(stage_label.y, None);
+        assert_eq!(stage_label.y_unit, None);
+        assert_eq!(stage_label.z_unit.as_deref(), Some("reference frame"));
     }
 }

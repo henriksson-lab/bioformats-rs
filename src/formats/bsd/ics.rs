@@ -1187,6 +1187,9 @@ impl FormatReader for IcsReader {
                             position_x: None,
                             position_y: None,
                             position_z: None,
+                            position_x_unit: None,
+                            position_y_unit: None,
+                            position_z_unit: None,
                         });
                     }
                 }
@@ -1296,6 +1299,9 @@ impl FormatReader for IcsReader {
                             position_x: None,
                             position_y: None,
                             position_z: None,
+                            position_x_unit: None,
+                            position_y_unit: None,
+                            position_z_unit: None,
                         });
                     }
                     debug_assert!(plane_index < meta.image_count);

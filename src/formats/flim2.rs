@@ -5883,6 +5883,10 @@ impl FormatReader for SlideBook7Reader {
                                     position_z: stage.map(|(_, _, sz)| {
                                         sz + series.interplane_spacing.unwrap_or(0.0) * z as f64
                                     }),
+                                    // SlideBook7Reader.java:3099/3103/3109: new Length(.., UNITS.MICROMETRE)
+                                    position_x_unit: stage.map(|_| "µm".to_string()),
+                                    position_y_unit: stage.map(|_| "µm".to_string()),
+                                    position_z_unit: stage.map(|_| "µm".to_string()),
                                 });
                             }
                             ome_image.planes = planes;
@@ -11395,6 +11399,19 @@ fn xlef_lms_ome_metadata(meta: &ImageMetadata) -> crate::common::ome_metadata::O
                     position_x: xlef_lms_metadata_float(meta, &format!("{prefix}.position_x")),
                     position_y: xlef_lms_metadata_float(meta, &format!("{prefix}.position_y")),
                     position_z: xlef_lms_metadata_float(meta, &format!("{prefix}.position_z")),
+                    // the Length unit emit_lms_planes recorded with each value
+                    position_x_unit: xlef_lms_metadata_string(
+                        meta,
+                        &format!("{prefix}.position_x_unit"),
+                    ),
+                    position_y_unit: xlef_lms_metadata_string(
+                        meta,
+                        &format!("{prefix}.position_y_unit"),
+                    ),
+                    position_z_unit: xlef_lms_metadata_string(
+                        meta,
+                        &format!("{prefix}.position_z_unit"),
+                    ),
                 });
             }
             image.planes = planes;
@@ -16921,6 +16938,10 @@ impl CellSensReader {
                         position_x: meta.origin_x,
                         position_y: meta.origin_y,
                         position_z,
+                        // CellSensReader.java:973-985: FormatTools.createLength(.., UNITS.MICROMETER)
+                        position_x_unit: meta.origin_x.map(|_| "µm".to_string()),
+                        position_y_unit: meta.origin_y.map(|_| "µm".to_string()),
+                        position_z_unit: position_z.map(|_| "µm".to_string()),
                         delta_t: meta.t_values.get(plane_index).map(|v| *v / 1000.0),
                     });
                 }
@@ -18695,6 +18716,10 @@ impl SlidebookTiffReader {
                 position_x,
                 position_y,
                 position_z,
+                // SlidebookTiffReader.java:263-265: new Length(.., UNITS.REFERENCEFRAME)
+                position_x_unit: position_x.map(|_| "reference frame".to_string()),
+                position_y_unit: position_y.map(|_| "reference frame".to_string()),
+                position_z_unit: position_z.map(|_| "reference frame".to_string()),
                 ..Default::default()
             });
         }

@@ -3270,15 +3270,19 @@ impl FormatReader for DicomReader {
                     ..Default::default()
                 })
                 .collect();
+            // DicomReader.java:1118/1126/1134: new Length(.., UNITS.MILLIMETER)
             for p in 0..plane_count {
                 if p < self.position_x.len() {
                     img.planes[p].position_x = self.position_x[p];
+                    img.planes[p].position_x_unit = self.position_x[p].map(|_| "mm".to_string());
                 }
                 if p < self.position_y.len() {
                     img.planes[p].position_y = self.position_y[p];
+                    img.planes[p].position_y_unit = self.position_y[p].map(|_| "mm".to_string());
                 }
                 if p < self.position_z.len() {
                     img.planes[p].position_z = self.position_z[p];
+                    img.planes[p].position_z_unit = self.position_z[p].map(|_| "mm".to_string());
                 }
             }
         }
@@ -3830,7 +3834,17 @@ mod tests {
         assert_eq!(attrs.position_y, vec![Some(2.5)]);
         assert_eq!(attrs.position_z, vec![Some(3.5)]);
 
+        // DicomReader.java:1118-1134: Image Position (Patient) is in millimetres.
+        let mut reader = DicomReader::new();
+        reader.set_id(&path).unwrap();
+        let ome = reader.ome_metadata().unwrap();
+        let plane = &ome.images[0].planes[0];
+        assert_eq!(plane.position_x, Some(1.5));
+        assert_eq!(plane.position_x_unit.as_deref(), Some("mm"));
+        assert_eq!(plane.position_z_unit.as_deref(), Some("mm"));
+
         let _ = std::fs::remove_file(&path);
+
         let _ = std::fs::remove_dir(&dir);
     }
 

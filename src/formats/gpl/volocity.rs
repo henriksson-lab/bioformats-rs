@@ -2201,6 +2201,11 @@ fn volocity_stack_planes(stack: &VolocityStack) -> Vec<OmePlane> {
             position_z: stack
                 .physical_z
                 .map(|physical_z| stack.z_location + f64::from(the_z) * physical_z),
+            // VolocityReader.java reads X/Y/Z Location but never calls
+            // setPlanePosition*, so there is no Java Length unit to mirror
+            position_x_unit: None,
+            position_y_unit: None,
+            position_z_unit: None,
         });
     }
     planes

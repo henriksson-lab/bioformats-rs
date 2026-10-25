@@ -716,6 +716,9 @@ impl FormatReader for QtReader {
                     position_x: None,
                     position_y: None,
                     position_z: None,
+                    position_x_unit: None,
+                    position_y_unit: None,
+                    position_z_unit: None,
                 })
                 .collect();
         }
@@ -6692,6 +6695,10 @@ impl FormatReader for OpenlabReader {
                     plane.position_x = stage_x;
                     plane.position_y = stage_y;
                     plane.position_z = stage_z;
+                    // OpenlabReader: new Length(Double.valueOf(xPos), UNITS.REFERENCEFRAME)
+                    plane.position_x_unit = stage_x.map(|_| "reference frame".to_string());
+                    plane.position_y_unit = stage_y.map(|_| "reference frame".to_string());
+                    plane.position_z_unit = stage_z.map(|_| "reference frame".to_string());
                 }
             }
         }

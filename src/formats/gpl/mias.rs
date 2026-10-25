@@ -1113,6 +1113,9 @@ fn add_cellworx_populated_planes(ome: &mut OmeMetadata, series: &[ImageMetadata]
                 position_x: None,
                 position_y: None,
                 position_z: None,
+                position_x_unit: None,
+                position_y_unit: None,
+                position_z_unit: None,
             });
         }
     }

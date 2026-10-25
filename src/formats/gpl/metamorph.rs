@@ -1781,6 +1781,16 @@ impl FormatReader for MetamorphReader {
                             }
                         }
                     }
+                    // MetamorphReader.java:1291/1295/1828-1829, MetamorphHandler.java:252/258:
+                    // every plane position is new Length(.., UNITS.REFERENCEFRAME)
+                    for plane in &mut image.planes {
+                        plane.position_x_unit =
+                            plane.position_x.map(|_| "reference frame".to_string());
+                        plane.position_y_unit =
+                            plane.position_y.map(|_| "reference frame".to_string());
+                        plane.position_z_unit =
+                            plane.position_z.map(|_| "reference frame".to_string());
+                    }
                 }
                 ome.images.extend(image_ome.images);
             }
@@ -1854,6 +1864,13 @@ impl FormatReader for MetamorphReader {
                         ch.detector_settings_binning = Some(binning.clone());
                     }
                 }
+            }
+            // MetamorphReader.java:1291/1295/1828-1829, MetamorphHandler.java:252/258:
+            // every plane position is new Length(.., UNITS.REFERENCEFRAME)
+            for plane in &mut image.planes {
+                plane.position_x_unit = plane.position_x.map(|_| "reference frame".to_string());
+                plane.position_y_unit = plane.position_y.map(|_| "reference frame".to_string());
+                plane.position_z_unit = plane.position_z.map(|_| "reference frame".to_string());
             }
         }
         Some(ome)

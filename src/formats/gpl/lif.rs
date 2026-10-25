@@ -4132,6 +4132,11 @@ fn build_planes(acc: &LifMetaAcc, meta: &ImageMetadata) -> Vec<OmePlane> {
             position_x: x_pos,
             position_y: y_pos,
             position_z: z_pos,
+            // LIFReader.java:1914/1920/1926: posX/posY/posZ are
+            // new Length(number, UNITS.REFERENCEFRAME)
+            position_x_unit: x_pos.map(|_| "reference frame".to_string()),
+            position_y_unit: y_pos.map(|_| "reference frame".to_string()),
+            position_z_unit: z_pos.map(|_| "reference frame".to_string()),
             ..OmePlane::default()
         };
 

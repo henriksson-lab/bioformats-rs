@@ -4348,6 +4348,27 @@ impl HcsAssembly {
                         .or_else(|| hcs_meta_f64(meta, "columbus.PlanePositionY")),
                     position_z: hcs_meta_f64(meta, "PlanePositionZ")
                         .or_else(|| hcs_meta_f64(meta, "columbus.PlanePositionZ")),
+                    // "PlanePositionX/Y" come from ScanrReader's fieldPositionX/Y,
+                    // new Length(number, UNITS.REFERENCEFRAME) (ScanrReader.java:876/883);
+                    // "columbus.PlanePosition*" from ColumbusReader,
+                    // new Length(p.positionZ, UNITS.MICROMETER) (ColumbusReader.java:436-438).
+                    // No assembled reader records "PlanePositionZ", so that branch has no unit.
+                    position_x_unit: hcs_meta_f64(meta, "PlanePositionX")
+                        .map(|_| "reference frame".to_string())
+                        .or_else(|| {
+                            hcs_meta_f64(meta, "columbus.PlanePositionX").map(|_| "µm".to_string())
+                        }),
+                    position_y_unit: hcs_meta_f64(meta, "PlanePositionY")
+                        .map(|_| "reference frame".to_string())
+                        .or_else(|| {
+                            hcs_meta_f64(meta, "columbus.PlanePositionY").map(|_| "µm".to_string())
+                        }),
+                    position_z_unit: match hcs_meta_f64(meta, "PlanePositionZ") {
+                        Some(_) => None,
+                        None => {
+                            hcs_meta_f64(meta, "columbus.PlanePositionZ").map(|_| "µm".to_string())
+                        }
+                    },
                 });
             }
         }
@@ -9708,6 +9729,11 @@ mod tests {
             matches!(md.get("PlanePositionX"), Some(MetadataValue::Float(v)) if (*v - 10.0).abs() < 1e-9),
             "plane position X not captured: {md:?}"
         );
+        let ome = reader.ome_metadata().unwrap();
+        let plane = &ome.images[0].planes[0];
+        assert_eq!(plane.position_x, Some(10.0));
+        assert_eq!(plane.position_x_unit.as_deref(), Some("reference frame"));
+        assert_eq!(plane.position_z_unit, None);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

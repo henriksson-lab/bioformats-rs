@@ -1738,6 +1738,10 @@ impl FormatReader for GatanReader {
                 position_x: px,
                 position_y: py,
                 position_z: pz,
+                // GatanReader.java:693-701, 737-745: new Length(.., UNITS.REFERENCEFRAME)
+                position_x_unit: px.map(|_| "reference frame".to_string()),
+                position_y_unit: py.map(|_| "reference frame".to_string()),
+                position_z_unit: pz.map(|_| "reference frame".to_string()),
             })
             .collect();
 
@@ -2399,6 +2403,7 @@ mod tests {
         assert_eq!(plane.position_x, Some(20.0));
         assert_eq!(plane.position_y, Some(21.0));
         assert_eq!(plane.position_z, Some(22.0));
+        assert_eq!(plane.position_z_unit.as_deref(), Some("reference frame"));
 
         let _ = std::fs::remove_file(path);
     }

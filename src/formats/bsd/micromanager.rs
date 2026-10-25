@@ -299,6 +299,10 @@ impl Position {
                 plane.position_x = p[0];
                 plane.position_y = p[1];
                 plane.position_z = p[2];
+                // MicromanagerReader.java:402/405/408: new Length(.., UNITS.MICROMETER)
+                plane.position_x_unit = p[0].map(|_| "µm".to_string());
+                plane.position_y_unit = p[1].map(|_| "µm".to_string());
+                plane.position_z_unit = p[2].map(|_| "µm".to_string());
             }
             planes.push(plane);
         }
@@ -1727,6 +1731,9 @@ mod tests {
         assert_eq!(img.planes[0].position_x, Some(10.5));
         assert_eq!(img.planes[0].position_y, Some(20.25));
         assert_eq!(img.planes[0].position_z, Some(1.0));
+        assert_eq!(img.planes[0].position_x_unit.as_deref(), Some("µm"));
+        assert_eq!(img.planes[0].position_z_unit.as_deref(), Some("µm"));
+
         assert_eq!(img.planes[0].exposure_time, Some(100.0));
         assert_eq!(img.planes[0].delta_t, Some(50.0));
         assert_eq!(img.planes[1].delta_t, Some(150.0));

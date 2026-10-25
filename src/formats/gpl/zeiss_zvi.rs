@@ -2147,6 +2147,10 @@ impl FormatReader for ZeissZviReader {
                     the_t: plane.t,
                     delta_t,
                     exposure_time,
+                    // BaseZeissReader.java:999/1004: new Length(number, UNITS.REFERENCEFRAME)
+                    position_x_unit: position_x.map(|_| "reference frame".to_string()),
+                    position_y_unit: position_y.map(|_| "reference frame".to_string()),
+                    position_z_unit: None,
                     position_x,
                     position_y,
                     position_z: None,
@@ -2654,6 +2658,11 @@ mod tests {
         assert_eq!(img.planes[0].exposure_time, Some(0.0125));
         assert_eq!(img.planes[0].position_x, Some(123.0));
         assert_eq!(img.planes[0].position_y, Some(456.0));
+        assert_eq!(
+            img.planes[0].position_y_unit.as_deref(),
+            Some("reference frame")
+        );
+        assert_eq!(img.planes[0].position_z_unit, None);
 
         assert_eq!(ome.instruments.len(), 1);
         assert_eq!(ome.instruments[0].detectors.len(), 2);
