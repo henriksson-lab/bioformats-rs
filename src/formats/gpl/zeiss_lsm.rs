@@ -2735,7 +2735,7 @@ impl FormatReader for ZeissLsmReader {
                     .recordings
                     .iter()
                     .filter_map(|r| r.user_name.as_ref())
-                    .last()
+                    .next_back()
                 {
                     combined.experimenters = vec![OmeExperimenter {
                         id: Some(create_lsid("Experimenter", &[0])),

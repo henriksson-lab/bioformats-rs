@@ -2568,9 +2568,8 @@ impl FormatReader for ZeissCziReader {
         let mut seen = std::collections::HashSet::new();
         for attachment in attachments {
             if attachment.name == "TimeStamps" {
-                for bytes in attachment.data.get(8..).unwrap_or(&[]).chunks_exact(8) {
-                    self.timestamps
-                        .push(f64::from_le_bytes(bytes.try_into().unwrap()));
+                for bytes in attachment.data.get(8..).unwrap_or(&[]).as_chunks::<8>().0 {
+                    self.timestamps.push(f64::from_le_bytes(*bytes));
                 }
                 continue;
             }

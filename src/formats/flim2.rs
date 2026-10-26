@@ -21724,7 +21724,10 @@ EndClass: 0
         .unwrap();
         let mut reader = SlideBook7Reader::new();
         reader.set_id(&path).unwrap();
-        assert_eq!(reader.metadata().dimension_order, DimensionOrder::XYCZT);
+        assert_eq!(
+            reader.metadata().dimension_order,
+            crate::DimensionOrder::XYCZT
+        );
         let expected = [10u16, 20, 11, 21, 30, 40, 31, 41];
         let ome = reader.ome_metadata().unwrap();
         for (p, value) in expected.into_iter().enumerate() {

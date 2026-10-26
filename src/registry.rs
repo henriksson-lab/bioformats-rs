@@ -271,6 +271,16 @@ fn open_reader_with_options_and_metadata(
     options: ImageReaderOptions,
     metadata_options: Option<&MetadataOptions>,
 ) -> Result<Box<dyn FormatReader>> {
+    // Incucyte archive markers are entry points, not containers of pixels.
+    if path
+        .extension()
+        .and_then(|s| s.to_str())
+        .is_some_and(|s| s.eq_ignore_ascii_case("icarch"))
+    {
+        let mut reader = boxed_reader(crate::formats::bsd::incucyte::IncucyteReader::new());
+        set_reader_id(&mut reader, path, &options, metadata_options)?;
+        return Ok(reader);
+    }
     // OME-Zarr is a directory-based format. `peek_header` cannot read a
     // directory, so detect and dispatch it before any byte sniffing. Mirrors
     // Java `ZarrReader.isThisType`, which matches on the `.zarr` path.
@@ -462,6 +472,13 @@ fn open_reader_with_options_and_metadata(
     // Give non-generic TIFF extensions a chance before the broad TiffReader
     // byte signature accepts the file.
     if is_tiff_header(&header) {
+        // Rust-native vendor reader: private XML, not the generic 72-DPI TIFF
+        // calibration. A recognized malformed archive must surface its error.
+        if crate::formats::bsd::incucyte::is_incucyte_tiff(path) {
+            let mut reader = boxed_reader(crate::formats::bsd::incucyte::IncucyteReader::new());
+            set_reader_id(&mut reader, path, &options, metadata_options)?;
+            return Ok(reader);
+        }
         let had_tiff_wrappers = !tiff_wrapper_readers_for_extension(path, &header).is_empty();
         for mut r in tiff_wrapper_readers_for_extension(path, &header) {
             match set_reader_id(&mut r, path, &options, metadata_options) {

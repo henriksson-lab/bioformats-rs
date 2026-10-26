@@ -14,6 +14,7 @@ The internal Metakit table reader used for Volocity is translated from
 `b8b3a629a6dd9bf422949f6b175b9e310ba6e252`.
 
 
+* 2026-10-26: Added incucyte support (experimental, not in upstream)
 * 2026-10-26: Updated the Bio-Formats translation to `d54bf462e3`: channel targets, CellSens stacks and pyramid metadata, anatomical orientations, MINC/FDF handling, and Operetta paths.
 * 2026-10-25: resolution translation error corrected
 * 2026-10-02: Tecan spark file format retranslated
@@ -46,6 +47,13 @@ But:
 * **If you are the author of the original code and wish to move to Rust, you can obtain ownership of this repository and crate**. Until then, our commitment is to offer an as-faithful-as-possible translation of a snapshot of your code. If we find serious bugs, we will report them to you. Otherwise we will just replicate them, to ensure comparability across studies that claim to use package XYZ v.666. Think of this like a fancy Ubuntu .deb-package of your software - that is how we treat it
 
 ## Quick start
+
+Incucyte S3 raw TIFFs and `.icarch` archive markers are supported by an
+independently implemented reader (not a Java Bio-Formats translation). It
+preserves native fluorescence, phase and auxiliary Seed streams, calibrated
+pixel sizes, stage metadata, local timestamps and stored pyramids. See
+[Incucyte grouping and validation](docs/incucyte.rst) for entry points,
+stream layout and limitations.
 
 ```rust
 use bioformats::{ImageReader, ImageWriter, ImageMetadata, PixelType};

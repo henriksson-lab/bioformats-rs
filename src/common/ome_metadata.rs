@@ -2273,7 +2273,6 @@ fn parse_channels(pixels_xml: &str) -> Vec<OmeChannel> {
                     .and_then(|s| s.parse().ok()),
                 light_source_settings_id: lss_id,
                 light_source_settings_attenuation: lss_atten,
-                ..Default::default()
             }
         })
         .collect()

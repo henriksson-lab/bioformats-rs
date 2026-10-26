@@ -25,6 +25,7 @@ include = [
     "/examples/lossless_jpeg_crop.rs",
     "/benches/read_ome_tiff.rs",
     "/README.md",
+    "/docs/incucyte.rst",
     "/bioformats_bug.txt",
     "/LICENSE.txt",
 ]
@@ -140,6 +141,10 @@ path = "tests/new_features_test.rs"
 [[test]]
 name = "non_upstream_readers_test"
 path = "tests/non_upstream_readers_test.rs"
+
+[[test]]
+name = "incucyte_test"
+path = "tests/incucyte_test.rs"
 
 [[test]]
 name = "stub_cellworx_test"

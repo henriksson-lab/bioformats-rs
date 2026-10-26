@@ -7,6 +7,7 @@ pub mod eps;
 pub mod fake;
 pub mod fits;
 pub mod ics;
+pub mod incucyte;
 pub mod jpeg;
 pub mod micromanager;
 pub mod nrrd;

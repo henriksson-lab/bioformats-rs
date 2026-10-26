@@ -1540,6 +1540,9 @@ fn java_reader_for_class(class: &str) -> Option<Box<dyn FormatReader>> {
 }
 
 fn append_rust_extra_readers(readers: &mut Vec<Box<dyn FormatReader>>) {
+    readers.push(Box::new(
+        crate::formats::bsd::incucyte::IncucyteReader::new(),
+    ));
     readers.push(Box::new(crate::formats::metaimage::MetaImageReader::new()));
     readers.push(Box::new(crate::formats::raster::webp_reader()));
     readers.push(Box::new(crate::formats::raster::hdr_reader()));
