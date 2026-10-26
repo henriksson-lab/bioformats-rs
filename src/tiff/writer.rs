@@ -75,7 +75,10 @@ impl TiffWriter {
             let mut ome = ome.clone();
             ome.populate_pixels(meta, 0)?;
             ome.verify_minimum_populated(meta, 0)?;
-            self.ome_xml = Some(ome.to_ome_xml(meta));
+            self.ome_xml = Some(
+                ome.to_ome_xml(meta)
+                    .replacen("<MetadataOnly/>", "<TiffData/>", 1),
+            );
         }
         Ok(())
     }
@@ -918,7 +921,10 @@ impl FormatWriter for PyramidOmeTiffWriter {
         self.meta = Some(meta.clone());
         if self.ome_xml.is_none() {
             let ome = crate::common::ome_metadata::OmeMetadata::from_image_metadata(meta);
-            self.ome_xml = Some(ome.to_ome_xml(meta));
+            self.ome_xml = Some(
+                ome.to_ome_xml(meta)
+                    .replacen("<MetadataOnly/>", "<TiffData/>", 1),
+            );
         }
         Ok(())
     }
@@ -978,7 +984,10 @@ impl FormatWriter for TiffWriter {
         self.meta = Some(meta.clone());
         if self.auto_ome_xml && self.ome_xml.is_none() {
             let ome = crate::common::ome_metadata::OmeMetadata::from_image_metadata(meta);
-            self.ome_xml = Some(ome.to_ome_xml(meta));
+            self.ome_xml = Some(
+                ome.to_ome_xml(meta)
+                    .replacen("<MetadataOnly/>", "<TiffData/>", 1),
+            );
         }
         Ok(())
     }

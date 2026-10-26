@@ -164,6 +164,12 @@ impl ImageReader {
     pub fn series(&self) -> usize {
         self.inner.as_deref().map(FormatReader::series).unwrap_or(0)
     }
+    pub fn axis_orientations(&self) -> [Option<crate::common::orientation::Orientation>; 5] {
+        self.inner
+            .as_deref()
+            .map(FormatReader::axis_orientations)
+            .unwrap_or([None; 5])
+    }
     pub fn metadata(&self) -> &ImageMetadata {
         match self.inner.as_deref() {
             Some(inner) => inner.metadata(),
@@ -2045,10 +2051,11 @@ mod tests {
         let reader = ImageReader::open(&path).expect("Pyramid TIFF dispatch failed");
 
         assert_eq!(
-            reader.resolution_count(),
+            reader.series_count(),
             2,
             "Faas TIFF should dispatch to PyramidTiffReader before generic TIFF"
         );
+        assert_eq!(reader.resolution_count(), 1);
         let _ = std::fs::remove_file(path);
     }
 

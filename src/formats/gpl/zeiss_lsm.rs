@@ -157,6 +157,8 @@ struct LsmInfo {
     /// with SimOut/SimPar, changing black channel-colour fallback for SIM data.
     is_sim: bool,
     scan_info: LsmScanInfo,
+    original_metadata: HashMap<String, MetadataValue>,
+    overlays: Vec<crate::common::ome_metadata::OmeROI>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -191,6 +193,7 @@ struct LsmRecording {
     start_time: Option<String>,
     user_name: Option<String>,
     objective_model: Option<String>,
+    iris: Option<bool>,
     correction: Option<String>,
     immersion: Option<String>,
     magnification: Option<f64>,
@@ -496,6 +499,8 @@ fn parse_lsm_info(bytes: &[u8], le: bool) -> Result<LsmInfo> {
         channel_colors: Vec::new(),
         is_sim: false,
         scan_info: LsmScanInfo::default(),
+        original_metadata: HashMap::new(),
+        overlays: Vec::new(),
     })
 }
 
@@ -622,7 +627,7 @@ fn parse_lsm_recording(data: &HashMap<i32, LsmScanValue>) -> LsmRecording {
     }
 
     let objective_model = non_empty_string(scan_text(data, RECORDING_OBJECTIVE));
-    let (correction, magnification, lens_na, immersion) =
+    let (correction, magnification, lens_na, immersion, iris) =
         parse_lsm_objective(objective_model.as_deref().unwrap_or(""));
 
     LsmRecording {
@@ -635,17 +640,24 @@ fn parse_lsm_recording(data: &HashMap<i32, LsmScanValue>) -> LsmRecording {
             .and_then(microsoft_days_to_iso8601),
         user_name: non_empty_string(scan_text(data, RECORDING_USER)),
         objective_model,
+        iris: Some(iris),
         correction,
         immersion,
         magnification,
         lens_na,
-        zoom: positive_f64(scan_float(data, RECORDING_ZOOM).unwrap_or(-1.0)),
+        zoom: Some(scan_float(data, RECORDING_ZOOM).unwrap_or(-1.0)),
     }
 }
 
 fn parse_lsm_objective(
     objective: &str,
-) -> (Option<String>, Option<f64>, Option<f64>, Option<String>) {
+) -> (
+    Option<String>,
+    Option<f64>,
+    Option<f64>,
+    Option<String>,
+    bool,
+) {
     let tokens: Vec<&str> = objective.split_whitespace().collect();
     let mut correction_parts = Vec::new();
     let mut next = 0usize;
@@ -661,15 +673,23 @@ fn parse_lsm_objective(
         next += 1;
         if let Some(slash) = p.find('/') {
             if slash > 0 {
-                magnification = p[..slash].trim_end_matches('x').parse::<f64>().ok();
+                magnification = p[..slash]
+                    .chars()
+                    .take(p[..slash].chars().count().saturating_sub(1))
+                    .collect::<String>()
+                    .parse::<f64>()
+                    .ok();
             }
             if slash + 1 < p.len() {
                 lens_na = p[slash + 1..].parse::<f64>().ok();
             }
         }
     }
-    let immersion = tokens.get(next).map(|s| (*s).to_string());
-    (correction, magnification, lens_na, immersion)
+    let immersion = Some(tokens.get(next).copied().unwrap_or("Unknown").to_string());
+    let iris = tokens
+        .get(next + 1)
+        .is_some_and(|s| s.trim().eq_ignore_ascii_case("iris"));
+    (correction, magnification, lens_na, immersion, iris)
 }
 
 fn parse_lsm_laser(data: &HashMap<i32, LsmScanValue>) -> LsmLaser {
@@ -704,10 +724,10 @@ fn parse_lsm_detection_channel(data: &HashMap<i32, LsmScanValue>) -> LsmDetectio
     let filter = non_empty_string(scan_text(data, CHANNEL_FILTER)).filter(|v| v != "None");
     LsmDetectionChannel {
         acquire: scan_acquire(data, CHANNEL_ACQUIRE),
-        channel_name: non_empty_string(scan_text(data, CHANNEL_NAME)),
-        pinhole: positive_f64(scan_float(data, CHANNEL_PINHOLE_DIAMETER).unwrap_or(-1.0)),
-        gain: positive_f64(scan_float(data, CHANNEL_DETECTOR_GAIN).unwrap_or(-1.0)),
-        amplification_gain: positive_f64(scan_float(data, CHANNEL_AMPLIFIER_GAIN).unwrap_or(-1.0)),
+        channel_name: scan_text(data, CHANNEL_NAME),
+        pinhole: Some(scan_float(data, CHANNEL_PINHOLE_DIAMETER).unwrap_or(-1.0)),
+        gain: Some(scan_float(data, CHANNEL_DETECTOR_GAIN).unwrap_or(-1.0)),
+        amplification_gain: Some(scan_float(data, CHANNEL_AMPLIFIER_GAIN).unwrap_or(-1.0)),
         filter,
         filter_set: non_empty_string(scan_text(data, CHANNEL_FILTER_SET)),
     }
@@ -1145,6 +1165,314 @@ fn parse_lsm_application_tags_is_sim(file_bytes: &[u8], offset: u32, le: bool) -
     false
 }
 
+/// Java ZeissLSMReader.parseOverlays. Reserved/validity/color flags are read by
+/// Java but do not control OME projection; preserve that behavior here.
+fn parse_lsm_overlays(
+    file: &[u8],
+    offset: u32,
+    le: bool,
+) -> Vec<crate::common::ome_metadata::OmeROI> {
+    use crate::common::ome_metadata::{OmeROI, OmeShape};
+    let mut rois = Vec::new();
+    let start = offset as usize;
+    if offset == 0 || start.checked_add(196).is_none_or(|end| end > file.len()) {
+        return rois;
+    }
+    let count = read_i32_lsm(file, start, le).max(0) as usize;
+    if read_i32_lsm(file, start + 4, le) <= 194 {
+        return rois;
+    }
+    let mut p = start + 196;
+    for _ in 0..count.min(file.len() / 8) {
+        if p + 8 > file.len() {
+            break;
+        }
+        let kind = read_i32_lsm(file, p, le);
+        let length = read_i32_lsm(file, p + 4, le);
+        if length < 204 {
+            break;
+        }
+        let Some(end) = p.checked_add(length as usize).filter(|&e| e <= file.len()) else {
+            break;
+        };
+        let block = &file[p..end];
+        let line_width = read_i32_lsm(block, 8, le) as f64;
+        let font_height = read_i32_lsm(block, 48, le);
+        let font_size = (font_height >= 0).then_some(font_height as f64);
+        let data = &block[204..];
+        let mut transform = None;
+        let shape = match kind {
+            13 if data.len() >= 16 => Some(OmeShape::Label {
+                x: read_f64_lsm(data, 0, le),
+                y: read_f64_lsm(data, 8, le),
+                text: Some(
+                    String::from_utf8_lossy(
+                        &data[16..data
+                            .iter()
+                            .skip(16)
+                            .position(|&b| b == 0)
+                            .map(|n| n + 16)
+                            .unwrap_or(data.len())],
+                    )
+                    .trim()
+                    .to_string(),
+                ),
+                font_size: None,
+                stroke_width: None,
+                the_z: None,
+                the_t: None,
+                the_c: None,
+            }),
+            14 if data.len() >= 36 => Some(OmeShape::Line {
+                x1: read_f64_lsm(data, 4, le),
+                y1: read_f64_lsm(data, 12, le),
+                x2: read_f64_lsm(data, 20, le),
+                y2: read_f64_lsm(data, 28, le),
+                the_z: None,
+                the_t: None,
+                the_c: None,
+            }),
+            18 if data.len() >= 36 => {
+                let (x1, y1, x2, y2) = (
+                    read_f64_lsm(data, 4, le),
+                    read_f64_lsm(data, 12, le),
+                    read_f64_lsm(data, 20, le),
+                    read_f64_lsm(data, 28, le),
+                );
+                Some(OmeShape::Rectangle {
+                    x: x1.min(x2),
+                    y: y1.min(y2),
+                    width: (x2 - x1).abs(),
+                    height: (y2 - y1).abs(),
+                    the_z: None,
+                    the_t: None,
+                    the_c: None,
+                })
+            }
+            19..=24 | 26..=29 if data.len() >= 4 => {
+                let count = match kind {
+                    24 => 2,
+                    28 | 29 => 3,
+                    _ => read_i32_lsm(data, 0, le).max(0) as usize,
+                };
+                if count > (data.len() - 4) / 16 {
+                    break;
+                }
+                let points: Vec<_> = (0..count)
+                    .map(|i| {
+                        (
+                            read_f64_lsm(data, 4 + i * 16, le),
+                            read_f64_lsm(data, 12 + i * 16, le),
+                        )
+                    })
+                    .collect();
+                match kind {
+                    19 | 24 | 29 => {
+                        let (mut x, mut y, mut rx, mut ry) = (0.0, 0.0, 0.0, 0.0);
+                        if kind == 19 && count == 4 {
+                            let r1x = (points[2].0 - points[0].0).abs() / 2.0;
+                            let r1y = (points[2].1 - points[0].1).abs() / 2.0;
+                            let r2x = (points[3].0 - points[1].0).abs() / 2.0;
+                            let r2y = (points[3].1 - points[1].1).abs() / 2.0;
+                            if r1x > r2x {
+                                ry = r1y;
+                                rx = r2x;
+                                x = points[3].0.min(points[1].0) + rx;
+                                y = points[2].1.min(points[0].1) + ry;
+                            } else {
+                                ry = r2y;
+                                rx = r1x;
+                                x = points[2].0.min(points[0].0) + rx;
+                                y = points[3].1.min(points[1].1) + ry;
+                            }
+                        } else if kind == 19 && count == 3 {
+                            (x, y) = points[0];
+                            rx = ((points[1].0 - x).powi(2) + (points[1].1 - y).powi(2)).sqrt();
+                            ry = ((points[2].0 - x).powi(2) + (points[2].1 - y).powi(2)).sqrt();
+                            // Preserve upstream's degree-valued theta passed to
+                            // FormatReader.getRotationTransform's sin/cos.
+                            let theta = ((points[2].1 - y) / (points[2].0 - x)).atan().to_degrees();
+                            transform = Some([
+                                theta.cos(),
+                                theta.sin(),
+                                0.0,
+                                -theta.sin(),
+                                theta.cos(),
+                                0.0,
+                            ]);
+                        } else if kind == 24 {
+                            (x, y) = points[0];
+                            rx = ((points[1].0 - x).powi(2) + (points[1].1 - y).powi(2)).sqrt();
+                            ry = rx;
+                        } else if kind == 29 {
+                            let s = 0.5
+                                * ((points[1].0 - points[2].0) * (points[0].0 - points[2].0)
+                                    - (points[1].1 - points[2].1) * (points[2].1 - points[0].1));
+                            let div = (points[0].0 - points[1].0) * (points[2].1 - points[0].1)
+                                - (points[1].1 - points[0].1) * (points[0].0 - points[2].0);
+                            let s = s / div;
+                            x = 0.5 * (points[0].0 + points[1].0) + s * (points[1].1 - points[0].1);
+                            y = 0.5 * (points[0].1 + points[1].1) + s * (points[0].0 - points[1].0);
+                            rx = ((points[0].0 - x).powi(2) + (points[0].1 - y).powi(2)).sqrt();
+                            ry = rx;
+                        }
+                        Some(OmeShape::Ellipse {
+                            x,
+                            y,
+                            radius_x: rx,
+                            radius_y: ry,
+                            the_z: None,
+                            the_t: None,
+                            the_c: None,
+                        })
+                    }
+                    20 | 22 | 27 => Some(OmeShape::Polygon {
+                        points,
+                        the_z: None,
+                        the_t: None,
+                        the_c: None,
+                    }),
+                    _ => Some(OmeShape::Polyline {
+                        points,
+                        the_z: None,
+                        the_t: None,
+                        the_c: None,
+                    }),
+                }
+            }
+            // Scale bars, arrows, palettes and unknown types do not emit ROIs.
+            _ => None,
+        };
+        if let Some(shape) = shape {
+            rois.push(OmeROI {
+                shapes: vec![OmeShape::Styled {
+                    shape: Box::new(shape),
+                    font_size,
+                    stroke_width: Some(line_width),
+                    transform,
+                }],
+                ..Default::default()
+            });
+        }
+        p = end;
+    }
+    rois
+}
+
+/// Java parseApplicationTags and event-list original metadata projection.
+fn parse_lsm_original_metadata(
+    file: &[u8],
+    info: &LsmInfo,
+    le: bool,
+) -> HashMap<String, MetadataValue> {
+    let mut metadata = HashMap::new();
+    let mut p = info.event_list_offset as usize;
+    if p > 0 && p + 8 <= file.len() {
+        let count = read_i32_lsm(file, p + 4, le);
+        let swapped = read_i32_lsm(file, p + 4, !le);
+        let count = if count < 0 {
+            swapped
+        } else {
+            count.min(swapped)
+        };
+        let count = if count > 65535 {
+            0
+        } else {
+            count.max(0) as usize
+        };
+        p += 8;
+        for event in 0..count {
+            if p + 16 > file.len() {
+                break;
+            }
+            let size = read_i32_lsm(file, p, le);
+            let time = read_f64_lsm(file, p + 4, le);
+            let kind = read_i32_lsm(file, p + 12, le);
+            let suffix = if event == 0 {
+                String::new()
+            } else {
+                format!(" #{}", event + 1)
+            };
+            metadata.insert(format!("Event Time{suffix}"), MetadataValue::Float(time));
+            metadata.insert(
+                format!("Event Type{suffix}"),
+                MetadataValue::Int(kind as i64),
+            );
+            let length = (size as i64 - 16).clamp(0, 65536) as usize;
+            if p + 16 + length > file.len() {
+                break;
+            }
+            metadata.insert(
+                format!("Event Description{suffix}"),
+                MetadataValue::String(
+                    String::from_utf8_lossy(&file[p + 16..p + 16 + length]).to_string(),
+                ),
+            );
+            if size < 16 {
+                break;
+            }
+            p = match p.checked_add(size as usize) {
+                Some(p) => p,
+                None => break,
+            };
+        }
+    }
+    p = info.application_tag_offset as usize;
+    if p > 0 && p + 8 <= file.len() {
+        let entries = read_i32_lsm(file, p + 4, le).max(0) as usize;
+        p += 8;
+        for _ in 0..entries.min(file.len() / 16) {
+            if p + 16 > file.len() {
+                break;
+            }
+            let start = p;
+            let size = read_i32_lsm(file, p, le);
+            let name_length = read_i32_lsm(file, p + 4, le);
+            if size < 16 || name_length < 0 {
+                break;
+            }
+            p += 8;
+            let n = name_length as usize;
+            if p.checked_add(n + 8).is_none_or(|end| end > file.len()) {
+                break;
+            }
+            let name = String::from_utf8_lossy(&file[p..p + n]).to_string();
+            p += n;
+            let kind = read_i32_lsm(file, p, le);
+            let data_size = read_i32_lsm(file, p + 4, le);
+            p += 8;
+            if data_size < 0
+                || p.checked_add(data_size as usize)
+                    .is_none_or(|end| end > file.len())
+            {
+                break;
+            }
+            let value = match kind {
+                2 => Some(MetadataValue::String(
+                    String::from_utf8_lossy(&file[p..p + data_size as usize]).to_string(),
+                )),
+                4 if data_size >= 4 => Some(MetadataValue::Int(read_i32_lsm(file, p, le) as i64)),
+                5 if data_size >= 8 => Some(MetadataValue::Float(read_f64_lsm(file, p, le))),
+                6 if data_size >= 8 => Some(MetadataValue::Int(if le {
+                    i64::from_le_bytes(file[p..p + 8].try_into().unwrap())
+                } else {
+                    i64::from_be_bytes(file[p..p + 8].try_into().unwrap())
+                })),
+                7 if data_size >= 4 => Some(MetadataValue::Bool(read_i32_lsm(file, p, le) == 0)),
+                _ => None,
+            };
+            if let Some(value) = value {
+                metadata.insert(name, value);
+            }
+            p = match start.checked_add(size as usize) {
+                Some(next) if next > start => next,
+                _ => break,
+            };
+        }
+    }
+    metadata
+}
+
 fn lsm_pack_rgba([red, green, blue]: [u8; 3]) -> i32 {
     u32::from_be_bytes([red, green, blue, 0xff]) as i32
 }
@@ -1406,6 +1734,11 @@ fn enrich_lsm_ome_from_scan_info(
     let mut next_detect_channel = 0usize;
     let mut next_illum_channel = 0usize;
 
+    let zoom = scan_info
+        .recordings
+        .last()
+        .and_then(|r| r.zoom)
+        .unwrap_or(-1.0);
     for block in lsm_scan_blocks_for_java_population(scan_info) {
         match block {
             LsmScanBlockRef::Recording(idx) => {
@@ -1420,23 +1753,31 @@ fn enrich_lsm_ome_from_scan_info(
                     });
                 }
                 let objective = &mut instrument.objectives[0];
-                objective.model = recording.objective_model.clone();
+                // Java derives properties without populating Objective.Model.
+                objective.iris = Some(recording.iris.unwrap_or(false));
                 objective.nominal_magnification = recording.magnification;
                 objective.lens_na = recording.lens_na;
-                objective.immersion = recording.immersion.clone();
-                objective.correction = recording.correction.clone();
+                objective.immersion = Some(
+                    super::leica_lms::metadata_immersion(recording.immersion.as_deref()).into(),
+                );
+                objective.correction = Some(
+                    super::leica_lms::metadata_correction(recording.correction.as_deref()).into(),
+                );
 
                 if recording.acquire {
                     if let Some(image) = ome.images.get_mut(0) {
                         image.description = recording.description.clone();
                         image.acquisition_date = recording.start_time.clone();
                         image.objective_ref = Some(0);
-                        for channel in &mut image.channels {
-                            channel.detector_settings_binning = recording.binning.clone();
-                        }
                     }
                 }
-                let _ = (&recording.name, &recording.zoom, &recording.user_name);
+                let _ = (
+                    &recording.name,
+                    &recording.zoom,
+                    &recording.user_name,
+                    &recording.objective_model,
+                    &recording.binning,
+                );
             }
             LsmScanBlockRef::Laser(idx) => {
                 let Some(laser) = scan_info.lasers.get(idx) else {
@@ -1447,11 +1788,35 @@ fn enrich_lsm_ome_from_scan_info(
                     id: Some(create_lsid("LightSource", &[0, next_laser])),
                     model: laser.model.clone(),
                     light_source_type: Some("Laser".into()),
-                    power: laser.power,
+                    laser_type: Some(
+                        match laser
+                            .laser_type
+                            .as_deref()
+                            .unwrap_or("")
+                            .to_ascii_lowercase()
+                            .as_str()
+                        {
+                            "gas" => "Gas",
+                            "solidstate" => "SolidState",
+                            "excimer" => "Excimer",
+                            "metalvapor" => "MetalVapor",
+                            "dye" => "Dye",
+                            "semiconductor" => "Semiconductor",
+                            "freeelectron" => "FreeElectron",
+                            _ => "Other",
+                        }
+                        .into(),
+                    ),
+                    laser_medium: Some(laser.medium.clone().unwrap_or_else(|| "Other".into())),
                     ..Default::default()
                 });
                 next_laser += 1;
-                let _ = (&laser.acquire, &laser.laser_type, &laser.medium);
+                let _ = (
+                    &laser.acquire,
+                    &laser.laser_type,
+                    &laser.medium,
+                    &laser.power,
+                );
             }
             LsmScanBlockRef::Track(idx) => {
                 let Some(track) = scan_info.tracks.get(idx) else {
@@ -1495,9 +1860,11 @@ fn enrich_lsm_ome_from_scan_info(
                     }
 
                     instrument.detectors.push(OmeDetector {
-                        id: Some(detector_id.clone()),
+                        id: channel.channel_name.as_ref().map(|_| detector_id.clone()),
                         detector_type: Some("PMT".into()),
                         gain: channel.gain,
+                        amplification_gain: channel.amplification_gain,
+                        zoom: Some(zoom),
                         ..Default::default()
                     });
                 }
@@ -1506,9 +1873,10 @@ fn enrich_lsm_ome_from_scan_info(
                     if let Some(image) = ome.images.get_mut(0) {
                         if next_detector < image.channels.len() {
                             let ome_channel = &mut image.channels[next_detector];
-                            ome_channel.pinhole_size = channel.pinhole;
-                            ome_channel.detector_settings_gain = channel.gain;
-                            ome_channel.detector_ref = Some(detector_id);
+                            ome_channel.pinhole_size = channel.pinhole.filter(|v| *v != 0.0);
+                            if channel.channel_name.is_some() {
+                                ome_channel.detector_ref = Some(detector_id);
+                            }
                         }
                     }
                 }
@@ -1600,8 +1968,15 @@ fn read_lsm_info_from_file(path: &Path) -> Result<(LsmInfo, bool)> {
         || info.timestamp_offset != 0
         || info.position_offset != 0
         || info.tile_position_offset != 0
+        || info.event_list_offset != 0
+        || info.overlay_offsets.iter().any(|&offset| offset != 0)
     {
         if let Ok(file_bytes) = std::fs::read(path) {
+            info.original_metadata = parse_lsm_original_metadata(&file_bytes, &info, le);
+            for offset in info.overlay_offsets {
+                info.overlays
+                    .extend(parse_lsm_overlays(&file_bytes, offset, le));
+            }
             info.timestamps = parse_lsm_timestamps(&file_bytes, info.timestamp_offset, le);
             info.positions = parse_lsm_positions(&file_bytes, &info, le);
             info.is_sim =
@@ -1653,6 +2028,10 @@ pub struct ZeissLsmReader {
     timestamps: Vec<f64>,
     /// Per-position coordinates from LSM position/tile-position tables.
     positions: Vec<[f64; 3]>,
+    overlays: Vec<crate::common::ome_metadata::OmeROI>,
+    sources: Vec<ZeissLsmReader>,
+    source_series: Vec<(usize, usize)>,
+    metadata_options: crate::common::metadata::MetadataOptions,
 }
 
 impl ZeissLsmReader {
@@ -1672,7 +2051,132 @@ impl ZeissLsmReader {
             channel_colors: Vec::new(),
             timestamps: Vec::new(),
             positions: Vec::new(),
+            overlays: Vec::new(),
+            sources: Vec::new(),
+            source_series: Vec::new(),
+            metadata_options: crate::common::metadata::MetadataOptions::default(),
         }
+    }
+
+    /// Java parseMDB/initFile, adapting MDBService's table vectors to MdbTable.
+    fn init_mdb(&mut self, path: &Path, tables: &[crate::common::mdb::MdbTable]) -> Result<()> {
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let mut metadata = HashMap::new();
+        let mut value_counts: HashMap<String, usize> = HashMap::new();
+        let mut referenced = Vec::new();
+        let mut reference_count = 0usize;
+        for table in tables {
+            for row in &table.rows {
+                for (column, value) in table.columns.iter().zip(row) {
+                    let key = format!("{} {}", table.name, column);
+                    let count = value_counts.entry(key.clone()).or_default();
+                    let key = if *count == 0 {
+                        key
+                    } else {
+                        format!("{key} #{}", *count + 1)
+                    };
+                    metadata.insert(key, MetadataValue::String(value.clone()));
+                    *count += 1;
+                    if table.name == "Recordings" && column == "SampleData" {
+                        reference_count += 1;
+                        let normalized = value.trim().replace('\\', "/");
+                        let filename = normalized.rsplit('/').next().unwrap_or("");
+                        if !filename.is_empty() {
+                            let file = parent.join(filename);
+                            if file.exists() {
+                                referenced.push(file);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if referenced.len() != reference_count {
+            let mut siblings: Vec<_> = std::fs::read_dir(parent)?
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .collect();
+            siblings.sort();
+            let other_mdbs: Vec<_> = siblings
+                .iter()
+                .filter(|p| {
+                    p.as_path() != path
+                        && p.extension()
+                            .and_then(|e| e.to_str())
+                            .is_some_and(|e| e.eq_ignore_ascii_case("mdb"))
+                })
+                .collect();
+            if other_mdbs.is_empty() || referenced.is_empty() {
+                referenced = siblings
+                    .iter()
+                    .filter(|p| {
+                        p.extension()
+                            .and_then(|e| e.to_str())
+                            .is_some_and(|e| e.eq_ignore_ascii_case("lsm"))
+                    })
+                    .cloned()
+                    .collect();
+                // When several databases share a directory, retain only LSMs
+                // that are not directly referenced by a sibling database.
+                for other in other_mdbs {
+                    if let Ok(other_tables) = crate::common::mdb::parse_database(other) {
+                        for table in other_tables.iter().filter(|t| t.name == "Recordings") {
+                            if let Some(column) =
+                                table.columns.iter().position(|c| c == "SampleData")
+                            {
+                                for value in table.rows.iter().filter_map(|r| r.get(column)) {
+                                    let normalized = value.trim().replace('\\', "/");
+                                    let file =
+                                        parent.join(normalized.rsplit('/').next().unwrap_or(""));
+                                    referenced.retain(|p| p != &file);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for file in referenced {
+            if file
+                .extension()
+                .and_then(|s| s.to_str())
+                .is_some_and(|s| s.eq_ignore_ascii_case("mdb"))
+            {
+                continue;
+            }
+            let mut reader = ZeissLsmReader::new();
+            reader.set_metadata_options(self.metadata_options.clone());
+            match reader.set_id(&file) {
+                Ok(()) => {
+                    let source = self.sources.len();
+                    for (series, meta) in reader.series_metas.iter().enumerate() {
+                        let mut meta = meta.clone();
+                        meta.series_metadata.extend(metadata.clone());
+                        self.series_metas.push(meta);
+                        self.source_series.push((source, series));
+                        self.image_names
+                            .push(reader.image_names.get(series).cloned().flatten());
+                    }
+                    self.sources.push(reader);
+                }
+                Err(error) => {
+                    log::debug!("Failed to parse LSM companion {}: {error}", file.display())
+                }
+            }
+        }
+        if self.sources.is_empty() {
+            return Err(BioFormatsError::Format("LSM files were not found.".into()));
+        }
+        if self.sources.len() != self.series_metas.len() {
+            for reader in &mut self.sources {
+                if reader.series_metas.len() == 1 {
+                    if let Some(Some(name)) = reader.image_names.first_mut() {
+                        name.push_str(" #1");
+                    }
+                }
+            }
+        }
+        self.path = Some(path.to_path_buf());
+        self.activate_series(0)
     }
 
     fn collect_full_resolution_ifds(&self, best_series: usize) -> Vec<usize> {
@@ -1717,6 +2221,9 @@ impl ZeissLsmReader {
             .get(s)
             .cloned()
             .ok_or(BioFormatsError::SeriesOutOfRange(s))?;
+        if let Some(&(source, local_series)) = self.source_series.get(s) {
+            self.sources[source].set_series(local_series)?;
+        }
         self.current_series = s;
         self.meta = Some(meta);
         self.image_name = self.image_names.get(s).cloned().unwrap_or(None);
@@ -1738,10 +2245,12 @@ fn is_lsm_mdb_header(header: &[u8]) -> bool {
 }
 
 impl FormatReader for ZeissLsmReader {
+    fn set_metadata_options(&mut self, options: crate::common::metadata::MetadataOptions) {
+        self.metadata_options = options;
+    }
+
     fn is_this_type_by_name(&self, path: &Path) -> bool {
-        // ZeissLSMReader.java:205-211 registers both "lsm" and "mdb"; MDB
-        // companion parsing is still not implemented below, but name detection
-        // should not reject the Java-registered suffix.
+        // ZeissLSMReader registers both TIFF-based LSM and MDB companions.
         let ext = path
             .extension()
             .and_then(|e| e.to_str())
@@ -1758,8 +2267,28 @@ impl FormatReader for ZeissLsmReader {
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.close()?;
+        if path
+            .extension()
+            .and_then(|s| s.to_str())
+            .is_some_and(|s| s.eq_ignore_ascii_case("mdb"))
+        {
+            let tables = crate::common::mdb::parse_database(path)?;
+            return self.init_mdb(path, &tables);
+        }
         // First, read the CZ_LSMInfo block to get true dimensions
-        let (lsm_info, le) = read_lsm_info_from_file(path)?;
+        let (mut lsm_info, le) = read_lsm_info_from_file(path)?;
+        if self.metadata_options.level == crate::common::metadata::MetadataLevel::Minimal {
+            lsm_info.scan_info = LsmScanInfo::default();
+            lsm_info.channel_colors.clear();
+            lsm_info.channel_names.clear();
+            lsm_info.timestamps.clear();
+            lsm_info.positions.clear();
+            lsm_info.original_metadata.clear();
+            lsm_info.overlays.clear();
+        } else if self.metadata_options.level == crate::common::metadata::MetadataLevel::NoOverlays
+        {
+            lsm_info.overlays.clear();
+        }
 
         // Open with inner TIFF reader to get pixel dimensions and read pixel data
         self.inner.set_id(path)?;
@@ -1891,6 +2420,7 @@ impl FormatReader for ZeissLsmReader {
             .copied()
             .and_then(|color| lsm_lookup_table_for_pixel_type(color, pixel_type));
 
+        meta_map.extend(lsm_info.original_metadata);
         let meta = ImageMetadata {
             size_x: tiff_meta.size_x,
             size_y: tiff_meta.size_y,
@@ -1922,6 +2452,7 @@ impl FormatReader for ZeissLsmReader {
         self.channel_colors = lsm_info.channel_colors;
         self.timestamps = lsm_info.timestamps;
         self.positions = lsm_info.positions;
+        self.overlays = lsm_info.overlays;
         self.series_metas = (0..lsm_series_count).map(|_| meta.clone()).collect();
         self.series_plane_offsets = (0..lsm_series_count).map(|s| s * ifds_per_series).collect();
         self.image_names = (0..lsm_series_count)
@@ -1954,6 +2485,9 @@ impl FormatReader for ZeissLsmReader {
         self.channel_colors = Vec::new();
         self.timestamps = Vec::new();
         self.positions = Vec::new();
+        self.overlays.clear();
+        self.sources.clear();
+        self.source_series.clear();
         let _ = self.inner.close();
         Ok(())
     }
@@ -1990,6 +2524,9 @@ impl FormatReader for ZeissLsmReader {
         w: u32,
         h: u32,
     ) -> Result<Vec<u8>> {
+        if let Some(&(source, _)) = self.source_series.get(self.current_series) {
+            return self.sources[source].open_bytes_region(plane_index, x, y, w, h);
+        }
         let count = self.meta.as_ref().map(|m| m.image_count).unwrap_or(0);
         if plane_index >= count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
@@ -2049,6 +2586,10 @@ impl FormatReader for ZeissLsmReader {
     }
 
     fn lookup_table(&mut self, plane_index: u32) -> Result<Option<LookupTable>> {
+        if let Some(&(source, _)) = self.source_series.get(self.current_series) {
+            return self.sources[source].lookup_table(plane_index);
+        }
+
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         if plane_index >= meta.image_count || !meta.is_indexed {
             return Ok(None);
@@ -2062,59 +2603,474 @@ impl FormatReader for ZeissLsmReader {
 
     fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
         use crate::common::metadata::MetadataValue;
-        use crate::common::ome_metadata::OmeMetadata;
-        let meta = self.meta.as_ref()?;
-        let mut ome = OmeMetadata::from_image_metadata(meta);
-        {
-            let img = &mut ome.images[0];
-            let get_f = |k: &str| -> Option<f64> {
-                if let Some(MetadataValue::Float(v)) = meta.series_metadata.get(k) {
-                    Some(*v)
-                } else {
-                    None
-                }
+        use crate::common::ome_metadata::{OmeExperimenter, OmeMetadata};
+        self.meta.as_ref()?;
+        let readers: Vec<&ZeissLsmReader> = if self.sources.is_empty() {
+            vec![self]
+        } else {
+            self.sources.iter().collect()
+        };
+        let mut combined = OmeMetadata::default();
+        let mut emission_filters: Vec<(usize, usize, String)> = Vec::new();
+        for (source, reader) in readers.into_iter().enumerate() {
+            let metas: Vec<&ImageMetadata> = if reader.series_metas.is_empty() {
+                reader.meta.iter().collect()
+            } else {
+                reader.series_metas.iter().collect()
             };
-            // Already stored in µm
-            img.physical_size_x = get_f("voxel_size_x_um");
-            img.physical_size_y = get_f("voxel_size_y_um");
-            img.physical_size_z = get_f("voxel_size_z_um");
-            img.time_increment = get_f("time_increment_s");
-            img.name = self.image_name.clone();
-        }
-        enrich_lsm_ome_from_scan_info(&mut ome, &self.scan_info, meta.size_c as usize);
-        let img = &mut ome.images[0];
-        // Channel names from the CZ-LSMINFO channel-colours sub-block
-        // (ZeissLSMReader.java:1351 store.setChannelName).
-        for (ci, name) in self.channel_names.iter().enumerate() {
-            if let Some(ch) = img.channels.get_mut(ci) {
-                if !name.is_empty() {
-                    ch.name = Some(name.clone());
+            for (local_series, meta) in metas.into_iter().enumerate() {
+                let mut ome = OmeMetadata::from_image_metadata(meta);
+                {
+                    let img = &mut ome.images[0];
+                    let get_f = |k: &str| -> Option<f64> {
+                        if let Some(MetadataValue::Float(v)) = meta.series_metadata.get(k) {
+                            Some(*v)
+                        } else {
+                            None
+                        }
+                    };
+                    // Already stored in µm
+                    if reader.metadata_options.level
+                        != crate::common::metadata::MetadataLevel::Minimal
+                    {
+                        img.physical_size_x = get_f("voxel_size_x_um").filter(|v| *v > 0.0);
+                        img.physical_size_y = get_f("voxel_size_y_um").filter(|v| *v > 0.0);
+                        img.physical_size_z = get_f("voxel_size_z_um").filter(|v| *v > 0.0);
+                        img.time_increment = get_f("time_increment_s");
+                    }
+                    img.name = reader
+                        .image_names
+                        .get(local_series)
+                        .cloned()
+                        .flatten()
+                        .or_else(|| reader.image_name.clone());
                 }
+                enrich_lsm_ome_from_scan_info(&mut ome, &reader.scan_info, meta.size_c as usize);
+                let img = &mut ome.images[0];
+                // Channel names from the CZ-LSMINFO channel-colours sub-block
+                // (ZeissLSMReader.java:1351 store.setChannelName).
+                for (ci, name) in reader.channel_names.iter().enumerate() {
+                    if let Some(ch) = img.channels.get_mut(ci) {
+                        ch.name = Some(name.clone());
+                    }
+                }
+                for (ci, color) in reader.channel_colors.iter().copied().enumerate() {
+                    if let Some(ch) = img.channels.get_mut(ci) {
+                        ch.color = Some(lsm_pack_rgba(color));
+                    }
+                }
+                let timestamp_start = local_series
+                    .checked_mul(meta.size_t as usize)
+                    .unwrap_or(usize::MAX);
+                let timestamps = reader.timestamps.get(timestamp_start..).unwrap_or(&[]);
+                lsm_populate_java_planes(
+                    img,
+                    meta,
+                    timestamps,
+                    reader.positions.get(local_series).copied(),
+                );
+
+                if ome.instruments.is_empty() {
+                    ome.instruments.push(OmeInstrument::default());
+                }
+                ome.images[0].instrument_ref = Some(source);
+                let rewrite = |id: &mut Option<String>| {
+                    if let Some(value) = id {
+                        let mut parts: Vec<String> = value.split(':').map(str::to_string).collect();
+                        if parts.len() > 1 {
+                            parts[1] = source.to_string();
+                            *value = parts.join(":");
+                        }
+                    }
+                };
+                for instrument in &mut ome.instruments {
+                    instrument.id = Some(create_lsid("Instrument", &[source]));
+                    for objective in &mut instrument.objectives {
+                        rewrite(&mut objective.id);
+                    }
+                    for detector in &mut instrument.detectors {
+                        rewrite(&mut detector.id);
+                    }
+                    for light in &mut instrument.light_sources {
+                        rewrite(&mut light.id);
+                    }
+                    for filter in &mut instrument.filters {
+                        rewrite(&mut filter.id);
+                    }
+                    for dichroic in &mut instrument.dichroics {
+                        rewrite(&mut dichroic.id);
+                    }
+                }
+                for channel in &mut ome.images[0].channels {
+                    rewrite(&mut channel.detector_ref);
+                    rewrite(&mut channel.light_source_settings_id);
+                }
+                for path in &mut ome.images[0].light_paths {
+                    rewrite(&mut path.dichroic_id);
+                    for id in path
+                        .excitation_filter_ids
+                        .iter_mut()
+                        .chain(&mut path.emission_filter_ids)
+                    {
+                        let mut value = Some(id.clone());
+                        rewrite(&mut value);
+                        *id = value.unwrap();
+                    }
+                }
+                // Java passes the instrument/source index as the image index
+                // for emission-filter refs, including multi-position datasets.
+                for (channel, path) in ome.images[0].light_paths.iter_mut().enumerate() {
+                    if local_series == 0 {
+                        for id in &path.emission_filter_ids {
+                            emission_filters.push((source, channel, id.clone()));
+                        }
+                    }
+                    path.emission_filter_ids.clear();
+                }
+                if local_series == 0 {
+                    combined.instruments.extend(ome.instruments);
+                }
+                if let Some(username) = reader
+                    .scan_info
+                    .recordings
+                    .iter()
+                    .filter_map(|r| r.user_name.as_ref())
+                    .last()
+                {
+                    combined.experimenters = vec![OmeExperimenter {
+                        id: Some(create_lsid("Experimenter", &[0])),
+                        user_name: Some(username.clone()),
+                        ..Default::default()
+                    }];
+                }
+                for original in &reader.overlays {
+                    let mut roi = original.clone();
+                    roi.id = Some(create_lsid("ROI", &[combined.rois.len()]));
+                    ome.images[0].roi_refs.push(roi.id.clone().unwrap());
+                    combined.rois.push(roi);
+                }
+                combined.images.extend(ome.images);
             }
         }
-        for (ci, color) in self.channel_colors.iter().copied().enumerate() {
-            if let Some(ch) = img.channels.get_mut(ci) {
-                ch.color = Some(lsm_pack_rgba(color));
+        for (image_index, channel, id) in emission_filters {
+            if let Some(image) = combined.images.get_mut(image_index) {
+                if image.light_paths.len() <= channel {
+                    image
+                        .light_paths
+                        .resize_with(channel + 1, OmeLightPath::default);
+                }
+                image.light_paths[channel].emission_filter_ids.push(id);
             }
         }
-        let timestamp_start = self
-            .current_series
-            .checked_mul(meta.size_t as usize)
-            .unwrap_or(usize::MAX);
-        let timestamps = self.timestamps.get(timestamp_start..).unwrap_or(&[]);
-        lsm_populate_java_planes(
-            img,
-            meta,
-            timestamps,
-            self.positions.get(self.current_series).copied(),
-        );
-        Some(ome)
+        Some(combined)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn write_lsm_gap_fixture(path: &Path, pixels: [u8; 2], voxel_x: f64) {
+        let count = 10u16;
+        let lsm_offset = 8 + 2 + count as u32 * 12 + 4;
+        let pixel_offset = lsm_offset + 512;
+        let mut bytes = Vec::from(&b"II\x2a\x00\x08\x00\x00\x00"[..]);
+        bytes.extend_from_slice(&count.to_le_bytes());
+        for (tag, kind, n, value) in [
+            (256u16, 4u16, 1u32, 2u32),
+            (257, 4, 1, 1),
+            (258, 3, 1, 8),
+            (259, 3, 1, 1),
+            (262, 3, 1, 1),
+            (273, 4, 1, pixel_offset),
+            (277, 3, 1, 1),
+            (278, 4, 1, 1),
+            (279, 4, 1, 2),
+            (34412, 7, 512, lsm_offset),
+        ] {
+            bytes.extend_from_slice(&tag.to_le_bytes());
+            bytes.extend_from_slice(&kind.to_le_bytes());
+            bytes.extend_from_slice(&n.to_le_bytes());
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        let mut lsm = vec![0u8; 512];
+        lsm[..4].copy_from_slice(&0x00300494i32.to_le_bytes());
+        lsm[4..8].copy_from_slice(&512i32.to_le_bytes());
+        for (offset, value) in [(8, 2i32), (12, 1), (16, 1), (20, 1), (24, 1), (28, 1)] {
+            lsm[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        lsm[40..48].copy_from_slice(&voxel_x.to_le_bytes());
+        lsm[48..56].copy_from_slice(&1e-6f64.to_le_bytes());
+        lsm[56..64].copy_from_slice(&1e-6f64.to_le_bytes());
+        bytes.extend(lsm);
+        bytes.extend(pixels);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn lsm_rich_graph_populates_exact_java_fields_without_overprojection() {
+        let mut recording = HashMap::new();
+        recording.insert(
+            RECORDING_OBJECTIVE,
+            LsmScanValue::Text("Plan-Apochromat 63x/1.4 Oil iris".into()),
+        );
+        recording.insert(RECORDING_ZOOM, LsmScanValue::Float(2.5));
+        let mut laser = HashMap::new();
+        laser.insert(LASER_NAME, LsmScanValue::Text("HeNe 633".into()));
+        laser.insert(LASER_POWER, LsmScanValue::Float(4.5));
+        let mut detector = HashMap::new();
+        detector.insert(CHANNEL_DETECTOR_GAIN, LsmScanValue::Float(0.0));
+        detector.insert(CHANNEL_AMPLIFIER_GAIN, LsmScanValue::Float(3.0));
+        detector.insert(CHANNEL_PINHOLE_DIAMETER, LsmScanValue::Float(0.0));
+        let scan_info = LsmScanInfo {
+            recordings: vec![parse_lsm_recording(&recording)],
+            lasers: vec![parse_lsm_laser(&laser)],
+            detection_channels: vec![parse_lsm_detection_channel(&detector)],
+            block_order: vec![
+                LsmScanBlockRef::Recording(0),
+                LsmScanBlockRef::Laser(0),
+                LsmScanBlockRef::DetectionChannel(0),
+            ],
+            ..Default::default()
+        };
+        let meta = ImageMetadata {
+            size_c: 1,
+            ..Default::default()
+        };
+        let mut ome = crate::common::ome_metadata::OmeMetadata::from_image_metadata(&meta);
+        enrich_lsm_ome_from_scan_info(&mut ome, &scan_info, 1);
+        let objective = &ome.instruments[0].objectives[0];
+        assert_eq!(objective.iris, Some(true));
+        assert_eq!(objective.model, None);
+        assert_eq!(objective.correction.as_deref(), Some("PlanApo"));
+        assert_eq!(objective.immersion.as_deref(), Some("Oil"));
+        let laser = &ome.instruments[0].light_sources[0];
+        assert_eq!(laser.power, None);
+        assert_eq!(laser.laser_type.as_deref(), Some("Gas"));
+        assert_eq!(laser.laser_medium.as_deref(), Some("HeNe"));
+        let detector = &ome.instruments[0].detectors[0];
+        assert_eq!(detector.id, None);
+        assert_eq!(detector.gain, Some(0.0));
+        assert_eq!(detector.amplification_gain, Some(3.0));
+        assert_eq!(detector.zoom, Some(2.5));
+        assert_eq!(ome.images[0].channels[0].detector_ref, None);
+        assert_eq!(ome.images[0].channels[0].detector_settings_gain, None);
+        assert_eq!(ome.images[0].channels[0].detector_settings_binning, None);
+        assert_eq!(ome.images[0].channels[0].pinhole_size, None);
+        let xml = ome.to_ome_xml(&meta);
+        assert!(xml.contains("Iris=\"true\""));
+        assert!(xml.contains("AmplificationGain=\"3\""));
+        assert!(xml.contains("LaserMedium=\"HeNe\""));
+        // Java drops the character before '/' when parsing magnification.
+        assert_eq!(parse_lsm_objective("Plan 63/1.4 Oil").1, Some(6.0));
+    }
+
+    #[test]
+    fn lsm_metadata_levels_suppress_overlays_and_rich_projection_like_java() {
+        use crate::common::metadata::{MetadataLevel, MetadataOptions};
+        let path =
+            std::env::temp_dir().join(format!("bf_lsm_overlay_levels_{}.lsm", std::process::id()));
+        write_lsm_gap_fixture(&path, [51, 52], 1e-6);
+        let mut bytes = std::fs::read(&path).unwrap();
+        let offset = bytes.len() as u32 + 8;
+        let mut payload = Vec::new();
+        payload.extend(2.0f64.to_le_bytes());
+        payload.extend(3.0f64.to_le_bytes());
+        payload.extend(b"label\0");
+        bytes[134 + 140..134 + 144].copy_from_slice(&offset.to_le_bytes());
+        bytes.extend(lsm_overlay_fixture(13, &payload));
+        std::fs::write(&path, bytes).unwrap();
+        for (level, rois, physical_size) in [
+            (MetadataLevel::All, 1, Some(1.0)),
+            (MetadataLevel::NoOverlays, 0, Some(1.0)),
+            (MetadataLevel::Minimal, 0, None),
+        ] {
+            let mut reader = ZeissLsmReader::new();
+            reader.set_metadata_options(MetadataOptions {
+                level,
+                ..Default::default()
+            });
+            reader.set_id(&path).unwrap();
+            assert_eq!(reader.open_bytes(0).unwrap(), vec![51, 52]);
+            let ome = reader.ome_metadata().unwrap();
+            assert_eq!(ome.rois.len(), rois);
+            assert_eq!(ome.images[0].roi_refs.len(), rois);
+            assert_eq!(ome.images[0].physical_size_x, physical_size);
+            reader.close().unwrap();
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn lsm_mdb_references_keep_database_order_and_per_file_metadata_pixels() {
+        use crate::common::mdb::MdbTable;
+        let dir = std::env::temp_dir().join(format!("bf_lsm_mdb_group_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        write_lsm_gap_fixture(&dir.join("a.lsm"), [11, 12], 1e-6);
+        write_lsm_gap_fixture(&dir.join("b.lsm"), [21, 22], 2e-6);
+        let table = MdbTable {
+            name: "Recordings".into(),
+            columns: vec!["SampleData".into(), "Description".into()],
+            rows: vec![
+                vec![r"C:\acquisition\b.lsm".into(), "B".into()],
+                vec!["/old/location/a.lsm".into(), "A".into()],
+            ],
+        };
+        let mut reader = ZeissLsmReader::new();
+        reader.init_mdb(&dir.join("project.mdb"), &[table]).unwrap();
+        assert_eq!(reader.series_count(), 2);
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![21, 22]);
+        assert!(
+            matches!(reader.metadata().series_metadata.get("Recordings Description"),Some(MetadataValue::String(v)) if v == "B")
+        );
+        reader.set_series(1).unwrap();
+        assert_eq!(reader.open_bytes_region(0, 1, 0, 1, 1).unwrap(), vec![12]);
+        let ome = reader.ome_metadata().unwrap();
+        assert_eq!(ome.images.len(), 2);
+        assert_eq!(ome.instruments.len(), 2);
+        assert_eq!(ome.images[0].physical_size_x, Some(2.0));
+        assert_eq!(ome.images[1].physical_size_x, Some(1.0));
+        assert_eq!(ome.images[0].name.as_deref(), Some("b"));
+        assert_eq!(ome.images[1].name.as_deref(), Some("a"));
+        assert_eq!(ome.images[0].instrument_ref, Some(0));
+        assert_eq!(ome.images[1].instrument_ref, Some(1));
+        reader.close().unwrap();
+        assert_eq!(reader.series_count(), 0);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn lsm_mdb_missing_reference_falls_back_to_sorted_siblings_like_java() {
+        let dir = std::env::temp_dir().join(format!("bf_lsm_mdb_fallback_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        write_lsm_gap_fixture(&dir.join("z.lsm"), [31, 32], 1e-6);
+        write_lsm_gap_fixture(&dir.join("a.lsm"), [41, 42], 1e-6);
+        let table = crate::common::mdb::MdbTable {
+            name: "Recordings".into(),
+            columns: vec!["SampleData".into()],
+            rows: vec![vec!["missing.lsm".into()]],
+        };
+        let mut reader = ZeissLsmReader::new();
+        reader.init_mdb(&dir.join("project.mdb"), &[table]).unwrap();
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![41, 42]);
+        reader.set_series(1).unwrap();
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![31, 32]);
+        reader.close().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn lsm_overlay_fixture(kind: i32, payload: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0u8; 8 + 196];
+        bytes[8..12].copy_from_slice(&1i32.to_le_bytes());
+        bytes[12..16].copy_from_slice(&(196i32 + 204 + payload.len() as i32).to_le_bytes());
+        let mut shape = vec![0u8; 204];
+        shape[..4].copy_from_slice(&kind.to_le_bytes());
+        shape[4..8].copy_from_slice(&(204i32 + payload.len() as i32).to_le_bytes());
+        shape[8..12].copy_from_slice(&3i32.to_le_bytes());
+        shape[48..52].copy_from_slice(&12i32.to_le_bytes());
+        bytes.extend(shape);
+        bytes.extend_from_slice(payload);
+        bytes
+    }
+
+    #[test]
+    fn lsm_overlay_geometry_styles_and_rotation_follow_java() {
+        use crate::common::ome_metadata::OmeShape;
+        let mut payload = 0i32.to_le_bytes().to_vec();
+        for value in [8.0f64, 9.0, 2.0, 3.0] {
+            payload.extend(value.to_le_bytes());
+        }
+        let rois = parse_lsm_overlays(&lsm_overlay_fixture(18, &payload), 8, true);
+        let OmeShape::Styled {
+            shape,
+            font_size,
+            stroke_width,
+            transform,
+        } = &rois[0].shapes[0]
+        else {
+            panic!("style missing")
+        };
+        assert_eq!(
+            (*font_size, *stroke_width, *transform),
+            (Some(12.0), Some(3.0), None)
+        );
+        assert!(
+            matches!(shape.as_ref(),OmeShape::Rectangle { x,y,width,height,.. } if (*x,*y,*width,*height)==(2.0,3.0,6.0,6.0))
+        );
+        let mut payload = 3i32.to_le_bytes().to_vec();
+        for (x, y) in [(10.0f64, 20.0f64), (13.0, 24.0), (8.0, 22.0)] {
+            payload.extend(x.to_le_bytes());
+            payload.extend(y.to_le_bytes());
+        }
+        let rois = parse_lsm_overlays(&lsm_overlay_fixture(19, &payload), 8, true);
+        let OmeShape::Styled {
+            shape,
+            transform: Some(transform),
+            ..
+        } = &rois[0].shapes[0]
+        else {
+            panic!("ellipse transform missing")
+        };
+        assert!(
+            matches!(shape.as_ref(),OmeShape::Ellipse{x,y,radius_x,radius_y,..} if (*x,*y,*radius_x)==(10.0,20.0,5.0) && (*radius_y-8f64.sqrt()).abs()<1e-12)
+        );
+        assert!((transform[0] - (-45.0f64).cos()).abs() < 1e-12);
+        // Java ignores overlay validity flags; unsupported palette emits no ROI.
+        assert!(parse_lsm_overlays(&lsm_overlay_fixture(25, &[0; 36]), 8, true).is_empty());
+        assert!(parse_lsm_overlays(&lsm_overlay_fixture(18, &payload)[..210], 8, true).is_empty());
+    }
+
+    #[test]
+    fn lsm_event_and_application_metadata_preserve_types() {
+        let mut bytes = vec![0u8; 16];
+        let event_offset = bytes.len() as u32;
+        bytes.extend(0i32.to_le_bytes());
+        bytes.extend(1i32.to_le_bytes());
+        bytes.extend(20i32.to_le_bytes());
+        bytes.extend(2.5f64.to_le_bytes());
+        bytes.extend(3i32.to_le_bytes());
+        bytes.extend(b"note");
+        let application_offset = bytes.len() as u32;
+        bytes.extend(0i32.to_le_bytes());
+        bytes.extend(3i32.to_le_bytes());
+        push_application_tag(&mut bytes, "Title", TYPE_ASCII, b"scan");
+        push_application_tag(&mut bytes, "Counter", TYPE_LONG, &17i32.to_le_bytes());
+        push_application_tag(&mut bytes, "Flag", 7, &0i32.to_le_bytes());
+        let mut info = LsmInfo::default();
+        info.event_list_offset = event_offset;
+        info.application_tag_offset = application_offset;
+        let meta = parse_lsm_original_metadata(&bytes, &info, true);
+        assert!(matches!(meta.get("Event Time"),Some(MetadataValue::Float(v)) if *v==2.5));
+        assert!(matches!(
+            meta.get("Event Type"),
+            Some(MetadataValue::Int(3))
+        ));
+        assert!(
+            matches!(meta.get("Event Description"),Some(MetadataValue::String(v)) if v=="note")
+        );
+        assert!(matches!(meta.get("Title"),Some(MetadataValue::String(v)) if v=="scan"));
+        assert!(matches!(meta.get("Counter"), Some(MetadataValue::Int(17))));
+        assert!(matches!(meta.get("Flag"), Some(MetadataValue::Bool(true))));
+    }
+
+    #[test]
+    fn lsm_experimenter_username_projects_to_ome() {
+        let mut reader = ZeissLsmReader::new();
+        reader.meta = Some(ImageMetadata {
+            size_c: 1,
+            ..Default::default()
+        });
+        reader.scan_info.recordings.push(LsmRecording {
+            user_name: Some("alice".into()),
+            ..Default::default()
+        });
+        let ome = reader.ome_metadata().unwrap();
+        assert_eq!(ome.experimenters[0].user_name.as_deref(), Some("alice"));
+        assert!(ome
+            .to_ome_xml(reader.metadata())
+            .contains("UserName=\"alice\""));
+    }
 
     #[test]
     fn lsm_plane_mapping_rejects_logical_planes_without_physical_ifds() {
@@ -2414,17 +3370,40 @@ mod tests {
         reader.image_names = vec![Some("multi #1".into()), Some("multi #2".into())];
         reader.timestamps = vec![10.0, 12.0, 100.0, 106.0];
         reader.positions = vec![[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]];
+        reader
+            .scan_info
+            .detection_channels
+            .push(LsmDetectionChannel {
+                acquire: true,
+                channel_name: Some("PMT".into()),
+                filter: Some("BP 500-550".into()),
+                ..Default::default()
+            });
+        reader
+            .scan_info
+            .block_order
+            .push(LsmScanBlockRef::DetectionChannel(0));
 
         reader.set_series(1).unwrap();
         assert_eq!(reader.series(), 1);
         assert_eq!(reader.metadata().image_count, 2);
 
         let ome = reader.ome_metadata().expect("OME metadata");
-        assert_eq!(ome.images[0].name.as_deref(), Some("multi #2"));
-        assert_eq!(ome.images[0].planes[0].delta_t, Some(0.0));
-        assert_eq!(ome.images[0].planes[1].delta_t, Some(6.0));
-        assert_eq!(ome.images[0].planes[0].position_x, Some(4.0));
-        assert_eq!(ome.images[0].planes[1].position_z, Some(6.0));
+        assert_eq!(ome.images.len(), 2);
+        assert_eq!(
+            ome.images[0].light_paths[0].emission_filter_ids,
+            vec!["Filter:0:0"]
+        );
+        assert!(ome.images[1].light_paths[0].emission_filter_ids.is_empty());
+
+        assert_eq!(ome.images[0].name.as_deref(), Some("multi #1"));
+        assert_eq!(ome.images[0].planes[1].delta_t, Some(2.0));
+        assert_eq!(ome.instruments.len(), 1);
+        assert_eq!(ome.images[1].name.as_deref(), Some("multi #2"));
+        assert_eq!(ome.images[1].planes[0].delta_t, Some(0.0));
+        assert_eq!(ome.images[1].planes[1].delta_t, Some(6.0));
+        assert_eq!(ome.images[1].planes[0].position_x, Some(4.0));
+        assert_eq!(ome.images[1].planes[1].position_z, Some(6.0));
     }
 
     #[test]
@@ -2801,7 +3780,7 @@ mod tests {
         );
         assert_eq!(
             info.channel_wavelength_offset, 0,
-            "checked-in LSM fixture cannot exercise Java channel-wavelength table parsing"
+            "checked-in LSM fixture has no wavelength pointer; Java retains but never consumes this table"
         );
 
         let mut reader = ZeissLsmReader::new();

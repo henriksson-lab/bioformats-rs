@@ -227,12 +227,20 @@ impl Default for SvsReader {
 /// `SvsReader` above and the crate's generic SubIFD-pyramid `TiffReader`).
 pub struct PyramidTiffReader {
     inner: crate::tiff::TiffReader,
+    thumbnail_ifds: Vec<usize>,
+    flattened_resolutions: bool,
+    current_public_series: usize,
+    flattened_metadata: Option<ImageMetadata>,
 }
 
 impl PyramidTiffReader {
     pub fn new() -> Self {
         PyramidTiffReader {
             inner: crate::tiff::TiffReader::new(),
+            thumbnail_ifds: Vec::new(),
+            flattened_resolutions: true,
+            current_public_series: 0,
+            flattened_metadata: None,
         }
     }
 
@@ -270,11 +278,36 @@ impl PyramidTiffReader {
     /// IFD into its own series (`build_series` groups by dimensions). We collapse
     /// those into one multi-resolution series by moving the trailing series'
     /// IFD indices into `sub_resolutions` of the first.
-    fn init_standard_metadata(&mut self) {
-        let series = self.inner.series_list();
+    fn init_standard_metadata(&mut self) -> Result<()> {
+        let original = self.inner.metadata().series_metadata.clone();
+        // Java builds one resolution core per main IFD, including equally sized IFDs.
+        self.inner.split_ifds_into_single_ifd_series_xyczt()?;
+        if let Some(first) = self.inner.series_list_mut().first_mut() {
+            first.metadata.series_metadata.extend(original);
+        }
+        // MinimalTiffReader.initFile separates reduced main IFDs from the
+        // image IFD list before PyramidTiffReader builds resolution cores.
+        self.thumbnail_ifds = (0..self.inner.ifd_count())
+            .filter(|index| {
+                self.inner.ifd_count() > 1
+                    && self
+                        .inner
+                        .ifd(*index)
+                        .and_then(|ifd| ifd.get_u32(crate::tiff::ifd::tag::NEW_SUBFILE_TYPE))
+                        == Some(1)
+            })
+            .collect();
+        let series: Vec<_> = self
+            .inner
+            .series_list()
+            .iter()
+            .filter(|series| !self.thumbnail_ifds.contains(&series.ifd_indices[0]))
+            .cloned()
+            .collect();
         if series.len() <= 1 {
+            self.inner.replace_series(series);
             // Single IFD (or empty): nothing to regroup; resolutionCount stays 1.
-            return;
+            return Ok(());
         }
 
         // Each pre-existing series maps to one pyramid resolution level, in
@@ -289,6 +322,7 @@ impl PyramidTiffReader {
         base.metadata.thumbnail = false;
 
         self.inner.replace_series(vec![base]);
+        Ok(())
     }
 }
 
@@ -317,24 +351,62 @@ impl FormatReader for PyramidTiffReader {
         self.inner.close()?;
         self.inner.set_flattened_resolutions(false)?;
         self.inner.set_id(path)?;
-        self.init_standard_metadata();
-        Ok(())
+        self.init_standard_metadata()?;
+        self.set_series(0)
     }
 
     fn close(&mut self) -> Result<()> {
+        self.current_public_series = 0;
+        self.flattened_metadata = None;
+        self.thumbnail_ifds.clear();
         self.inner.close()
     }
     fn series_count(&self) -> usize {
-        self.inner.series_count()
+        if self.flattened_resolutions && self.inner.series_count() > 0 {
+            self.inner.series_list()[0].metadata.resolution_count.max(1) as usize
+        } else {
+            self.inner.series_count()
+        }
     }
     fn set_series(&mut self, series: usize) -> Result<()> {
-        self.inner.set_series(series)
+        if series >= self.series_count() {
+            return Err(BioFormatsError::SeriesOutOfRange(series));
+        }
+        self.current_public_series = series;
+        self.inner.set_series(if self.flattened_resolutions {
+            0
+        } else {
+            series
+        })?;
+        self.flattened_metadata = None;
+        if self.flattened_resolutions {
+            self.inner.set_resolution(series)?;
+            let mut meta = self.inner.metadata().clone();
+            meta.resolution_count = 1;
+            meta.thumbnail = series > 0;
+            self.flattened_metadata = Some(meta);
+        }
+        Ok(())
     }
     fn series(&self) -> usize {
-        self.inner.series()
+        self.current_public_series
     }
     fn metadata(&self) -> &ImageMetadata {
-        self.inner.metadata()
+        self.flattened_metadata
+            .as_ref()
+            .unwrap_or_else(|| self.inner.metadata())
+    }
+    fn has_flattened_resolutions(&self) -> bool {
+        self.flattened_resolutions
+    }
+    fn set_flattened_resolutions(&mut self, flattened: bool) -> Result<()> {
+        if self.inner.series_count() > 0 {
+            return Err(BioFormatsError::Format(
+                "set_flattened_resolutions must be called before set_id".into(),
+            ));
+        }
+        self.flattened_resolutions = flattened;
+        Ok(())
     }
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
         self.inner.open_bytes(plane_index)
@@ -350,14 +422,56 @@ impl FormatReader for PyramidTiffReader {
         self.inner.open_bytes_region(plane_index, x, y, w, h)
     }
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        self.inner.open_thumb_bytes(plane_index)
+        if self.inner.series_count() == 0 {
+            return Err(BioFormatsError::NotInitialized);
+        }
+        let dimensions = self
+            .thumbnail_ifds
+            .first()
+            .and_then(|index| self.inner.ifd(*index))
+            .map(|ifd| {
+                (
+                    ifd.image_width().unwrap_or(1),
+                    ifd.image_length().unwrap_or(1),
+                )
+            });
+        if let Some(index) = self.thumbnail_ifds.get(plane_index as usize).copied() {
+            let ifd = self.inner.ifd(index).unwrap();
+            let bits = ifd.bits_per_sample();
+            let metadata = self.metadata();
+            let samples = if metadata.is_rgb {
+                metadata.size_c.max(1)
+            } else {
+                1
+            };
+            if bits.first().is_some_and(|bits| {
+                (*bits as usize).div_ceil(8) == metadata.pixel_type.bytes_per_sample()
+            }) && bits.len() == samples as usize
+            {
+                let (width, height) = dimensions.unwrap();
+                return self
+                    .inner
+                    .read_physical_ifd_region(index, 0, 0, width, height);
+            }
+        }
+        crate::common::thumbnail::open_thumb_bytes(self, plane_index, dimensions)
     }
     fn compressed_level_info(
         &self,
         plane_index: u32,
         level: u32,
     ) -> Result<CompressedExtractionSupport> {
-        self.inner.compressed_level_info(plane_index, level)
+        if self.flattened_resolutions && level != 0 {
+            return Err(BioFormatsError::PlaneOutOfRange(level));
+        }
+        self.inner.compressed_level_info(
+            plane_index,
+            if self.flattened_resolutions {
+                self.current_public_series as u32
+            } else {
+                level
+            },
+        )
     }
     fn read_compressed_tile(
         &mut self,
@@ -367,17 +481,44 @@ impl FormatReader for PyramidTiffReader {
         row: u64,
         preferred_modes: &[CompressedTileMode],
     ) -> Result<CompressedTile> {
-        self.inner
-            .read_compressed_tile(plane_index, level, col, row, preferred_modes)
+        if self.flattened_resolutions && level != 0 {
+            return Err(BioFormatsError::PlaneOutOfRange(level));
+        }
+        self.inner.read_compressed_tile(
+            plane_index,
+            if self.flattened_resolutions {
+                self.current_public_series as u32
+            } else {
+                level
+            },
+            col,
+            row,
+            preferred_modes,
+        )
     }
     fn resolution_count(&self) -> usize {
-        self.inner.resolution_count()
+        if self.flattened_resolutions {
+            1
+        } else {
+            self.inner.resolution_count()
+        }
     }
     fn set_resolution(&mut self, level: usize) -> Result<()> {
+        if self.flattened_resolutions {
+            return if level == 0 {
+                Ok(())
+            } else {
+                Err(BioFormatsError::PlaneOutOfRange(level as u32))
+            };
+        }
         self.inner.set_resolution(level)
     }
     fn resolution(&self) -> usize {
-        self.inner.resolution()
+        if self.flattened_resolutions {
+            0
+        } else {
+            self.inner.resolution()
+        }
     }
 
     /// Mirror Java `PyramidTiffReader.initMetadataStore()`: name each OME image
@@ -388,16 +529,36 @@ impl FormatReader for PyramidTiffReader {
         if series.is_empty() {
             return None;
         }
-        let images = series
-            .iter()
-            .enumerate()
-            .map(|(i, s)| OmeImage {
-                name: Some(format!("Series {}", i + 1)),
-                channels: vec![OmeChannel {
-                    samples_per_pixel: s.metadata.size_c.max(1),
+        let base_calibration = self
+            .inner
+            .ome_metadata()
+            .and_then(|o| o.images.first().cloned())
+            .unwrap_or_default();
+        let count = self.series_count();
+        let images = (0..count)
+            .map(|i| {
+                let meta = if self.flattened_resolutions {
+                    self.inner
+                        .metadata_at(0, i)
+                        .unwrap_or_else(|_| series[0].metadata.clone())
+                } else {
+                    series[i].metadata.clone()
+                };
+                OmeImage {
+                    pixels: Some((&meta).into()),
+                    name: Some(format!("Series {}", i + 1)),
+                    physical_size_x: base_calibration
+                        .physical_size_x
+                        .map(|v| v * series[0].metadata.size_x as f64 / meta.size_x as f64),
+                    physical_size_y: base_calibration
+                        .physical_size_y
+                        .map(|v| v * series[0].metadata.size_y as f64 / meta.size_y as f64),
+                    channels: vec![OmeChannel {
+                        samples_per_pixel: meta.size_c.max(1),
+                        ..Default::default()
+                    }],
                     ..Default::default()
-                }],
-                ..Default::default()
+                }
             })
             .collect();
         Some(OmeMetadata {
@@ -593,7 +754,15 @@ impl FormatReader for SvsReader {
                     .unwrap_or_else(|_| self.inner.series_list()[logical_series].metadata.clone());
                 owned_meta.resolution_count = 1;
                 let m = &owned_meta;
-                let (px, py) = if i == 0 { (mpp, mpp) } else { (None, None) };
+                let (px, py) = if i == 0 {
+                    (mpp, mpp)
+                } else if resolution > 0 {
+                    let base = &self.inner.series_list()[logical_series].metadata;
+                    let scaled = mpp.map(|v| v * base.size_x as f64 / m.size_x as f64);
+                    (scaled, scaled)
+                } else {
+                    (None, None)
+                };
                 let name = Some(format!("Series {}", i + 1));
                 let mut channel = OmeChannel {
                     samples_per_pixel: m.size_c.max(1),
@@ -986,12 +1155,74 @@ mod pyramid_tiff_tests {
     }
 
     #[test]
+    fn pyramid_tiff_reduced_ifd_is_specialized_thumbnail_not_resolution() {
+        let path =
+            std::env::temp_dir().join(format!("bf_pyramid_thumbnail_{}.tif", std::process::id()));
+        let mut bytes = build_pyramid_tiff("Faas");
+        // Replace IFD1's Software entry with NewSubfileType=1. IFD0 still
+        // identifies the file as Faas; this IFD belongs to thumbnailIFDs.
+        let entry = 8 + (2 + 9 * 12 + 4) + 2 + 8 * 12;
+        bytes[entry..entry + 2].copy_from_slice(&tag::NEW_SUBFILE_TYPE.to_le_bytes());
+        bytes[entry + 2..entry + 4].copy_from_slice(&4u16.to_le_bytes());
+        bytes[entry + 4..entry + 8].copy_from_slice(&1u32.to_le_bytes());
+        bytes[entry + 8..entry + 12].copy_from_slice(&1u32.to_le_bytes());
+        std::fs::write(&path, bytes).unwrap();
+        let mut reader = PyramidTiffReader::new();
+        reader.set_id(&path).unwrap();
+        assert_eq!(reader.series_count(), 1);
+        assert_eq!(reader.resolution_count(), 1);
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![0xAB; 16]);
+        assert_eq!(reader.open_thumb_bytes(0).unwrap(), vec![0xCD; 4]);
+        assert_eq!((reader.metadata().size_x, reader.metadata().size_y), (4, 4));
+        reader.close().unwrap();
+        std::fs::write(&path, build_pyramid_tiff("Faas")).unwrap();
+        reader.set_id(&path).unwrap();
+        assert_eq!(reader.series_count(), 2);
+        assert_eq!(reader.open_thumb_bytes(0).unwrap(), vec![0xAB; 16]);
+        reader.set_series(1).unwrap();
+        assert_eq!(reader.open_thumb_bytes(0).unwrap(), vec![0xCD; 4]);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn pyramid_tiff_defaults_to_flattened_series_and_preserves_level_pixels() {
+        let path =
+            std::env::temp_dir().join(format!("pyramid_faas_flat_{}.tif", std::process::id()));
+        std::fs::write(&path, build_pyramid_tiff("Faas")).unwrap();
+        let mut reader = PyramidTiffReader::new();
+        reader.set_id(&path).unwrap();
+        assert_eq!(reader.series_count(), 2);
+        assert_eq!(reader.resolution_count(), 1);
+        let base = reader.open_bytes(0).unwrap();
+        assert_eq!(base.len(), 16);
+        reader.set_series(1).unwrap();
+        assert_eq!((reader.metadata().size_x, reader.metadata().size_y), (2, 2));
+        assert_eq!(reader.metadata().resolution_count, 1);
+        assert!(reader.is_thumbnail_series());
+        assert_eq!(reader.open_bytes(0).unwrap().len(), 4);
+        assert!(reader.set_resolution(1).is_err());
+        reader.set_resolution(0).unwrap();
+        assert_eq!(reader.metadata().size_x, 2);
+        let ome = reader.ome_metadata().unwrap();
+        assert_eq!(ome.images.len(), 2);
+        assert_eq!(ome.images[1].name.as_deref(), Some("Series 2"));
+        assert!(reader.set_flattened_resolutions(false).is_err());
+        reader.close().unwrap();
+        reader.set_flattened_resolutions(false).unwrap();
+        reader.set_id(&path).unwrap();
+        assert_eq!(reader.series_count(), 1);
+        assert_eq!(reader.resolution_count(), 2);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn maps_ifd_chain_to_resolution_levels() {
         let faas = build_pyramid_tiff("Faas");
         let path = std::env::temp_dir().join(format!("pyramid_faas_{}.tif", std::process::id()));
         std::fs::write(&path, &faas).unwrap();
 
         let mut reader = PyramidTiffReader::new();
+        reader.set_flattened_resolutions(false).unwrap();
         reader.set_id(&path).unwrap();
 
         // The two top-level IFDs collapse into a single multi-resolution series.
@@ -1070,6 +1301,11 @@ mod pyramid_tiff_tests {
             4,
             "full resolution, sub-resolution, label, and macro public series"
         );
+        let ome = reader.ome_metadata().unwrap();
+        assert_eq!(ome.images[0].physical_size_x, Some(0.25));
+        assert_eq!(ome.images[1].physical_size_x, Some(0.5));
+        assert_eq!(ome.images[1].physical_size_y, Some(0.5));
+        assert_eq!(ome.images[2].physical_size_x, None);
         assert_eq!(reader.resolution_count(), 1);
         assert_eq!((reader.metadata().size_x, reader.metadata().size_y), (4, 4));
         assert_eq!(reader.open_bytes(0).unwrap(), vec![0x11; 16]);

@@ -2615,6 +2615,14 @@ impl VentanaReader {
                 .metadata_at(logical_series, resolution)
                 .map(|metadata| metadata.size_c.max(1))
                 .unwrap_or(1);
+            let physical = physical.map(|value| {
+                let base = &self.inner.series_list()[logical_series].metadata;
+                let current = self
+                    .inner
+                    .metadata_at(logical_series, resolution)
+                    .unwrap_or_else(|_| base.clone());
+                value * base.size_x as f64 / current.size_x as f64
+            });
             self.ome_images.push(OmeImage {
                 name: Some(format!("{file_name} #{}", i + 1)),
                 physical_size_x: physical,

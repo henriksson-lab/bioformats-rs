@@ -363,8 +363,14 @@ impl BrukerReader {
         self.users = vec![None; series_count];
         self.timestamps = vec![None; series_count];
 
+        let subject = parent.join("subject");
+        let mut subject_metadata = SeriesParse::default();
+        if subject.is_file() {
+            subject_metadata.parse_lines(&read_text(&subject)?);
+        }
         for series in 0..series_count {
             let mut p = SeriesParse::default();
+            p.meta.extend(subject_metadata.meta.clone());
 
             // acqp (required)
             let acq_path = acqp_files.get(series).ok_or_else(|| {
@@ -511,6 +517,45 @@ impl Default for BrukerReader {
 }
 
 impl FormatReader for BrukerReader {
+    fn axis_orientations(&self) -> [Option<crate::common::orientation::Orientation>; 5] {
+        use crate::common::orientation::{AnatomicalOrientation::*, Orientation, OrientationType};
+        let meta = self.metadata();
+        let value = |key| match meta.series_metadata.get(key) {
+            Some(MetadataValue::String(s)) => Some(s.as_str()),
+            _ => None,
+        };
+        let terms = match (
+            value("SUBJECT_type"),
+            value("SUBJECT_entry"),
+            value("SUBJECT_position"),
+        ) {
+            (Some(kind), Some(entry), Some(pose))
+                if kind.eq_ignore_ascii_case("human")
+                    && entry
+                        .rsplit('_')
+                        .next()
+                        .unwrap_or(entry)
+                        .to_ascii_lowercase()
+                        .starts_with("head")
+                    && pose
+                        .rsplit('_')
+                        .next()
+                        .unwrap_or(pose)
+                        .eq_ignore_ascii_case("supine") =>
+            {
+                Some([RightToLeft, SuperiorToInferior, PosteriorToAnterior])
+            }
+            _ => None,
+        };
+        let mut axes = [None; 5];
+        if let Some(terms) = terms {
+            for (term, i) in terms.into_iter().zip([0, 1, 4]) {
+                axes[i] = Some(Orientation::new(OrientationType::Anatomical, term));
+            }
+        }
+        axes
+    }
+
     fn is_this_type_by_name(&self, path: &Path) -> bool {
         // suffixSufficient = false: the file *name* must be exactly fid or acqp.
         matches!(
@@ -1253,6 +1298,7 @@ mod tests {
         let pdata1 = acq_dir.join("pdata").join("1");
         fs::create_dir_all(&pdata1).unwrap();
 
+        fs::write(root.join("subject"), "##$SUBJECT_type=Human\n##$SUBJECT_entry=SUBJECT_ENTRY_Head\n##$SUBJECT_position=SUBJECT_POSITION_Supine\n").unwrap();
         let acqp = "##$NI=1\n##$NR=1\n##$ACQ_ns_list_size=1\n##$BYTORDA=little\n\
                     ##$ACQ_time=15:14:00  5 Jan 2015\n\
                     ##$ACQ_institution=( 60 )\n<My Institute>\n\
@@ -1274,6 +1320,17 @@ mod tests {
 
         let mut reader = BrukerReader::new();
         reader.set_id(&acq_dir.join("acqp")).unwrap();
+        use crate::common::orientation::AnatomicalOrientation::*;
+        assert_eq!(
+            reader.axis_orientations().map(|o| o.map(|v| v.term)),
+            [
+                Some(RightToLeft),
+                Some(SuperiorToInferior),
+                None,
+                None,
+                Some(PosteriorToAnterior)
+            ]
+        );
 
         assert_eq!(reader.series_count(), 1);
         let m = reader.metadata();

@@ -2323,6 +2323,14 @@ fn direct_tiff_set_ome_metadata_populates_required_channels() {
     assert!(text.contains(r#"<Image ID="Image:0""#));
     assert!(text.contains(r#"<Channel ID="Channel:0:0" SamplesPerPixel="1""#));
     assert!(text.contains(r#"<Channel ID="Channel:0:1" SamplesPerPixel="1""#));
+    assert!(text.contains("<TiffData/>"));
+    assert!(!text.contains("<MetadataOnly/>"));
+    let mut reader = ImageReader::new();
+    reader.set_id(&path).unwrap();
+    assert_eq!(reader.open_bytes(0).unwrap(), vec![1]);
+    assert_eq!(reader.open_bytes(1).unwrap(), vec![2]);
+    reader.close().unwrap();
+    let _ = std::fs::remove_file(path);
 }
 
 #[test]

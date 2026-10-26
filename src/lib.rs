@@ -72,3 +72,7 @@ pub use pixel::PixelType;
 pub use reader::FormatReader;
 pub use registry::{ImageReader, ImageReaderOptions};
 pub use writer_registry::ImageWriter;
+
+pub use common::orientation::{
+    AnatomicalOrientation, Orientation, OrientationTerm, OrientationType,
+};

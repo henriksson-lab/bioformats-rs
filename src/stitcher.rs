@@ -46,6 +46,9 @@ pub struct FileStitcher {
     no_stitch: bool,
     /// The currently-open reader (index into `files`).
     current_reader: Option<(usize, Box<dyn FormatReader>)>,
+    /// Reader configuration is retained for initial probing and lazy reopen.
+    reader_options: crate::registry::ImageReaderOptions,
+    flattened_resolutions: bool,
 }
 
 impl FileStitcher {
@@ -54,6 +57,13 @@ impl FileStitcher {
     /// Discovers related files by analyzing the filename for numeric patterns
     /// and finding all files that match the same pattern.
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with_options(path, crate::registry::ImageReaderOptions::default())
+    }
+
+    pub fn open_with_options(
+        path: &Path,
+        options: crate::registry::ImageReaderOptions,
+    ) -> Result<Self> {
         let files = discover_sequence(path)?;
         if files.is_empty() {
             return Err(BioFormatsError::Format(
@@ -61,43 +71,67 @@ impl FileStitcher {
             ));
         }
 
-        Self::from_discovered_files(files, FilePattern::from_file(path).ok())
+        Self::from_discovered_files(files, FilePattern::from_file(path).ok(), options)
     }
 
     /// Open with explicit file list (no auto-discovery).
     pub fn from_files(files: Vec<PathBuf>) -> Result<Self> {
-        if files.is_empty() {
-            return Err(BioFormatsError::Format("Empty file list".into()));
-        }
-
-        let pattern = FilePattern::from_file_list(&files).ok();
-        Self::from_discovered_files(files, pattern)
+        Self::from_files_with_options(files, crate::registry::ImageReaderOptions::default())
     }
 
-    /// Open with an explicit file list and the `.pattern` text that produced it.
-    pub fn from_files_with_pattern(files: Vec<PathBuf>, pattern_path: &Path) -> Result<Self> {
-        if files.is_empty() {
-            return Err(BioFormatsError::Format("Empty file list".into()));
-        }
-
-        let pattern = FilePattern::from_explicit_pattern(pattern_path)?;
-        Self::from_discovered_files(files, Some(pattern))
-    }
-
-    /// Open with an explicit file list and an already-parsed file pattern.
-    pub(crate) fn from_files_with_file_pattern(
+    pub fn from_files_with_options(
         files: Vec<PathBuf>,
-        pattern: FilePattern,
+        options: crate::registry::ImageReaderOptions,
     ) -> Result<Self> {
         if files.is_empty() {
             return Err(BioFormatsError::Format("Empty file list".into()));
         }
 
-        Self::from_discovered_files(files, Some(pattern))
+        let pattern = FilePattern::from_file_list(&files).ok();
+        Self::from_discovered_files(files, pattern, options)
     }
 
-    fn from_discovered_files(files: Vec<PathBuf>, pattern: Option<FilePattern>) -> Result<Self> {
-        let mut first = crate::registry::ImageReader::open(&files[0])?;
+    /// Open with an explicit file list and the `.pattern` text that produced it.
+    pub fn from_files_with_pattern(files: Vec<PathBuf>, pattern_path: &Path) -> Result<Self> {
+        Self::from_files_with_pattern_and_options(
+            files,
+            pattern_path,
+            crate::registry::ImageReaderOptions::default(),
+        )
+    }
+
+    pub fn from_files_with_pattern_and_options(
+        files: Vec<PathBuf>,
+        pattern_path: &Path,
+        options: crate::registry::ImageReaderOptions,
+    ) -> Result<Self> {
+        if files.is_empty() {
+            return Err(BioFormatsError::Format("Empty file list".into()));
+        }
+
+        let pattern = FilePattern::from_explicit_pattern(pattern_path)?;
+        Self::from_discovered_files(files, Some(pattern), options)
+    }
+
+    /// Open an expanded glob while retaining the wrapped reader's options.
+    pub(crate) fn from_files_with_file_pattern_and_options(
+        files: Vec<PathBuf>,
+        pattern: FilePattern,
+        options: crate::registry::ImageReaderOptions,
+    ) -> Result<Self> {
+        if files.is_empty() {
+            return Err(BioFormatsError::Format("Empty file list".into()));
+        }
+        Self::from_discovered_files(files, Some(pattern), options)
+    }
+
+    fn from_discovered_files(
+        files: Vec<PathBuf>,
+        pattern: Option<FilePattern>,
+        options: crate::registry::ImageReaderOptions,
+    ) -> Result<Self> {
+        let mut first = crate::registry::ImageReader::open_with_options(&files[0], options)?;
+        let flattened_resolutions = first.has_flattened_resolutions();
         if files.len() == 1 {
             let mut metas = Vec::with_capacity(first.series_count());
             let mut plane_maps = Vec::with_capacity(first.series_count());
@@ -121,6 +155,8 @@ impl FileStitcher {
                 resolution_meta: None,
                 no_stitch: true,
                 current_reader: None,
+                reader_options: options,
+                flattened_resolutions,
             });
         }
 
@@ -142,6 +178,8 @@ impl FileStitcher {
             resolution_meta: None,
             no_stitch: false,
             current_reader: None,
+            reader_options: options,
+            flattened_resolutions,
         })
     }
 
@@ -182,15 +220,13 @@ impl FileStitcher {
         if let Some((_, mut r)) = self.current_reader.take() {
             let _ = r.close();
         }
-        let reader = open_reader(&self.files[file_idx])?;
+        let reader = crate::registry::open_reader_boxed_with_options(
+            &self.files[file_idx],
+            self.reader_options,
+        )?;
         self.current_reader = Some((file_idx, reader));
         Ok(&mut self.current_reader.as_mut().unwrap().1)
     }
-}
-
-/// Open a format reader for the given file.
-fn open_reader(path: &Path) -> Result<Box<dyn FormatReader>> {
-    crate::registry::open_reader(path)
 }
 
 /// Discover a file sequence from a single exemplar file.
@@ -684,6 +720,21 @@ fn zct_to_plane(z: u32, c: u32, t: u32, meta: &ImageMetadata) -> Option<u32> {
 }
 
 impl FormatReader for FileStitcher {
+    fn has_flattened_resolutions(&self) -> bool {
+        self.flattened_resolutions
+    }
+
+    fn set_flattened_resolutions(&mut self, flattened: bool) -> Result<()> {
+        if !self.files.is_empty() {
+            return Err(BioFormatsError::Format(
+                "set_flattened_resolutions must be called before set_id".into(),
+            ));
+        }
+        self.flattened_resolutions = flattened;
+        self.reader_options = self.reader_options.flattened_resolutions(flattened);
+        Ok(())
+    }
+
     fn is_this_type_by_name(&self, _path: &Path) -> bool {
         false
     }
@@ -692,7 +743,7 @@ impl FormatReader for FileStitcher {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        *self = Self::open(path)?;
+        *self = Self::open_with_options(path, self.reader_options)?;
         Ok(())
     }
 
@@ -776,7 +827,13 @@ impl FormatReader for FileStitcher {
                 .ok_or(BioFormatsError::NotInitialized)?;
             let reader = self.ensure_reader(file_idx)?;
             Self::set_reader_position(reader, local_series, level)?;
-            self.resolution_meta = Some(reader.metadata().clone());
+            let child_meta = reader.metadata().clone();
+            let mut meta = self.metas[self.current_series].clone();
+            // The child supplies active spatial geometry; the stitcher keeps
+            // its cross-file Z/C/T axes and logical plane map.
+            meta.size_x = child_meta.size_x;
+            meta.size_y = child_meta.size_y;
+            self.resolution_meta = Some(meta);
         }
         Ok(())
     }
@@ -3329,6 +3386,8 @@ mod tests {
             resolution_meta: None,
             no_stitch: false,
             current_reader: None,
+            reader_options: crate::registry::ImageReaderOptions::default(),
+            flattened_resolutions: true,
         };
 
         let ome = stitcher.ome_metadata().unwrap();

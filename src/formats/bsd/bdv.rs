@@ -773,7 +773,14 @@ impl FormatReader for BdvReader {
                 None => format!("P_t{first_timepoint:05}, W_s{:02}_{}", si.setup, ri.level),
             };
             let (psx, psy, psz) = match si.voxel_size {
-                Some((x, y, z)) => (Some(x), Some(y), Some(z)),
+                Some((x, y, z)) => {
+                    let original = &self.series.first()?.resolutions.first()?.meta;
+                    (
+                        Some(x * original.size_x as f64 / ri.meta.size_x as f64),
+                        Some(y * original.size_y as f64 / ri.meta.size_y as f64),
+                        Some(z * original.size_z as f64 / ri.meta.size_z as f64),
+                    )
+                }
                 None => (None, None, None),
             };
             let base_meta = &ri.meta;
@@ -1405,9 +1412,14 @@ mod tests {
                     },
                 },
             ],
-            voxel_size: None,
+            voxel_size: Some((0.5, 0.75, 2.0)),
         });
         r.rebuild_public_series();
+        let ome = r.ome_metadata().unwrap();
+        assert_eq!(ome.images[0].physical_size_x, Some(0.5));
+        assert_eq!(ome.images[1].physical_size_x, Some(1.0));
+        assert_eq!(ome.images[1].physical_size_y, Some(1.125));
+        assert_eq!(ome.images[1].physical_size_z, Some(2.0));
 
         assert_eq!(r.series_count(), 2);
         assert_eq!(r.resolution_count(), 1);

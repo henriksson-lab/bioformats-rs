@@ -2556,6 +2556,7 @@ fn imaris_ome_instrument(instrument: &ImarisInstrumentMetadata) -> Option<OmeIns
         || instrument.objective_working_distance.is_some()
     {
         ome_instrument.objectives.push(OmeObjective {
+            iris: None,
             id: Some(create_lsid("Objective", &[0, 0])),
             model: instrument.objective_model.clone(),
             manufacturer: instrument.objective_manufacturer.clone(),
@@ -2576,6 +2577,11 @@ fn imaris_ome_instrument(instrument: &ImarisInstrumentMetadata) -> Option<OmeIns
         || instrument.detector_offset.is_some()
     {
         ome_instrument.detectors.push(OmeDetector {
+            voltage: None,
+            zoom: None,
+            amplification_gain: None,
+            serial_number: None,
+            lot_number: None,
             id: Some(create_lsid("Detector", &[0, 0])),
             model: instrument.detector_model.clone(),
             manufacturer: instrument.detector_manufacturer.clone(),
@@ -2591,6 +2597,10 @@ fn imaris_ome_instrument(instrument: &ImarisInstrumentMetadata) -> Option<OmeIns
         || instrument.light_source_power.is_some()
     {
         ome_instrument.light_sources.push(OmeLightSource {
+            laser_type: None,
+            laser_medium: None,
+            serial_number: None,
+            lot_number: None,
             id: Some(create_lsid("LightSource", &[0, 0])),
             model: instrument.light_source_model.clone(),
             manufacturer: instrument.light_source_manufacturer.clone(),

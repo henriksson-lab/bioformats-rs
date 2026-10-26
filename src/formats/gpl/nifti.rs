@@ -357,6 +357,7 @@ fn optional_dim(value: i16, label: &str) -> Result<u32> {
 // ── Reader ────────────────────────────────────────────────────────────────────
 
 pub struct NiftiReader {
+    axes: [Option<crate::common::orientation::Orientation>; 5],
     hdr_path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
     data_path: Option<PathBuf>,
@@ -368,6 +369,7 @@ pub struct NiftiReader {
 impl NiftiReader {
     pub fn new() -> Self {
         NiftiReader {
+            axes: [None; 5],
             hdr_path: None,
             meta: None,
             data_path: None,
@@ -424,6 +426,10 @@ impl Default for NiftiReader {
 }
 
 impl FormatReader for NiftiReader {
+    fn axis_orientations(&self) -> [Option<crate::common::orientation::Orientation>; 5] {
+        self.axes
+    }
+
     fn is_this_type_by_name(&self, path: &Path) -> bool {
         let name = path.to_string_lossy().to_ascii_lowercase();
         // Java NiftiReader.isThisType(String, open) accepts ".nii" by suffix
@@ -470,7 +476,65 @@ impl FormatReader for NiftiReader {
         }
 
         let hdr = parse_header(&hdr_bytes)?;
-        let meta = build_metadata(&hdr)?;
+        let mut meta = build_metadata(&hdr)?;
+        use crate::common::orientation::{AnatomicalOrientation::*, Orientation, OrientationType};
+        let terms = if hdr.magic == [0; 4] {
+            let (description, terms) = match hdr_bytes[252] {
+                0 => (
+                    "transverse unflipped",
+                    [RightToLeft, PosteriorToAnterior, InferiorToSuperior],
+                ),
+                1 => (
+                    "coronal unflipped",
+                    [RightToLeft, InferiorToSuperior, PosteriorToAnterior],
+                ),
+                2 => (
+                    "sagittal unflipped",
+                    [PosteriorToAnterior, InferiorToSuperior, RightToLeft],
+                ),
+                3 => (
+                    "transverse flipped",
+                    [RightToLeft, AnteriorToPosterior, InferiorToSuperior],
+                ),
+                4 => (
+                    "coronal flipped",
+                    [RightToLeft, SuperiorToInferior, PosteriorToAnterior],
+                ),
+                5 => (
+                    "sagittal flipped",
+                    [PosteriorToAnterior, SuperiorToInferior, RightToLeft],
+                ),
+                value => {
+                    meta.series_metadata.insert(
+                        "Orientation".into(),
+                        MetadataValue::String(value.to_string()),
+                    );
+                    self.axes = [None; 5];
+                    ("", [RightToLeft, PosteriorToAnterior, InferiorToSuperior])
+                }
+            };
+            if !description.is_empty() {
+                meta.series_metadata.insert(
+                    "Orientation".into(),
+                    MetadataValue::String(description.into()),
+                );
+            }
+            (!description.is_empty()).then_some(terms)
+        } else {
+            Some([LeftToRight, PosteriorToAnterior, InferiorToSuperior])
+        };
+        self.axes = [None; 5];
+        if let Some(terms) = terms {
+            for (i, position) in [0, 1, 3].into_iter().enumerate() {
+                let mut axis = Orientation::new(OrientationType::Anatomical, terms[i]);
+                if hdr.magic != [0; 4]
+                    && read_f32(&hdr_bytes, 280 + i * 20, hdr.little_endian) < 0.0
+                {
+                    axis = axis.flip();
+                }
+                self.axes[position] = Some(axis);
+            }
+        }
 
         // Determine data file and offset
         let is_hdr = path_str.ends_with(".hdr");
@@ -501,6 +565,7 @@ impl FormatReader for NiftiReader {
     }
 
     fn close(&mut self) -> Result<()> {
+        self.axes = [None; 5];
         self.hdr_path = None;
         self.meta = None;
         self.data_path = None;
@@ -716,6 +781,55 @@ mod tests {
 
     fn tmp_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("bioformats_nifti_{}_{}", std::process::id(), name))
+    }
+
+    #[test]
+    fn nifti_orientation_uses_transform_signs_and_clears_on_close() {
+        use crate::common::orientation::AnatomicalOrientation::*;
+        let path = tmp_path("orientation.nii");
+        let mut bytes = synthetic_header(0);
+        for (offset, value) in [(280, -1.0f32), (300, 1.0), (320, -2.0)] {
+            bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        std::fs::write(&path, bytes).unwrap();
+        let mut reader = NiftiReader::new();
+        reader.set_id(&path).unwrap();
+        assert_eq!(
+            reader.axis_orientations().map(|o| o.map(|v| v.term)),
+            [
+                Some(RightToLeft),
+                Some(PosteriorToAnterior),
+                None,
+                Some(SuperiorToInferior),
+                None
+            ]
+        );
+        reader.close().unwrap();
+        assert_eq!(reader.axis_orientations(), [None; 5]);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn analyze_orientation_uses_header_code() {
+        use crate::common::orientation::AnatomicalOrientation::*;
+        let path = tmp_path("analyze_orientation.hdr");
+        let mut bytes = synthetic_header(0);
+        bytes[344..348].fill(0);
+        bytes[252] = 5;
+        std::fs::write(&path, bytes).unwrap();
+        let mut reader = NiftiReader::new();
+        reader.set_id(&path).unwrap();
+        assert_eq!(
+            reader.axis_orientations().map(|o| o.map(|v| v.term)),
+            [
+                Some(PosteriorToAnterior),
+                Some(SuperiorToInferior),
+                None,
+                Some(RightToLeft),
+                None
+            ]
+        );
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

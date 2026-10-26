@@ -239,6 +239,7 @@ fn dicom_tag_info(group: u16, element: u16) -> Option<(&'static str, &'static st
         (0x0020, 0x0011) => ("SeriesNumber", "IS"),
         (0x0020, 0x0013) => ("InstanceNumber", "IS"),
         (0x0020, 0x0032) => ("ImagePositionPatient", "DS"),
+        (0x0010, 0x2210) => ("AnatomicalOrientationType", "CS"),
         (0x0020, 0x0037) => ("ImageOrientationPatient", "DS"),
         (0x0028, 0x0002) => ("SamplesPerPixel", "US"),
         (0x0028, 0x0004) => ("PhotometricInterpretation", "CS"),
@@ -2814,6 +2815,58 @@ impl Default for DicomReader {
 }
 
 impl FormatReader for DicomReader {
+    fn axis_orientations(&self) -> [Option<crate::common::orientation::Orientation>; 5] {
+        use crate::common::orientation::{AnatomicalOrientation::*, Orientation, OrientationType};
+        let Some(meta) = &self.meta else {
+            return [None; 5];
+        };
+        let kind = match meta.series_metadata.get("AnatomicalOrientationType") {
+            Some(MetadataValue::String(s)) => s.as_str(),
+            _ => "BIPED",
+        };
+        let terms = match kind {
+            "BIPED" => [RightToLeft, AnteriorToPosterior, InferiorToSuperior],
+            "QUADRUPED" => [RightToLeft, VentralToDorsal, CaudalToCranial],
+            _ => return [None; 5],
+        };
+        let mut base = terms.map(|t| Some(Orientation::new(OrientationType::Anatomical, t)));
+        let mut result = [None; 5];
+        if let Some(MetadataValue::String(value)) =
+            meta.series_metadata.get("ImageOrientationPatient")
+        {
+            let matrix: Vec<f64> = value
+                .split(['\\', '_'])
+                .filter_map(|v| v.parse().ok())
+                .collect();
+            if matrix.len() != 6 {
+                return result;
+            }
+            let use_axis = |row: usize, component: usize| {
+                let magnitude = matrix[row * 3 + component].abs();
+                magnitude > 1e-6 && (0..3).all(|i| matrix[row * 3 + i].abs() <= magnitude)
+            };
+            for i in 0..3 {
+                if use_axis(0, i) {
+                    result[0] = base[i].map(|v| if matrix[i] > 0.0 { v } else { v.flip() });
+                    base[i] = None;
+                }
+            }
+            for i in 0..3 {
+                if use_axis(1, i) {
+                    result[1] = base[i].map(|v| if matrix[3 + i] > 0.0 { v } else { v.flip() });
+                    base[i] = None;
+                    break;
+                }
+            }
+            result[3] = base.into_iter().flatten().next();
+        } else {
+            result[0] = base[0];
+            result[1] = base[1];
+            result[3] = base[2];
+        }
+        result
+    }
+
     fn is_this_type_by_name(&self, path: &Path) -> bool {
         let ext = path
             .extension()
@@ -3607,6 +3660,52 @@ mod tests {
             h[o..o + 4].copy_from_slice(&off.to_le_bytes());
         }
         h
+    }
+
+    #[test]
+    fn dicom_orientation_permutates_and_flips_patient_axes() {
+        use crate::common::orientation::AnatomicalOrientation::*;
+        let mut reader = DicomReader::new();
+        reader.meta = Some(ImageMetadata::default());
+        let terms = |reader: &DicomReader| reader.axis_orientations().map(|o| o.map(|v| v.term));
+        assert_eq!(
+            terms(&reader),
+            [
+                Some(RightToLeft),
+                Some(AnteriorToPosterior),
+                None,
+                Some(InferiorToSuperior),
+                None
+            ]
+        );
+        reader.meta.as_mut().unwrap().series_metadata.insert(
+            "ImageOrientationPatient".into(),
+            MetadataValue::String("0\\-1\\0\\1\\0\\0".into()),
+        );
+        assert_eq!(
+            terms(&reader),
+            [
+                Some(PosteriorToAnterior),
+                Some(RightToLeft),
+                None,
+                Some(InferiorToSuperior),
+                None
+            ]
+        );
+        reader.meta.as_mut().unwrap().series_metadata.insert(
+            "AnatomicalOrientationType".into(),
+            MetadataValue::String("QUADRUPED".into()),
+        );
+        assert_eq!(
+            terms(&reader),
+            [
+                Some(DorsalToVentral),
+                Some(RightToLeft),
+                None,
+                Some(CaudalToCranial),
+                None
+            ]
+        );
     }
 
     #[test]

@@ -144,7 +144,9 @@ fn parity_input_path(input: &str) -> PathBuf {
 }
 
 fn jar_path() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("bioformats_package.jar")
+    env::var_os("BIOFORMATS_RS_JAVA_PARITY_JAR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("bioformats_package.jar"))
 }
 
 /// Max per-byte absolute difference tolerated when the exact CRC differs.

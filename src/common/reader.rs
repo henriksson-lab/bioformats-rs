@@ -19,6 +19,12 @@ pub fn uninitialized_metadata() -> &'static ImageMetadata {
 
 /// Core trait that every format reader must implement.
 pub trait FormatReader: Send + Sync {
+    /// One orientation per axis in dimension-order order, mirroring
+    /// Java IAxisOrientationReader. Unknown axes have no orientation.
+    fn axis_orientations(&self) -> [Option<super::orientation::Orientation>; 5] {
+        [None; 5]
+    }
+
     fn is_this_type_by_name(&self, path: &Path) -> bool;
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool;
     /// Java `FormatReader.suffixNecessary`: when true, the registry only

@@ -83,8 +83,8 @@ fn valid_segment_position(pos: u64, file_len: u64) -> bool {
 /// CZI FileHeader stores 16-byte GUIDs, so directoryPosition/metadataPosition
 /// live at offsets 52/60. Synthetic fixtures in this crate instead use 36/44.
 /// Returns 0 when no candidate resolves to the expected segment.
-fn resolve_segment_pointer(
-    f: &mut BufReader<File>,
+fn resolve_segment_pointer<R: Read + Seek>(
+    f: &mut R,
     fh: &[u8],
     candidate_offsets: &[usize],
     file_len: u64,
@@ -123,6 +123,17 @@ struct DirEntry {
     pixel_type: i32,
     file_position: i64,
     compression: i32,
+    stage_x: Option<f64>,
+    stage_y: Option<f64>,
+    stage_z: Option<f64>,
+    timestamp: Option<f64>,
+    acquisition_time: Option<String>,
+    exposure_time: Option<f64>,
+    source_path: Option<PathBuf>,
+    source_bytes: Option<std::sync::Arc<Vec<u8>>>,
+    attachment_index: Option<usize>,
+    data_offset: Option<u64>,
+    data_size: u64,
     // Dimensions from DimensionEntry array
     dims: HashMap<String, (i32, i32)>, // dim_name -> (start, size)
     // storedSize per dimension (physical/decoded extent of the tile, which may
@@ -219,6 +230,7 @@ struct CziSeries {
     /// the two PALM planes this series exposes (ZeissCZIReader:1155-1172 splits by
     /// stored size). `None` for non-PALM series.
     palm_size: Option<(u32, u32)>,
+    attachment: Option<(usize, String, ImageMetadata)>,
     resolutions: Vec<CziResolution>,
 }
 
@@ -258,6 +270,17 @@ fn parse_dir_entry(data: &[u8]) -> DirEntry {
     }
 
     DirEntry {
+        source_path: None,
+        source_bytes: None,
+        attachment_index: None,
+        data_offset: None,
+        data_size: 0,
+        stage_x: None,
+        stage_y: None,
+        stage_z: None,
+        timestamp: None,
+        acquisition_time: None,
+        exposure_time: None,
         pixel_type,
         file_position,
         compression,
@@ -388,8 +411,17 @@ struct DimCounts {
     min_mosaic: i32,
 }
 
-fn parse_czi_file(f: &mut BufReader<File>) -> std::io::Result<CziParsed> {
-    let file_len = f.get_ref().metadata()?.len();
+struct CziAttachment {
+    name: String,
+    data: Vec<u8>,
+}
+
+// Java readSegments, usable for both disk files and embedded CZI attachments.
+fn parse_czi_file<R: Read + Seek>(
+    f: &mut R,
+) -> std::io::Result<(String, Vec<DirEntry>, Vec<CziAttachment>)> {
+    let file_len = f.seek(SeekFrom::End(0))?;
+    f.seek(SeekFrom::Start(0))?;
 
     // --- Read file header segment ---
     let mut hdr = vec![0u8; SEG_HEADER];
@@ -463,9 +495,206 @@ fn parse_czi_file(f: &mut BufReader<File>) -> std::io::Result<CziParsed> {
         }
     }
 
-    // Compute dimensions from entries.
-    let parsed = build_dimensions(meta_xml, entries)?;
-    Ok(parsed)
+    let mut attachments = Vec::new();
+    let mut local_entries = Vec::new();
+    let mut position = 0u64;
+    while position.saturating_add(SEG_HEADER as u64) <= file_len {
+        f.seek(SeekFrom::Start(position))?;
+        let mut header = [0u8; SEG_HEADER];
+        f.read_exact(&mut header)?;
+        let kind = read_seg_type(&header);
+        let (allocated, used) = read_seg_sizes(&header);
+        if kind == "ZISRAWSUBBLOCK" {
+            let mut body = [0u8; 48];
+            f.read_exact(&mut body)?;
+            let count = read_i32(&body, 44);
+            let entry = if count > 0 && count <= 64 {
+                let length = 32 + count as usize * 20;
+                let mut bytes = vec![0; length];
+                bytes[..32].copy_from_slice(&body[16..]);
+                f.read_exact(&mut bytes[32..])?;
+                let mut entry = parse_dir_entry(&bytes);
+                entry.file_position = position as i64;
+                Some(entry)
+            } else {
+                entries
+                    .iter()
+                    .find(|entry| entry.file_position == position as i64)
+                    .cloned()
+            };
+            if let Some(entry) = entry {
+                local_entries.push(entry);
+            }
+        } else if kind == "ZISRAWMETADATA" && meta_xml.is_empty() {
+            let mut body = [0u8; 256];
+            f.read_exact(&mut body)?;
+            let length = read_i32(&body, 0);
+            if length > 0 {
+                let offset = position + SEG_HEADER as u64 + 256;
+                if length as u64 > file_len.saturating_sub(offset) {
+                    return Err(czi_invalid_data("CZI metadata exceeds file bounds"));
+                }
+                let mut data = vec![0; length as usize];
+                f.read_exact(&mut data)?;
+                meta_xml = String::from_utf8_lossy(&data).into_owned();
+            }
+        } else if kind == "ZISRAWATTACH" {
+            let mut body = [0u8; 256];
+            f.read_exact(&mut body)?;
+            let length = read_i32(&body, 0);
+            let name = String::from_utf8_lossy(&body[64..144])
+                .trim_matches(char::from(0))
+                .trim()
+                .to_string();
+            if length > 0 && ["Label", "SlidePreview", "TimeStamps"].contains(&name.as_str()) {
+                let offset = position + SEG_HEADER as u64 + 256;
+                if length as u64 > file_len.saturating_sub(offset) {
+                    return Err(czi_invalid_data("CZI attachment exceeds file bounds"));
+                }
+                let mut data = vec![0; length as usize];
+                f.read_exact(&mut data)?;
+                attachments.push(CziAttachment { name, data });
+            }
+        }
+        // The specification stores body sizes. Older generated fixtures store
+        // header-inclusive sizes, so verify the next candidate's segment ID.
+        let mut next = None;
+        for raw in [
+            position
+                .saturating_add(SEG_HEADER as u64)
+                .saturating_add(allocated),
+            position.saturating_add(allocated),
+            position
+                .saturating_add(SEG_HEADER as u64)
+                .saturating_add(used),
+        ] {
+            for candidate in [raw, raw.saturating_add(31) / 32 * 32] {
+                if candidate <= position || candidate.saturating_add(SEG_HEADER as u64) > file_len {
+                    continue;
+                }
+                f.seek(SeekFrom::Start(candidate))?;
+                let mut signature = [0u8; SEG_HEADER];
+                f.read_exact(&mut signature)?;
+                let id = read_seg_type(&signature);
+                if id.starts_with("ZISRAW") || id == "DELETED" {
+                    next = Some(candidate);
+                    break;
+                }
+            }
+            if next.is_some() {
+                break;
+            }
+        }
+        match next {
+            Some(value) => position = value,
+            None => break,
+        }
+    }
+    // Directory records may also reference other file parts; only local segment
+    // records are loaded here. The outer reader aggregates the numbered files.
+    if !local_entries.is_empty() {
+        entries = local_entries;
+    } else {
+        entries.clear();
+    }
+
+    // SubBlock.parseMetadata: each pixel subblock has its own acquisition tags.
+    // These values belong to that source plane, not to the global XML image.
+    for entry in &mut entries {
+        if entry.file_position < 0 {
+            return Err(czi_invalid_data("CZI subblock has negative file position"));
+        }
+        f.seek(SeekFrom::Start(
+            entry.file_position as u64 + SEG_HEADER as u64,
+        ))?;
+        let mut subblock_header = [0u8; 48];
+        f.read_exact(&mut subblock_header)?;
+        let metadata_size = read_i32(&subblock_header, 0);
+        let dimension_count = read_i32(&subblock_header, 44).max(0) as u64;
+        let header_size = (16 + 32 + 20 * dimension_count).max(256);
+        let metadata_offset = entry.file_position as u64 + SEG_HEADER as u64 + header_size;
+        entry.data_offset = Some(metadata_offset + metadata_size.max(0) as u64);
+        entry.data_size = read_u64(&subblock_header, 8);
+        if metadata_size <= 0 {
+            continue;
+        }
+        if metadata_size as u64 > file_len.saturating_sub(metadata_offset) {
+            return Err(czi_invalid_data(
+                "CZI subblock metadata exceeds file bounds",
+            ));
+        }
+        f.seek(SeekFrom::Start(metadata_offset))?;
+        let mut bytes = vec![0; metadata_size as usize];
+        f.read_exact(&mut bytes)?;
+        let xml = String::from_utf8_lossy(&bytes);
+        if let Some(tags) = first_element_body(&xml, "Tags") {
+            entry.stage_x = child_value(tags, "StageXPosition").and_then(|v| v.parse().ok());
+            entry.stage_y = child_value(tags, "StageYPosition").and_then(|v| v.parse().ok());
+            entry.stage_z = child_value(tags, "FocusPosition").and_then(|v| v.parse().ok());
+            entry.acquisition_time = child_value(tags, "AcquisitionTime");
+            entry.timestamp = entry
+                .acquisition_time
+                .as_deref()
+                .and_then(czi_timestamp_seconds);
+            entry.exposure_time = child_value(tags, "ExposureTime").and_then(|v| v.parse().ok());
+        }
+    }
+    Ok((meta_xml, entries, attachments))
+}
+
+/// Adapter for Java Timestamp.valueOf(...).asInstant().getMillis() / 1000d.
+fn czi_timestamp_seconds(value: &str) -> Option<f64> {
+    let date_time = value.get(..19)?;
+    if date_time.as_bytes().get(4) != Some(&b'-') || date_time.as_bytes().get(7) != Some(&b'-') {
+        return None;
+    }
+    let mut year = date_time.get(0..4)?.parse::<i64>().ok()?;
+    let month = date_time.get(5..7)?.parse::<i64>().ok()?;
+    let day = date_time.get(8..10)?.parse::<i64>().ok()?;
+    let hour = date_time.get(11..13)?.parse::<i64>().ok()?;
+    let minute = date_time.get(14..16)?.parse::<i64>().ok()?;
+    let second = date_time.get(17..19)?.parse::<i64>().ok()?;
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
+        return None;
+    }
+    year -= i64::from(month <= 2);
+    let era = year.div_euclid(400);
+    let yoe = year - era * 400;
+    let mp = month + if month > 2 { -3 } else { 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let days = era * 146097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719468;
+    let tail = value.get(19..)?;
+    let offset_start = tail.find(['+', '-']).unwrap_or(tail.len());
+    let fractional = tail
+        .get(..offset_start)?
+        .trim_end_matches('Z')
+        .trim_start_matches('.');
+    let millis = if fractional.is_empty() {
+        0
+    } else {
+        let mut digits = fractional.chars().take(3).collect::<String>();
+        while digits.len() < 3 {
+            digits.push('0');
+        }
+        digits.parse::<i64>().ok()?
+    };
+    let offset = if offset_start < tail.len() {
+        let zone = &tail[offset_start..];
+        let hours = zone.get(1..3)?.parse::<i64>().ok()?;
+        let minutes = zone.get(4..6)?.parse::<i64>().ok()?;
+        (hours * 3600 + minutes * 60) * if zone.starts_with('-') { -1 } else { 1 }
+    } else {
+        0
+    };
+    Some(
+        (days * 86400 + hour * 3600 + minute * 60 + second - offset) as f64
+            + millis as f64 / 1000.0,
+    )
 }
 
 /// Port of ZeissCZIReader.calculateDimensions + the prestitching / series-split /
@@ -914,6 +1143,7 @@ fn build_dimensions(meta_xml: String, entries: Vec<DirEntry>) -> std::io::Result
                             mosaic,
                             pixel_type_index: ptype,
                             palm_size: None,
+                            attachment: None,
                             resolutions,
                         });
                     }
@@ -929,6 +1159,7 @@ fn build_dimensions(meta_xml: String, entries: Vec<DirEntry>) -> std::io::Result
             mosaic: None,
             pixel_type_index: 0,
             palm_size: None,
+            attachment: None,
             resolutions: vec![CziResolution {
                 r: 0,
                 scale_x: 1,
@@ -970,6 +1201,7 @@ fn build_dimensions(meta_xml: String, entries: Vec<DirEntry>) -> std::io::Result
                     mosaic: None,
                     pixel_type_index: 0,
                     palm_size: Some((sx, sy)),
+                    attachment: None,
                     resolutions: vec![CziResolution {
                         r: 0,
                         scale_x: 1,
@@ -1121,10 +1353,39 @@ fn parse_component_bit_count(xml: &str) -> Option<u8> {
 /// sensitive, matching CZI's mixed-case element names). Returns the inner text
 /// between the open and close tags, or `None` if not found.
 fn first_element_body<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
-    let (_, qname, after_open) = find_start_tag(xml, tag, 0)?;
-    let close = format!("</{}>", qname);
-    let close_rel = xml[after_open..].find(&close)?;
-    Some(&xml[after_open..after_open + close_rel])
+    let (start, qname, after_open) = find_start_tag(xml, tag, 0)?;
+    if xml[start..after_open].trim_end().ends_with("/>") {
+        return Some(&xml[after_open..after_open]);
+    }
+    let mut depth = 1usize;
+    let mut position = after_open;
+    while let Some(relative) = xml[position..].find('<') {
+        let current = position + relative;
+        if xml[current..].starts_with("<!--") {
+            position = current + xml[current..].find("-->")? + 3;
+            continue;
+        }
+        if xml[current..].starts_with("<![CDATA[") {
+            position = current + xml[current..].find("]]>")? + 3;
+            continue;
+        }
+        let current_tag = start_tag_slice(xml, current)?;
+        if let Some(closing) = current_tag.strip_prefix("</") {
+            let name = closing.trim_end_matches('>').trim();
+            if name == qname {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&xml[after_open..current]);
+                }
+            }
+        } else if start_tag_name(current_tag) == Some(qname)
+            && !current_tag.trim_end().ends_with("/>")
+        {
+            depth += 1;
+        }
+        position = current + current_tag.len();
+    }
+    None
 }
 
 fn find_start_tag<'a>(
@@ -1203,29 +1464,25 @@ fn channel_blocks(scope: &str) -> Vec<&str> {
 }
 
 fn channel_blocks_in_channels(channels: &str) -> Vec<&str> {
-    let mut out = Vec::new();
-    let mut pos = 0usize;
-    while let Some((start, qname, after_open)) = find_start_tag(channels, "Channel", pos) {
-        let close = format!("</{}>", qname);
-        let Some(end_rel) = channels[after_open..].find(&close) else {
-            break;
-        };
-        let end = after_open + end_rel + close.len();
-        out.push(&channels[start..end]);
-        pos = end;
-    }
-    out
+    element_blocks(channels, "Channel")
 }
 
 fn element_blocks<'a>(scope: &'a str, tag: &str) -> Vec<&'a str> {
     let mut out = Vec::new();
     let mut pos = 0usize;
-    while let Some((start, qname, after_open)) = find_start_tag(scope, tag, pos) {
-        let close = format!("</{}>", qname);
-        let Some(end_rel) = scope[after_open..].find(&close) else {
-            break;
+    while let Some((start, _, after_open)) = find_start_tag(scope, tag, pos) {
+        let end = if scope[start..after_open].trim_end().ends_with("/>") {
+            after_open
+        } else {
+            let Some(body) = first_element_body(&scope[start..], tag) else {
+                break;
+            };
+            let closing = after_open + body.len();
+            let Some(closing_tag) = start_tag_slice(scope, closing) else {
+                break;
+            };
+            closing + closing_tag.len()
         };
-        let end = after_open + end_rel + close.len();
         out.push(&scope[start..end]);
         pos = end;
     }
@@ -1329,6 +1586,25 @@ fn build_czi_channels(xml: &str) -> Vec<crate::common::ome_metadata::OmeChannel>
                 channels.push(OmeChannel {
                     name: channel_name_attr(block),
                     samples_per_pixel: 1,
+                    pinhole_size: child_value(block, "PinholeSize").and_then(|v| v.parse().ok()),
+                    illumination_type: child_value(block, "IlluminationType"),
+                    acquisition_mode: child_value(block, "AcquisitionMode"),
+                    detector_settings_binning: first_element_body(block, "DetectorSettings")
+                        .and_then(|v| child_value(v, "Binning"))
+                        .map(|v| v.replace(',', "x")),
+                    detector_ref: first_element_body(block, "DetectorSettings").and_then(|scope| {
+                        let (start, _, _) = find_start_tag(scope, "Detector", 0)?;
+                        let id = xml_start_tag_attr(start_tag_slice(scope, start)?, "Id")?;
+                        let id: String = id.chars().filter(|c| !c.is_whitespace()).collect();
+                        Some(if id.starts_with("Detector:") {
+                            id
+                        } else {
+                            format!("Detector:{id}")
+                        })
+                    }),
+                    filter_set_ref: find_start_tag(block, "FilterSetRef", 0).and_then(
+                        |(start, _, _)| xml_start_tag_attr(start_tag_slice(block, start)?, "Id"),
+                    ),
                     color: child_value(block, "Color").and_then(|s| {
                         // Extra Rust support: Java only reads CZI false colors from
                         // DisplaySetting/Channels, but pack Dimensions/Channels
@@ -1362,6 +1638,11 @@ fn build_czi_channels(xml: &str) -> Vec<crate::common::ome_metadata::OmeChannel>
                 .and_then(|s| parse_czi_channel_color(&s));
             if color.is_some() {
                 channels[i].color = color;
+            }
+            if let Some(fluor) =
+                child_value(block, "DyeName").or_else(|| child_value(block, "ShortName"))
+            {
+                channels[i].fluor = Some(fluor);
             }
             if let Some(emission) =
                 child_value(block, "DyeMaxEmission").and_then(|s| s.parse().ok())
@@ -1749,6 +2030,10 @@ fn decompress_zstd_1(data: &[u8]) -> Result<Vec<u8>> {
 // ---- reader ----------------------------------------------------------------
 
 pub struct ZeissCziReader {
+    base_metadata: Option<ImageMetadata>,
+    timestamps: Vec<f64>,
+    flattened_resolutions: bool,
+    current_public_series: usize,
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
     entries: Vec<DirEntry>,
@@ -1776,6 +2061,10 @@ pub struct ZeissCziReader {
 impl ZeissCziReader {
     pub fn new() -> Self {
         ZeissCziReader {
+            base_metadata: None,
+            timestamps: Vec::new(),
+            flattened_resolutions: true,
+            current_public_series: 0,
             path: None,
             meta: None,
             entries: Vec::new(),
@@ -1794,16 +2083,6 @@ impl ZeissCziReader {
         }
     }
 
-    fn plane_zct(&self, plane_index: u32) -> Option<(u32, u32, u32)> {
-        let meta = self.meta.as_ref()?;
-        let sz = meta.size_z;
-        let sc = meta.size_c;
-        let z = (plane_index / sc) % sz;
-        let c = plane_index % sc;
-        let t = plane_index / (sc * sz);
-        Some((z, c, t))
-    }
-
     /// Resolution list for the active series.
     fn current_resolutions(&self) -> &[CziResolution] {
         self.series
@@ -1816,10 +2095,54 @@ impl ZeissCziReader {
         &self,
         plane_index: u32,
         resolution_index: usize,
+        logical_series: usize,
     ) -> Option<Vec<DirEntry>> {
-        let (z, c, t) = self.plane_zct(plane_index)?;
-        let series = self.series.get(self.current_series)?;
-        let res = self.current_resolutions().get(resolution_index)?;
+        let series = self.series.get(logical_series)?;
+        // Java caches thumbReader.openBytes(0) when loading an attachment and
+        // returns that same plane for every valid attachment plane index.
+        if let Some((attachment_index, _, _)) = &series.attachment {
+            let res = series.resolutions.get(resolution_index)?;
+            let key = CziResolutionKey {
+                r: res.r,
+                scale_x: res.scale_x.max(1),
+                scale_y: res.scale_y.max(1),
+            };
+            let entries: Vec<_> = self
+                .entries
+                .iter()
+                .filter(|entry| {
+                    entry.attachment_index == Some(*attachment_index)
+                        && entry_in_series(
+                            entry,
+                            series.scene,
+                            series.acquisition,
+                            series.angle,
+                            series.mosaic,
+                        )
+                        && resolution_key(entry, false) == key
+                        && self.pixel_types.get(series.pixel_type_index) == Some(&entry.pixel_type)
+                })
+                .collect();
+            let first_channel = entries.iter().map(|entry| entry.dim_start("C")).min()?;
+            let entries: Vec<_> = entries
+                .into_iter()
+                .filter(|entry| entry.matches_plane(0, first_channel as u32, 0))
+                .cloned()
+                .collect();
+            return (!entries.is_empty()).then_some(entries);
+        }
+        let plane_meta = series
+            .attachment
+            .as_ref()
+            .map(|v| &v.2)
+            .or(self.base_metadata.as_ref())
+            .or(self.meta.as_ref())?;
+        let sc =
+            (plane_meta.image_count / plane_meta.size_z.max(1) / plane_meta.size_t.max(1)).max(1);
+        let z = (plane_index / sc) % plane_meta.size_z.max(1);
+        let c = plane_index % sc;
+        let t = plane_index / (sc * plane_meta.size_z.max(1));
+        let res = series.resolutions.get(resolution_index)?;
         let r = res.r;
         let want_resolution_key = CziResolutionKey {
             r: res.r,
@@ -1830,9 +2153,10 @@ impl ZeissCziReader {
         // Invert the modulo folding (ZeissCZIReader:2216-2223). The requested
         // expanded z/c/t decompose into the per-subblock coordinate plus the
         // rotation/illumination/phase sub-index. origZ = sizeZ / rotations etc.
-        let meta = self.meta.as_ref()?;
+        let meta = plane_meta;
         let orig_z = (meta.size_z / self.rotations.max(1)).max(1);
-        let orig_c = (meta.size_c / self.illuminations.max(1)).max(1);
+        let logical_channels = (meta.image_count / meta.size_z.max(1) / meta.size_t.max(1)).max(1);
+        let orig_c = (logical_channels / self.illuminations.max(1)).max(1);
         let orig_t = (meta.size_t / self.phases.max(1)).max(1);
         let rotation = z / orig_z; // R.start when rotation_axis
         let z = z % orig_z;
@@ -1846,7 +2170,7 @@ impl ZeissCziReader {
         // the active pixel type carry channels [ptype*sizeC .. ). We select by the
         // entry's pixel-type rank within the distinct list.
         let want_pt = self.pixel_types.get(series.pixel_type_index).copied();
-        let multi_pt = self.pixel_types.len() > 1;
+        let multi_pt = self.pixel_types.len() > 1 && series.attachment.is_none();
         // Logical-channel offset for the per-pixel-type split (ZeissCZIReader:2152
         // `c = dimension.start - plane.pixelTypeIndex`): the requested channel `c`
         // corresponds to entry C-start `c + pixelTypeIndex`.
@@ -1888,12 +2212,14 @@ impl ZeissCziReader {
             .entries
             .iter()
             .filter(|e| {
-                entry_in_series(e, series.scene, series.acquisition, series.angle, series.mosaic)
+                e.attachment_index == series.attachment.as_ref().map(|v| v.0)
+                    && entry_in_series(e, series.scene, series.acquisition, series.angle, series.mosaic)
                     && match_resolution(e)
                     && (self.illuminations <= 1 || match_sub(e, "I", illum))
                     && (self.phases <= 1 || match_sub(e, "H", phase))
                     && e.matches_plane(z, c_with_offset, t)
                     && (!multi_pt || want_pt == Some(e.pixel_type))
+                    && (series.attachment.is_none() || want_pt == Some(e.pixel_type))
                     // PALM: a series exposes only the subblock matching its stored
                     // tile size (ZeissCZIReader:1155-1172).
                     && series.palm_size.is_none_or(|(sx, sy)| {
@@ -1907,11 +2233,21 @@ impl ZeissCziReader {
     }
 
     fn matching_entries(&self, plane_index: u32) -> Option<Vec<DirEntry>> {
-        self.matching_entries_at_resolution(plane_index, self.current_resolution)
+        self.matching_entries_at_resolution(
+            plane_index,
+            self.current_resolution,
+            self.current_series,
+        )
     }
 
     /// Apply the active series/resolution's X/Y size to the cached metadata.
     fn refresh_meta_dimensions(&mut self) {
+        self.meta = self
+            .series
+            .get(self.current_series)
+            .and_then(|series| series.attachment.as_ref().map(|v| v.2.clone()))
+            .or_else(|| self.base_metadata.clone())
+            .or_else(|| self.meta.clone());
         let (width, height, res_count) = {
             let resolutions = self.current_resolutions();
             let res_count = resolutions.len().max(1) as u32;
@@ -1922,20 +2258,64 @@ impl ZeissCziReader {
                 res_count,
             )
         };
+        let is_attachment = self
+            .series
+            .get(self.current_series)
+            .is_some_and(|series| series.attachment.is_some());
+        let pixel_type = self
+            .series
+            .get(self.current_series)
+            .and_then(|series| self.pixel_types.get(series.pixel_type_index))
+            .and_then(|code| czi_pixel_type(*code).ok());
         if let Some(meta) = self.meta.as_mut() {
             meta.size_x = width;
             meta.size_y = height;
-            meta.resolution_count = res_count;
+            if let Some((pixel_type, spp)) = pixel_type {
+                let logical_channels =
+                    (meta.image_count / meta.size_z.max(1) / meta.size_t.max(1)).max(1);
+                self.packed_spp = spp;
+                meta.pixel_type = pixel_type;
+                meta.is_rgb = spp >= 3;
+                meta.is_interleaved = meta.is_rgb;
+                meta.size_c = logical_channels * if meta.is_rgb { spp } else { 1 };
+                if !is_attachment {
+                    meta.bits_per_pixel = parse_component_bit_count(&self.meta_xml)
+                        .map(u16::from)
+                        .unwrap_or((pixel_type.bytes_per_sample() * 8) as u16);
+                }
+                meta.series_metadata.insert(
+                    "rgb_channel_count".into(),
+                    MetadataValue::Int(if meta.is_rgb { spp as i64 } else { 1 }),
+                );
+                if meta.is_rgb {
+                    meta.is_indexed = false;
+                }
+            }
+            meta.resolution_count = if self.flattened_resolutions {
+                1
+            } else {
+                res_count
+            };
         }
     }
 
     fn read_subblock(path: &Path, entry: &DirEntry, pixel_bytes: usize) -> Result<Vec<u8>> {
         let (data_offset, data_size) = Self::subblock_data_range(path, entry)?;
-        let mut f = File::open(path).map_err(BioFormatsError::Io)?;
-        f.seek(SeekFrom::Start(data_offset))
-            .map_err(BioFormatsError::Io)?;
         let mut compressed = vec![0u8; data_size as usize];
-        f.read_exact(&mut compressed).map_err(BioFormatsError::Io)?;
+        if let Some(source) = &entry.source_bytes {
+            let data = source
+                .get(data_offset as usize..data_offset as usize + data_size as usize)
+                .ok_or_else(|| {
+                    BioFormatsError::Format("CZI embedded byte range is invalid".into())
+                })?;
+            compressed.copy_from_slice(data);
+        } else {
+            let mut f = File::open(entry.source_path.as_deref().unwrap_or(path))
+                .map_err(BioFormatsError::Io)?;
+            f.seek(SeekFrom::Start(data_offset))
+                .map_err(BioFormatsError::Io)?;
+            f.read_exact(&mut compressed).map_err(BioFormatsError::Io)?;
+        }
 
         // For compressed/downsampled tiles Java uses the stored (physical) X/Y
         // sizes to size the decoded buffer.
@@ -1951,12 +2331,32 @@ impl ZeissCziReader {
     }
 
     fn subblock_data_range(path: &Path, entry: &DirEntry) -> Result<(u64, u64)> {
+        if let Some(offset) = entry.data_offset {
+            let length = entry.data_size;
+            let source_length = match &entry.source_bytes {
+                Some(source) => source.len() as u64,
+                None => std::fs::metadata(entry.source_path.as_deref().unwrap_or(path))
+                    .map_err(BioFormatsError::Io)?
+                    .len(),
+            };
+            if length == 0
+                || offset
+                    .checked_add(length)
+                    .is_none_or(|end| end > source_length)
+            {
+                return Err(BioFormatsError::Format(
+                    "CZI source byte range is invalid".into(),
+                ));
+            }
+            return Ok((offset, length));
+        }
         if entry.file_position < 0 {
             return Err(BioFormatsError::Format(
                 "CZI subblock has negative file position".into(),
             ));
         }
-        let mut f = File::open(path).map_err(BioFormatsError::Io)?;
+        let mut f = File::open(entry.source_path.as_deref().unwrap_or(path))
+            .map_err(BioFormatsError::Io)?;
         f.seek(SeekFrom::Start(entry.file_position as u64))
             .map_err(BioFormatsError::Io)?;
         let mut seg_hdr = vec![0u8; SEG_HEADER];
@@ -2101,10 +2501,137 @@ impl FormatReader for ZeissCziReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let stem = path.file_stem().and_then(|v| v.to_str()).unwrap_or("");
+        if stem.ends_with(')') {
+            if let Some(open) = stem.rfind('(') {
+                if stem[open + 1..stem.len() - 1].parse::<u32>().is_ok() {
+                    let master = parent.join(format!("{}.czi", stem[..open].trim_end()));
+                    if master.exists() && master != path {
+                        return self.set_id(&master);
+                    }
+                }
+            }
+        }
         self.close()?;
-        let f = File::open(path).map_err(BioFormatsError::Io)?;
-        let mut reader = BufReader::new(f);
-        let parsed = parse_czi_file(&mut reader).map_err(BioFormatsError::Io)?;
+        let mut parts = Vec::new();
+        for entry in std::fs::read_dir(parent)
+            .map_err(BioFormatsError::Io)?
+            .flatten()
+        {
+            let file = entry.path();
+            let Some(name) = file.file_stem().and_then(|v| v.to_str()) else {
+                continue;
+            };
+            if !file
+                .extension()
+                .and_then(|v| v.to_str())
+                .is_some_and(|v| v.eq_ignore_ascii_case("czi"))
+            {
+                continue;
+            }
+            let Some(suffix) = name.strip_prefix(stem) else {
+                continue;
+            };
+            let suffix = suffix.trim_start();
+            if let Some(number) = suffix
+                .strip_prefix('(')
+                .and_then(|v| v.strip_suffix(')'))
+                .and_then(|v| v.parse::<u32>().ok())
+            {
+                parts.push((number, file));
+            }
+        }
+        parts.sort_by_key(|v| v.0);
+        let mut files = vec![path.to_path_buf()];
+        files.extend(parts.into_iter().map(|v| v.1));
+        let mut meta_xml = String::new();
+        let mut entries = Vec::new();
+        let mut attachments = Vec::new();
+        for file in files {
+            let mut input = BufReader::new(File::open(&file).map_err(BioFormatsError::Io)?);
+            let (xml, mut local, mut extra) =
+                parse_czi_file(&mut input).map_err(BioFormatsError::Io)?;
+            if meta_xml.is_empty() && !xml.is_empty() {
+                meta_xml = xml;
+            }
+            for entry in &mut local {
+                entry.source_path = Some(file.clone());
+            }
+            entries.append(&mut local);
+            attachments.append(&mut extra);
+        }
+        let mut parsed = build_dimensions(meta_xml, entries).map_err(BioFormatsError::Io)?;
+        let mut seen = std::collections::HashSet::new();
+        for attachment in attachments {
+            if attachment.name == "TimeStamps" {
+                for bytes in attachment.data.get(8..).unwrap_or(&[]).chunks_exact(8) {
+                    self.timestamps
+                        .push(f64::from_le_bytes(bytes.try_into().unwrap()));
+                }
+                continue;
+            }
+            if !seen.insert(attachment.name.clone()) {
+                continue;
+            }
+            let source = std::sync::Arc::new(attachment.data);
+            let (xml, mut local, _) = parse_czi_file(&mut std::io::Cursor::new(source.as_slice()))
+                .map_err(BioFormatsError::Io)?;
+            let child = build_dimensions(xml, local.clone()).map_err(BioFormatsError::Io)?;
+            if child.z_count > 1 || child.t_count > 1 {
+                continue;
+            }
+            let index = parsed.series.len();
+            let mut series = child.series[0].clone();
+            let pixel_index = parsed
+                .pixel_types
+                .iter()
+                .position(|v| *v == child.pixel_types[0])
+                .unwrap_or_else(|| {
+                    parsed.pixel_types.push(child.pixel_types[0]);
+                    parsed.pixel_types.len() - 1
+                });
+            series.pixel_type_index = pixel_index;
+            series.resolutions.truncate(1);
+            let meta = ImageMetadata {
+                size_x: series.resolutions[0].width,
+                size_y: series.resolutions[0].height,
+                size_z: 1,
+                size_t: 1,
+                size_c: child.c_count * if child.spp >= 3 { child.spp } else { 1 },
+                pixel_type: child.pixel_type,
+                bits_per_pixel: parse_component_bit_count(&child.meta_xml)
+                    .map(u16::from)
+                    .unwrap_or((child.pixel_type.bytes_per_sample() * 8) as u16),
+                image_count: child.c_count,
+                is_rgb: child.spp >= 3,
+                is_interleaved: child.spp >= 3,
+                is_little_endian: true,
+                dimension_order: DimensionOrder::XYCZT,
+                resolution_count: 1,
+                thumbnail: true,
+                ..Default::default()
+            };
+            series.attachment = Some((
+                index,
+                if attachment.name == "Label" {
+                    "label image"
+                } else {
+                    "macro image"
+                }
+                .into(),
+                meta,
+            ));
+            for entry in &mut local {
+                entry.source_bytes = Some(source.clone());
+                entry.attachment_index = Some(index);
+            }
+            parsed.entries.append(&mut local);
+            parsed.series.push(series);
+        }
 
         let image_count = parsed.z_count * parsed.c_count * parsed.t_count;
         // Java reports the significant/valid bit depth (`<ComponentBitCount>`,
@@ -2147,7 +2674,7 @@ impl FormatReader for ZeissCziReader {
             size_x: init_w,
             size_y: init_h,
             size_z: parsed.z_count,
-            size_c: parsed.c_count,
+            size_c: parsed.c_count * if is_rgb { parsed.spp } else { 1 },
             size_t: parsed.t_count,
             pixel_type: parsed.pixel_type,
             bits_per_pixel: (bps).into(),
@@ -2179,11 +2706,15 @@ impl FormatReader for ZeissCziReader {
         self.current_resolution = 0;
         self.meta_xml = parsed.meta_xml;
         self.path = Some(path.to_path_buf());
-        Ok(())
+        self.base_metadata = self.meta.clone();
+        self.set_series(0)
     }
 
     fn close(&mut self) -> Result<()> {
         self.path = None;
+        self.base_metadata = None;
+        self.timestamps.clear();
+        self.current_public_series = 0;
         self.meta = None;
         self.entries.clear();
         self.meta_xml.clear();
@@ -2202,25 +2733,55 @@ impl FormatReader for ZeissCziReader {
     }
 
     fn series_count(&self) -> usize {
-        if self.meta.is_some() {
-            self.series.len().max(1)
+        if self.meta.is_none() {
+            return 0;
+        }
+        if self.flattened_resolutions {
+            self.series
+                .iter()
+                .map(|v| v.resolutions.len().max(1))
+                .sum::<usize>()
+                .max(1)
         } else {
-            0
+            self.series.len().max(1)
         }
     }
     fn set_series(&mut self, s: usize) -> Result<()> {
         if s >= self.series_count() {
             return Err(BioFormatsError::SeriesOutOfRange(s));
         }
+        self.current_public_series = s;
         self.current_series = s;
-        // Switching scenes resets the active resolution to full-res (level 0),
-        // matching how setSeries resets the core/resolution index in Java.
         self.current_resolution = 0;
+        if self.flattened_resolutions {
+            let mut offset = s;
+            for (logical, series) in self.series.iter().enumerate() {
+                let count = series.resolutions.len().max(1);
+                if offset < count {
+                    self.current_series = logical;
+                    self.current_resolution = offset;
+                    break;
+                }
+                offset -= count;
+            }
+        }
         self.refresh_meta_dimensions();
         Ok(())
     }
     fn series(&self) -> usize {
-        self.current_series
+        self.current_public_series
+    }
+    fn has_flattened_resolutions(&self) -> bool {
+        self.flattened_resolutions
+    }
+    fn set_flattened_resolutions(&mut self, flattened: bool) -> Result<()> {
+        if self.path.is_some() {
+            return Err(BioFormatsError::Format(
+                "set_flattened_resolutions must be called before set_id".into(),
+            ));
+        }
+        self.flattened_resolutions = flattened;
+        Ok(())
     }
     fn metadata(&self) -> &ImageMetadata {
         self.meta
@@ -2322,10 +2883,7 @@ impl FormatReader for ZeissCziReader {
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        let (tw, th) = (meta.size_x.min(256), meta.size_y.min(256));
-        let (tx, ty) = ((meta.size_x - tw) / 2, (meta.size_y - th) / 2);
-        self.open_bytes_region(plane_index, tx, ty, tw, th)
+        crate::common::thumbnail::open_thumb_bytes(self, plane_index, None)
     }
 
     fn compressed_level_info(
@@ -2333,16 +2891,27 @@ impl FormatReader for ZeissCziReader {
         plane_index: u32,
         level: u32,
     ) -> Result<CompressedExtractionSupport> {
+        if self.flattened_resolutions && level != 0 {
+            return Err(BioFormatsError::PlaneOutOfRange(level));
+        }
+        let resolution_index = if self.flattened_resolutions {
+            self.current_resolution
+        } else {
+            level as usize
+        };
+
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         if plane_index >= meta.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
-        let Some(res) = self.current_resolutions().get(level as usize) else {
+        let Some(res) = self.current_resolutions().get(resolution_index) else {
             return Ok(CompressedExtractionSupport::NotSupported {
                 reason: format!("CZI resolution level {level} is out of range"),
             });
         };
-        let Some(entries) = self.matching_entries_at_resolution(plane_index, level as usize) else {
+        let Some(entries) =
+            self.matching_entries_at_resolution(plane_index, resolution_index, self.current_series)
+        else {
             return Ok(CompressedExtractionSupport::NotSupported {
                 reason: "CZI plane has no source subblocks at requested resolution".into(),
             });
@@ -2408,6 +2977,15 @@ impl FormatReader for ZeissCziReader {
         row: u64,
         preferred_modes: &[CompressedTileMode],
     ) -> Result<CompressedTile> {
+        if self.flattened_resolutions && level != 0 {
+            return Err(BioFormatsError::PlaneOutOfRange(level));
+        }
+        let resolution_index = if self.flattened_resolutions {
+            self.current_resolution
+        } else {
+            level as usize
+        };
+
         if !mode_allowed(preferred_modes, CompressedTileMode::OriginalBytes) {
             return Err(BioFormatsError::UnsupportedFormat(
                 "requested compressed tile modes are not available for CZI subblocks".into(),
@@ -2425,11 +3003,11 @@ impl FormatReader for ZeissCziReader {
 
         let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         let entries = self
-            .matching_entries_at_resolution(plane_index, level as usize)
+            .matching_entries_at_resolution(plane_index, resolution_index, self.current_series)
             .ok_or(BioFormatsError::PlaneOutOfRange(plane_index))?;
         let res = self
             .current_resolutions()
-            .get(level as usize)
+            .get(resolution_index)
             .ok_or(BioFormatsError::PlaneOutOfRange(plane_index))?;
         let scale_x = res.scale_x.max(1);
         let scale_y = res.scale_y.max(1);
@@ -2481,10 +3059,16 @@ impl FormatReader for ZeissCziReader {
                 nominal_tile_height: info.tile_height,
                 codec: info.codec,
                 mode: CompressedTileMode::OriginalBytes,
-                bytes: CompressedBytes::FileRange {
-                    path: path.clone(),
-                    offset,
-                    length,
+                bytes: if let Some(source) = &entry.source_bytes {
+                    CompressedBytes::Owned(
+                        source[offset as usize..offset as usize + length as usize].to_vec(),
+                    )
+                } else {
+                    CompressedBytes::FileRange {
+                        path: entry.source_path.clone().unwrap_or_else(|| path.clone()),
+                        offset,
+                        length,
+                    }
                 },
             });
         }
@@ -2495,10 +3079,21 @@ impl FormatReader for ZeissCziReader {
     }
 
     fn resolution_count(&self) -> usize {
-        self.current_resolutions().len().max(1)
+        if self.flattened_resolutions {
+            1
+        } else {
+            self.current_resolutions().len().max(1)
+        }
     }
 
     fn set_resolution(&mut self, level: usize) -> Result<()> {
+        if self.flattened_resolutions {
+            return if level == 0 {
+                Ok(())
+            } else {
+                Err(BioFormatsError::PlaneOutOfRange(level as u32))
+            };
+        }
         let count = self.current_resolutions().len();
         if level >= count {
             return Err(BioFormatsError::Format(format!(
@@ -2513,50 +3108,625 @@ impl FormatReader for ZeissCziReader {
     }
 
     fn resolution(&self) -> usize {
-        self.current_resolution
+        if self.flattened_resolutions {
+            0
+        } else {
+            self.current_resolution
+        }
     }
 
     fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
-        if self.meta_xml.is_empty() {
-            return None;
-        }
+        let base_meta = self.base_metadata.as_ref().or(self.meta.as_ref())?;
         let mut ome = crate::common::ome_metadata::OmeMetadata::from_czi_xml(&self.meta_xml);
-        // Override channel enumeration to match ZeissCZIReader: the channel
-        // count and wavelengths come from Information/Image/Dimensions/Channels,
-        // names from DisplaySetting/Channels (the generic XML scan over-counts
-        // by also picking up Experiment setup channels).
-        let channels = build_czi_channels(&self.meta_xml);
-        if let Some(image) = ome.images.first_mut() {
-            image.physical_size_x = czi_physical_size(&self.meta_xml, "X");
-            image.physical_size_y = czi_physical_size(&self.meta_xml, "Y");
-            image.physical_size_z = czi_physical_size(&self.meta_xml, "Z");
-            if !channels.is_empty() {
-                image.channels = channels;
-                if self.meta.as_ref().map(|m| m.is_rgb).unwrap_or(false) {
+        let information = first_element_body(&self.meta_xml, "Information");
+        let instrument_xml = information.and_then(|v| first_element_body(v, "Instrument"));
+        let light_sources = instrument_xml
+            .map(|v| element_blocks(v, "LightSource"))
+            .unwrap_or_default();
+        let filter_sets = instrument_xml
+            .map(|v| element_blocks(v, "FilterSet"))
+            .unwrap_or_default();
+        if ome.instruments.is_empty()
+            && (!light_sources.is_empty()
+                || !filter_sets.is_empty()
+                || instrument_xml.is_some_and(|v| find_start_tag(v, "Objective", 0).is_some()))
+        {
+            ome.instruments
+                .push(crate::common::ome_metadata::OmeInstrument {
+                    id: Some(crate::common::ome_metadata::create_lsid("Instrument", &[0])),
+                    ..Default::default()
+                });
+        }
+        if let Some(instrument) = ome.instruments.first_mut() {
+            if let Some(scope) = instrument_xml {
+                let objectives = element_blocks(scope, "Objective");
+                if !objectives.is_empty() {
+                    instrument.objectives.clear();
+                    for block in objectives {
+                        let manufacturer = first_element_body(block, "Manufacturer");
+                        instrument
+                            .objectives
+                            .push(crate::common::ome_metadata::OmeObjective {
+                                id: start_tag_slice(block, 0)
+                                    .and_then(|v| xml_start_tag_attr(v, "Id")),
+                                model: manufacturer.and_then(|v| child_value(v, "Model")),
+                                manufacturer: manufacturer
+                                    .and_then(|v| child_value(v, "Manufacturer")),
+                                serial_number: manufacturer
+                                    .and_then(|v| child_value(v, "SerialNumber")),
+                                nominal_magnification: child_value(block, "NominalMagnification")
+                                    .or_else(|| child_value(block, "Magnification"))
+                                    .and_then(|v| v.parse().ok()),
+                                lens_na: child_value(block, "LensNA").and_then(|v| v.parse().ok()),
+                                correction: child_value(block, "Correction"),
+                                immersion: child_value(block, "Immersion"),
+                                working_distance: child_value(block, "WorkingDistance")
+                                    .and_then(|v| v.parse().ok()),
+                                ..Default::default()
+                            });
+                    }
+                }
+                for (filter, block) in instrument
+                    .filters
+                    .iter_mut()
+                    .zip(element_blocks(scope, "Filter"))
+                {
+                    filter.id = start_tag_slice(block, 0).and_then(|v| xml_start_tag_attr(v, "Id"));
+                    if let Some(manufacturer) = first_element_body(block, "Manufacturer") {
+                        filter.model = child_value(manufacturer, "Model").or(filter.model.take());
+                        filter.manufacturer = child_value(manufacturer, "Manufacturer");
+                    }
+                }
+                for (dichroic, block) in instrument
+                    .dichroics
+                    .iter_mut()
+                    .zip(element_blocks(scope, "Dichroic"))
+                {
+                    dichroic.id = start_tag_slice(block, 0)
+                        .and_then(|v| xml_start_tag_attr(v, "Id"))
+                        .map(|v| format!("Dichroic:{v}"));
+                    if let Some(manufacturer) = first_element_body(block, "Manufacturer") {
+                        dichroic.model =
+                            child_value(manufacturer, "Model").or(dichroic.model.take());
+                        dichroic.manufacturer = child_value(manufacturer, "Manufacturer");
+                    }
+                }
+                if let Some(microscope) = first_element_body(scope, "Microscope") {
+                    if let Some(manufacturer) = first_element_body(microscope, "Manufacturer") {
+                        instrument.microscope_model = child_value(manufacturer, "Model")
+                            .or(instrument.microscope_model.take());
+                        instrument.microscope_manufacturer =
+                            child_value(manufacturer, "Manufacturer");
+                    }
+                    instrument.microscope_type = child_value(microscope, "Type");
+                }
+                for detector in &mut instrument.detectors {
+                    for block in element_blocks(scope, "Detector") {
+                        let Some(tag) = start_tag_slice(block, 0) else {
+                            continue;
+                        };
+                        let Some(id) = xml_start_tag_attr(tag, "Id") else {
+                            continue;
+                        };
+                        let id: String = id.chars().filter(|c| !c.is_whitespace()).collect();
+                        let id = if id.starts_with("Detector:") {
+                            id
+                        } else {
+                            format!("Detector:{id}")
+                        };
+                        if detector.id.as_deref() != Some(id.as_str()) {
+                            continue;
+                        }
+                        if let Some(manufacturer) = first_element_body(block, "Manufacturer") {
+                            detector.model =
+                                child_value(manufacturer, "Model").or(detector.model.take());
+                            detector.manufacturer = child_value(manufacturer, "Manufacturer");
+                            detector.serial_number = child_value(manufacturer, "SerialNumber");
+                            detector.lot_number = child_value(manufacturer, "LotNumber");
+                        }
+                        detector.zoom = child_value(block, "Zoom")
+                            .and_then(|v| v.split(',').next()?.parse().ok());
+                        detector.amplification_gain =
+                            child_value(block, "AmplificationGain").and_then(|v| v.parse().ok());
+                    }
+                }
+            }
+            for (index, block) in light_sources.iter().enumerate() {
+                let manufacturer = first_element_body(block, "Manufacturer");
+                let name = start_tag_slice(block, 0).and_then(|v| xml_start_tag_attr(v, "Name"));
+                let mut model = manufacturer.and_then(|v| child_value(v, "Model"));
+                let kind = first_element_body(block, "LightSourceType").map(|body| {
+                    // Java distinguishes an absent type from an existing empty
+                    // element. Only absent type plus absent model infers by Name.
+                    ["Laser", "Arc", "LightEmittingDiode", "Filament"]
+                        .into_iter()
+                        .find(|tag| find_start_tag(body, tag, 0).is_some())
+                        .unwrap_or(body.trim())
+                });
+                let kind = if kind.is_none() && model.is_none() {
+                    model = Some(name.unwrap_or_default());
+                    Some(
+                        if model
+                            .as_deref()
+                            .is_some_and(|value| value.starts_with("LED"))
+                        {
+                            "LightEmittingDiode"
+                        } else {
+                            "Laser"
+                        },
+                    )
+                } else {
+                    kind
+                };
+                let Some(kind @ ("Laser" | "Arc" | "LightEmittingDiode" | "Filament")) = kind
+                else {
+                    continue;
+                };
+                instrument
+                    .light_sources
+                    .push(crate::common::ome_metadata::OmeLightSource {
+                        id: Some(crate::common::ome_metadata::create_lsid(
+                            "LightSource",
+                            &[0, index],
+                        )),
+                        model,
+                        manufacturer: manufacturer.and_then(|v| child_value(v, "Manufacturer")),
+                        serial_number: manufacturer.and_then(|v| child_value(v, "SerialNumber")),
+                        lot_number: manufacturer.and_then(|v| child_value(v, "LotNumber")),
+                        light_source_type: Some(kind.into()),
+                        power: child_value(block, "Power").and_then(|v| v.parse().ok()),
+                        ..Default::default()
+                    });
+            }
+            for block in &filter_sets {
+                let manufacturer = first_element_body(block, "Manufacturer");
+                let mut set = crate::common::ome_metadata::OmeFilterSet {
+                    id: start_tag_slice(block, 0).and_then(|v| xml_start_tag_attr(v, "Id")),
+                    model: manufacturer.and_then(|v| child_value(v, "Model")),
+                    manufacturer: manufacturer.and_then(|v| child_value(v, "Manufacturer")),
+                    serial_number: manufacturer.and_then(|v| child_value(v, "SerialNumber")),
+                    lot_number: manufacturer.and_then(|v| child_value(v, "LotNumber")),
+                    ..Default::default()
+                };
+                for (tag, target) in [
+                    ("ExcitationFilterRef", &mut set.excitation_filter_ids),
+                    ("EmissionFilterRef", &mut set.emission_filter_ids),
+                ] {
+                    let mut pos = 0;
+                    while let Some((start, _, after)) = find_start_tag(block, tag, pos) {
+                        let value = child_value(&block[start..], tag)
+                            .or_else(|| xml_start_tag_attr(start_tag_slice(block, start)?, "Id"));
+                        if let Some(value) = value {
+                            target.push(value);
+                        }
+                        pos = after;
+                    }
+                }
+                set.dichroic_ref = child_value(block, "DichroicRef").or_else(|| {
+                    find_start_tag(block, "DichroicRef", 0).and_then(|(start, _, _)| {
+                        xml_start_tag_attr(start_tag_slice(block, start)?, "Id")
+                    })
+                });
+                instrument.filter_sets.push(set);
+            }
+        }
+        let hardware = first_element_body(&self.meta_xml, "HardwareSetting");
+        let objective_changer =
+            hardware.and_then(|body| first_element_body(body, "ObjectiveChanger"));
+        let mut hardware_objective_index = None;
+        if let Some(hardware) = hardware {
+            if ome.instruments.is_empty() {
+                ome.instruments
+                    .push(crate::common::ome_metadata::OmeInstrument {
+                        id: Some(crate::common::ome_metadata::create_lsid("Instrument", &[0])),
+                        ..Default::default()
+                    });
+            }
+            let instrument = &mut ome.instruments[0];
+            if let Some(microscope) = find_start_tag(hardware, "Microscope", 0)
+                .and_then(|(start, _, _)| start_tag_slice(hardware, start))
+            {
+                instrument.microscope_model =
+                    Some(xml_start_tag_attr(microscope, "Name").unwrap_or_default());
+            }
+            if let Some(changer) = objective_changer {
+                let objectives = element_blocks(changer, "Objective");
+                let position = child_value(changer, "Position")
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .and_then(|value| value.checked_sub(1));
+                let settings_id = information
+                    .and_then(|body| first_element_body(body, "Image"))
+                    .and_then(|body| first_element_body(body, "ObjectiveSettings"))
+                    .and_then(|body| {
+                        find_start_tag(body, "ObjectiveRef", 0).and_then(|(start, _, _)| {
+                            xml_start_tag_attr(start_tag_slice(body, start)?, "Id")
+                        })
+                    });
+                for (index, block) in objectives.iter().enumerate() {
+                    if instrument.objectives.len() <= index {
+                        instrument.objectives.push(Default::default());
+                    }
+                    let objective = &mut instrument.objectives[index];
+                    let tag = start_tag_slice(block, 0).unwrap_or("");
+                    objective.id = Some(crate::common::ome_metadata::create_lsid(
+                        "Objective",
+                        &[0, index],
+                    ));
+                    objective.model = Some(xml_start_tag_attr(tag, "Model").unwrap_or_default());
+                    objective.serial_number =
+                        Some(xml_start_tag_attr(tag, "UniqueName").unwrap_or_default());
+                    objective.immersion = Some(
+                        child_value(block, "Immersions")
+                            .filter(|value| {
+                                [
+                                    "Air",
+                                    "Oil",
+                                    "Water",
+                                    "WaterDipping",
+                                    "Multi",
+                                    "Glycerol",
+                                    "Other",
+                                ]
+                                .contains(&value.as_str())
+                            })
+                            .unwrap_or_else(|| "Other".into()),
+                    );
+                    objective.correction = Some("Other".into());
+                    objective.nominal_magnification = child_value(block, "Magnification")
+                        .and_then(|value| value.parse().ok())
+                        .or(objective.nominal_magnification);
+                    objective.lens_na = child_value(block, "NumericalAperture")
+                        .and_then(|value| value.parse().ok())
+                        .or(objective.lens_na);
+                    objective.working_distance = child_value(block, "WorkingDistance")
+                        .and_then(|value| value.parse().ok())
+                        .or(objective.working_distance);
+                    if position == Some(index) || (objectives.len() == 1 && settings_id.is_some()) {
+                        hardware_objective_index = Some(index);
+                    }
+                }
+            }
+        }
+        let template = ome.images.first().cloned().unwrap_or_default();
+        ome.images.clear();
+        let mut channels = build_czi_channels(&self.meta_xml);
+        let channel_xml = information
+            .and_then(|v| first_element_body(v, "Image"))
+            .and_then(|v| first_element_body(v, "Dimensions"))
+            .and_then(|v| first_element_body(v, "Channels"))
+            .map(channel_blocks_in_channels)
+            .unwrap_or_default();
+        for (index, channel) in channels.iter_mut().enumerate() {
+            if let Some(instrument) = ome.instruments.first() {
+                if channel.detector_ref.as_deref().is_some_and(|id| {
+                    !instrument
+                        .detectors
+                        .iter()
+                        .any(|v| v.id.as_deref() == Some(id))
+                }) {
+                    channel.detector_ref = None;
+                    channel.detector_settings_binning = None;
+                }
+            } else {
+                channel.detector_ref = None;
+                channel.detector_settings_binning = None;
+            }
+            if let Some(block) = channel_xml.get(index) {
+                let light_id = find_start_tag(block, "LightSource", 0).and_then(|(start, _, _)| {
+                    xml_start_tag_attr(start_tag_slice(block, start)?, "Id")
+                });
+                if let Some((light_id, intensity)) = light_id.zip(child_value(block, "Intensity")) {
+                    if let Some(light_index) = light_sources.iter().position(|source| {
+                        start_tag_slice(source, 0)
+                            .and_then(|v| xml_start_tag_attr(v, "Id"))
+                            .as_deref()
+                            == Some(light_id.as_str())
+                    }) {
+                        let id = crate::common::ome_metadata::create_lsid(
+                            "LightSource",
+                            &[0, light_index],
+                        );
+                        if !ome.instruments.first().is_some_and(|instrument| {
+                            instrument
+                                .light_sources
+                                .iter()
+                                .any(|source| source.id.as_deref() == Some(id.as_str()))
+                        }) {
+                            continue;
+                        }
+                        channel.light_source_settings_id = Some(id);
+                        let attenuation = intensity
+                            .replace([' ', '%'], "")
+                            .parse::<f64>()
+                            .ok()
+                            .map(|v| 1.0 - v / 100.0);
+                        channel.light_source_settings_attenuation = attenuation
+                            .filter(|v| *v > 1e-6 && 1.0 - *v > 1e-6)
+                            .map(|v| v as f32 as f64);
+                    }
+                }
+            }
+        }
+        let tracks = first_element_body(&self.meta_xml, "HardwareSetting")
+            .and_then(|v| first_element_body(v, "Acquisition"))
+            .and_then(|v| first_element_body(v, "MultiTrackSetup"))
+            .map(|v| element_blocks(v, "Track"))
+            .unwrap_or_default();
+        let mut exposures = Vec::new();
+        for (index, track) in tracks.iter().enumerate() {
+            while channels.len() <= index {
+                channels.push(Default::default());
+            }
+            let channel = first_element_body(track, "Channel");
+            channels[index].detector_settings_gain = channel
+                .and_then(|v| child_value(v, "EMGain"))
+                .and_then(|v| v.parse().ok());
+            exposures.push(
+                channel
+                    .and_then(|v| child_value(v, "ExposureTime"))
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .map(|v| v / 1000.0),
+            );
+        }
+        let filename = self
+            .path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .and_then(|v| v.to_str())
+            .unwrap_or("");
+        let width = self.series_count().to_string().len();
+        let image_xml = first_element_body(&self.meta_xml, "Information")
+            .and_then(|v| first_element_body(v, "Image"));
+        let acquired_date = image_xml.and_then(|v| child_value(v, "AcquisitionDateAndTime"));
+        let acquisition_start = acquired_date.as_deref().and_then(czi_timestamp_seconds);
+        let objective_settings = image_xml.and_then(|v| first_element_body(v, "ObjectiveSettings"));
+        let scene_xml = image_xml
+            .and_then(|v| first_element_body(v, "Dimensions"))
+            .and_then(|v| first_element_body(v, "S"));
+        let scenes = scene_xml
+            .map(|v| element_blocks(v, "Scene"))
+            .unwrap_or_default();
+        for (logical_series, series) in self.series.iter().enumerate() {
+            let count = if self.flattened_resolutions {
+                series.resolutions.len().max(1)
+            } else {
+                1
+            };
+            for resolution in 0..count {
+                let mut meta = series
+                    .attachment
+                    .as_ref()
+                    .map(|v| v.2.clone())
+                    .unwrap_or_else(|| base_meta.clone());
+                let logical_channels =
+                    (meta.image_count / meta.size_z.max(1) / meta.size_t.max(1)).max(1);
+                let spp = self
+                    .pixel_types
+                    .get(series.pixel_type_index)
+                    .and_then(|code| czi_pixel_type(*code).ok())
+                    .map(|(pixel_type, spp)| {
+                        meta.pixel_type = pixel_type;
+                        spp
+                    })
+                    .unwrap_or(1);
+                meta.is_rgb = spp >= 3;
+                meta.size_c = logical_channels * if meta.is_rgb { spp } else { 1 };
+                meta.series_metadata.insert(
+                    "rgb_channel_count".into(),
+                    MetadataValue::Int(if meta.is_rgb { spp as i64 } else { 1 }),
+                );
+
+                if let Some(level) = series.resolutions.get(resolution) {
+                    meta.size_x = level.width;
+                    meta.size_y = level.height;
+                }
+                meta.resolution_count = if self.flattened_resolutions {
+                    1
+                } else {
+                    series.resolutions.len().max(1) as u32
+                };
+                let image_index = ome.images.len();
+                if let Some((_, name, _)) = &series.attachment {
+                    ome.images.push(crate::common::ome_metadata::OmeImage {
+                        name: Some(name.clone()),
+                        instrument_ref: (!ome.instruments.is_empty()).then_some(0),
+                        acquisition_date: acquired_date.clone(),
+                        planes: czi_default_ome_planes(&meta),
+                        ..Default::default()
+                    });
+                    let _ = ome.populate_pixels(&meta, image_index);
+                    continue;
+                }
+                let mut image = template.clone();
+                image.acquisition_date = acquired_date.clone().or_else(|| {
+                    self.entries
+                        .first()
+                        .and_then(|v| v.acquisition_time.clone())
+                });
+                if let Some(settings) = objective_settings {
+                    image.objective_settings_refractive_index =
+                        child_value(settings, "RefractiveIndex").and_then(|v| v.parse().ok());
+                    image.objective_settings_correction_collar =
+                        child_value(settings, "CorrectionCollar").and_then(|v| v.parse().ok());
+                    image.objective_settings_medium = child_value(settings, "Medium");
+                }
+                if let Some(objectives) = ome.instruments.first().map(|v| &v.objectives) {
+                    let selected = objective_settings.and_then(|scope| {
+                        find_start_tag(scope, "ObjectiveRef", 0).and_then(|(start, _, _)| {
+                            xml_start_tag_attr(start_tag_slice(scope, start)?, "Id")
+                        })
+                    });
+                    if let Some(id) = selected {
+                        image.objective_ref = objectives
+                            .iter()
+                            .position(|v| v.id.as_deref() == Some(id.as_str()));
+                    }
+                    if image.objective_ref.is_none() && objectives.len() == 1 {
+                        image.objective_ref = Some(0);
+                    }
+                    if let Some(index) = hardware_objective_index {
+                        image.objective_ref = Some(index);
+                    }
+                }
+                image.time_increment = image_xml
+                    .and_then(|v| first_element_body(v, "Dimensions"))
+                    .and_then(|v| first_element_body(v, "T"))
+                    .and_then(|v| first_element_body(v, "Positions"))
+                    .and_then(|v| first_element_body(v, "Interval"))
+                    .and_then(|v| child_value(v, "Increment"))
+                    .and_then(|v| v.parse().ok());
+
+                image.name = Some(if self.flattened_resolutions {
+                    format!("{filename} #{:0width$}", image_index + 1)
+                } else if self.series.len() == 1 {
+                    String::new()
+                } else {
+                    format!("Scene #{:0width$}", image_index + 1)
+                });
+                image.physical_size_x = czi_physical_size(&self.meta_xml, "X");
+                image.physical_size_y = czi_physical_size(&self.meta_xml, "Y");
+                image.physical_size_z = czi_physical_size(&self.meta_xml, "Z");
+                if series.palm_size.is_none() {
+                    if let (Some(base), Some(level)) = (
+                        series.resolutions.first(),
+                        series.resolutions.get(resolution),
+                    ) {
+                        if level.width > 0 {
+                            image.physical_size_x = image
+                                .physical_size_x
+                                .map(|v| v * base.width as f64 / level.width as f64);
+                        }
+                        if level.height > 0 {
+                            image.physical_size_y = image
+                                .physical_size_y
+                                .map(|v| v * base.height as f64 / level.height as f64);
+                        }
+                    }
+                }
+                if !channels.is_empty() {
+                    image.channels = channels.clone();
+                }
+                image.channels.truncate(logical_channels as usize);
+                if series.palm_size.is_some() {
+                    if let (Some(first), Some(source)) =
+                        (image.channels.first_mut(), channels.get(logical_series))
+                    {
+                        first.name = source.name.clone();
+                    }
+                }
+                if meta.is_rgb {
                     for channel in &mut image.channels {
                         channel.color = None;
+                        channel.samples_per_pixel = spp;
                     }
-                }
-            }
-            // ZeissCZIReader names the single-series image "<filename> #1"
-            // (base name, then " #" + 1-based series index).
-            if image.name.is_none() {
-                if let Some(path) = &self.path {
-                    if let Some(file) = path.file_name().and_then(|f| f.to_str()) {
-                        image.name = Some(format!("{} #1", file));
-                    }
-                }
-            }
-        }
-        if let Some(meta) = self.meta.as_ref() {
-            let _ = ome.populate_pixels(meta, 0);
-            if let Some(image) = ome.images.first_mut() {
-                if image.planes.is_empty() {
-                    image.planes = czi_default_ome_planes(meta);
                 }
                 if !ome.instruments.is_empty() {
                     image.instrument_ref = Some(0);
                 }
+                image.planes = czi_default_ome_planes(&meta);
+                let scene = scenes.get(logical_series).copied();
+                let position = scene.and_then(|v| {
+                    find_start_tag(v, "Position", 0)
+                        .and_then(|(start, _, _)| start_tag_slice(v, start))
+                });
+                let center: Vec<f64> = scene
+                    .and_then(|v| child_value(v, "CenterPosition"))
+                    .map(|v| v.split(',').filter_map(|n| n.trim().parse().ok()).collect())
+                    .unwrap_or_default();
+                let scene_x = position
+                    .and_then(|v| xml_start_tag_attr(v, "X"))
+                    .and_then(|v| v.parse().ok())
+                    .or_else(|| center.first().copied());
+                let scene_y = position
+                    .and_then(|v| xml_start_tag_attr(v, "Y"))
+                    .and_then(|v| v.parse().ok())
+                    .or_else(|| center.get(1).copied());
+                let scene_z = position
+                    .and_then(|v| xml_start_tag_attr(v, "Z"))
+                    .and_then(|v| v.parse::<f64>().ok());
+                let mut start_time = acquisition_start;
+                for (plane_index, plane) in image.planes.iter_mut().enumerate() {
+                    let Some(entries) = self.matching_entries_at_resolution(
+                        plane_index as u32,
+                        resolution,
+                        logical_series,
+                    ) else {
+                        continue;
+                    };
+                    let Some(first) = entries.first() else {
+                        continue;
+                    };
+                    let range_x = entries.iter().filter_map(|v| v.stage_x).fold(
+                        None,
+                        |range: Option<(f64, f64)>, v| {
+                            Some(range.map_or((v, v), |(lo, hi)| (lo.min(v), hi.max(v))))
+                        },
+                    );
+                    let range_y = entries.iter().filter_map(|v| v.stage_y).fold(
+                        None,
+                        |range: Option<(f64, f64)>, v| {
+                            Some(range.map_or((v, v), |(lo, hi)| (lo.min(v), hi.max(v))))
+                        },
+                    );
+                    let x = range_x.map(|(lo, hi)| (lo + hi) / 2.0).or(scene_x);
+                    let y = range_y.map(|(lo, hi)| (lo + hi) / 2.0).or(scene_y);
+                    plane.position_x = x.or(Some(first.dim_start("X") as f64));
+                    plane.position_y = y.or(Some(first.dim_start("Y") as f64));
+                    plane.position_x_unit = Some(
+                        if x.is_some() {
+                            "µm"
+                        } else {
+                            "reference frame"
+                        }
+                        .into(),
+                    );
+                    plane.position_y_unit = Some(
+                        if y.is_some() {
+                            "µm"
+                        } else {
+                            "reference frame"
+                        }
+                        .into(),
+                    );
+                    plane.position_z = first.stage_z.or_else(|| {
+                        scene_z
+                            .map(|v| v + plane.the_z as f64 * image.physical_size_z.unwrap_or(0.0))
+                    });
+                    plane.position_z_unit = plane.position_z.map(|_| "µm".into());
+                    if start_time.is_none() {
+                        start_time = first.timestamp;
+                    }
+                    plane.delta_t = first
+                        .timestamp
+                        .zip(start_time)
+                        .map(|(value, start)| value - start)
+                        .or_else(|| {
+                            self.timestamps
+                                .get(if self.timestamps.len() == meta.image_count as usize {
+                                    plane_index
+                                } else {
+                                    plane.the_t as usize
+                                })
+                                .copied()
+                        });
+                    plane.exposure_time = first
+                        .exposure_time
+                        .or_else(|| exposures.get(plane.the_c as usize).copied().flatten());
+                    if plane_index == 0 {
+                        image.stage_label = Some(crate::common::ome_metadata::OmeStageLabel {
+                            name: Some(format!("Scene position #{image_index}")),
+                            x: plane.position_x,
+                            y: plane.position_y,
+                            z: plane.position_z,
+                            x_unit: plane.position_x_unit.clone(),
+                            y_unit: plane.position_y_unit.clone(),
+                            z_unit: plane.position_z_unit.clone(),
+                        });
+                    }
+                }
+
+                ome.images.push(image);
+                let _ = ome.populate_pixels(&meta, image_index);
             }
         }
         Some(ome)
@@ -2565,8 +3735,8 @@ impl FormatReader for ZeissCziReader {
 
 fn czi_default_ome_planes(meta: &ImageMetadata) -> Vec<crate::common::ome_metadata::OmePlane> {
     let size_z = meta.size_z.max(1) as usize;
-    let size_c = meta.size_c.max(1) as usize;
     let size_t = meta.size_t.max(1) as usize;
+    let size_c = (meta.image_count as usize / size_z / size_t).max(1);
     let mut planes = Vec::with_capacity(meta.image_count as usize);
     for plane in 0..meta.image_count as usize {
         let (the_z, the_c, the_t) =
@@ -3101,7 +4271,7 @@ mod tests {
         reader.set_id(&path).unwrap();
 
         let meta = reader.metadata();
-        assert_eq!(meta.size_c, 2);
+        assert_eq!(meta.size_c, 6);
         assert_eq!(meta.image_count, 2);
         assert!(meta.is_rgb);
         assert_eq!(reader.open_bytes(0).unwrap(), vec![3, 2, 1, 6, 5, 4]);
@@ -3205,6 +4375,335 @@ mod tests {
     }
 
     #[test]
+    fn czi_numbered_parts_without_directory_route_planes_to_their_source_files() {
+        let dir = std::env::temp_dir().join(format!("bf_czi_parts_{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let master = dir.join("scan.czi");
+        let part = dir.join("scan (1).czi");
+        let first = write_synthetic_czi_entries(
+            "master_part",
+            vec![(directory_entry_zc_dims(0, 0, 0, 0, 2, 1), vec![7, 8])],
+        );
+        fs::copy(&first, &master).unwrap();
+        let second = write_synthetic_czi_entries(
+            "second_part",
+            vec![(directory_entry_zc_dims(0, 0, 1, 0, 2, 1), vec![9, 10])],
+        );
+        let mut bytes = fs::read(&second).unwrap();
+        let position = read_i64(&bytes, SEG_HEADER + 80 + SEG_HEADER + 128 + 6) as usize;
+        let embedded = directory_entry_zc_dims(0, position as i64, 1, 0, 2, 1);
+        bytes[position + SEG_HEADER + 16..position + SEG_HEADER + 16 + 132]
+            .copy_from_slice(&embedded[..132]);
+        put_u64(&mut bytes, SEG_HEADER + 36, 0); // only segment records identify the second file's plane
+        fs::write(&part, bytes).unwrap();
+        let mut reader = ZeissCziReader::new();
+        reader.set_id(&part).unwrap(); // numbered entry point must resolve the master
+        assert_eq!(reader.path.as_deref(), Some(master.as_path()));
+        assert_eq!(reader.metadata().size_z, 2);
+        assert_eq!(reader.metadata().image_count, 2);
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![7, 8]);
+        assert_eq!(reader.open_bytes(1).unwrap(), vec![9, 10]);
+        assert_eq!(reader.open_bytes_region(1, 1, 0, 1, 1).unwrap(), vec![10]);
+        fs::remove_file(first).unwrap();
+        fs::remove_file(second).unwrap();
+        reader.close().unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn czi_thumbnail_resamples_full_plane_like_java() {
+        let bytes: Vec<u8> = (0..64).flat_map(|_| 0..=255u8).collect();
+        let path = write_synthetic_czi_entries(
+            "thumbnail_resample",
+            vec![(directory_entry(0, 0, 0, 256, 64), bytes)],
+        );
+        let mut reader = ZeissCziReader::new();
+        reader.set_id(&path).unwrap();
+        let thumb = reader.open_thumb_bytes(0).unwrap();
+        assert_eq!(thumb.len(), 128 * 32);
+        // Upstream FormatTools/AWTImageTools oracle: area averaging then
+        // grayscale-to-sRGB rendering, rather than a center crop.
+        assert_eq!(
+            &thumb[..16],
+            &[7, 25, 36, 44, 52, 58, 63, 68, 72, 76, 80, 84, 87, 91, 94, 97]
+        );
+        assert_eq!(
+            (reader.metadata().size_x, reader.metadata().size_y),
+            (256, 64)
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn czi_bare_relative_path_uses_current_directory() {
+        let fixture = write_synthetic_czi_entries(
+            "bare_relative",
+            vec![(directory_entry(0, 0, 0, 2, 1), vec![1, 2])],
+        );
+        let filename = format!("bf_czi_relative_{}.czi", std::process::id());
+        let relative = Path::new(&filename);
+        fs::copy(&fixture, relative).unwrap();
+        let mut reader = ZeissCziReader::new();
+        let result = reader.set_id(relative);
+        fs::remove_file(relative).unwrap();
+        result.unwrap();
+        fs::remove_file(fixture).unwrap();
+    }
+
+    #[test]
+    fn czi_attachment_labels_previews_and_timestamp_arrays_are_exposed() {
+        let main = write_synthetic_czi_with_xml(
+            "attachment_main",
+            vec![
+                (directory_entry(0, 0, 0, 2, 1), vec![1, 2]),
+                (directory_entry(0, 0, 1, 2, 1), vec![3, 4]),
+            ],
+            "<Metadata><Information><Image><ComponentBitCount>12</ComponentBitCount></Image></Information></Metadata>",
+        );
+        let label = write_synthetic_czi_entries(
+            "attachment_label",
+            vec![
+                (directory_entry(3, 0, 0, 1, 1), vec![5, 6, 7]),
+                (directory_entry(3, 0, 1, 1, 1), vec![15, 16, 17]),
+            ],
+        );
+        let preview = write_synthetic_czi_with_xml(
+            "attachment_preview",
+            vec![(directory_entry(1, 0, 0, 2, 2), vec![8, 0, 9, 0, 10, 0, 11, 0])],
+            "<Metadata><Information><Image><ComponentBitCount>12</ComponentBitCount></Image></Information></Metadata>",
+        );
+        let mut timestamps = vec![0; 8];
+        timestamps.extend_from_slice(&0.25f64.to_le_bytes());
+        timestamps.extend_from_slice(&1.5f64.to_le_bytes());
+        let mut bytes = fs::read(&main).unwrap();
+        let mut directory_entries = Vec::new();
+        for (name, data) in [
+            ("Label", fs::read(&label).unwrap()),
+            ("SlidePreview", fs::read(&preview).unwrap()),
+            ("TimeStamps", timestamps),
+        ] {
+            let position = bytes.len() as u64;
+            let mut body = vec![0u8; 256];
+            put_i32(&mut body, 0, data.len() as i32);
+            body[16..18].copy_from_slice(b"A1");
+            put_u64(&mut body, 28, position);
+            body[56..59].copy_from_slice(b"CZI");
+            body[64..64 + name.len()].copy_from_slice(name.as_bytes());
+            directory_entries.extend_from_slice(&body[16..144]);
+            bytes.extend_from_slice(&segment_header(
+                "ZISRAWATTACH",
+                (SEG_HEADER + 256 + data.len()) as u64,
+            ));
+            bytes.extend_from_slice(&body);
+            bytes.extend_from_slice(&data);
+        }
+        let directory_position = bytes.len() as u64;
+        let mut directory = vec![0u8; 256];
+        put_i32(&mut directory, 0, 3);
+        bytes.extend_from_slice(&segment_header(
+            "ZISRAWATTDIR",
+            (SEG_HEADER + directory.len() + directory_entries.len()) as u64,
+        ));
+        bytes.extend_from_slice(&directory);
+        bytes.extend_from_slice(&directory_entries);
+        // The directory is also advertised by the standard file header.
+        put_u64(&mut bytes, SEG_HEADER + 72, directory_position);
+        fs::write(&main, bytes).unwrap();
+        let mut reader = ZeissCziReader::new();
+        reader.set_id(&main).unwrap();
+        assert_eq!(reader.series_count(), 3);
+        assert_eq!(reader.open_bytes(1).unwrap(), vec![3, 4]);
+        let ome = reader.ome_metadata().unwrap();
+        assert_eq!(ome.images.len(), 3);
+        assert_eq!(ome.images[0].planes[0].delta_t, Some(0.25));
+        assert_eq!(ome.images[0].planes[1].delta_t, Some(1.5));
+        assert_eq!(ome.images[1].name.as_deref(), Some("label image"));
+        assert_eq!(ome.images[2].name.as_deref(), Some("macro image"));
+        reader.set_series(1).unwrap();
+        assert!(reader.metadata().thumbnail);
+        assert_eq!(reader.metadata().size_c, 6);
+        assert_eq!(reader.metadata().bits_per_pixel, 8);
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![7, 6, 5]);
+        assert_eq!(reader.open_bytes(1).unwrap(), vec![7, 6, 5]);
+        reader.set_series(2).unwrap();
+        assert_eq!(reader.metadata().bits_per_pixel, 12);
+        assert_eq!(
+            reader.open_bytes_region(0, 1, 0, 1, 2).unwrap(),
+            vec![9, 0, 11, 0]
+        );
+        reader.set_series(0).unwrap();
+        assert_eq!(reader.metadata().size_c, 2);
+        assert_eq!(reader.open_bytes(1).unwrap(), vec![3, 4]);
+        let xml = reader.ome_metadata().unwrap().to_ome_xml(reader.metadata());
+        assert_eq!(xml.matches("<Image ").count(), 3);
+        assert!(xml.contains("SizeX=\"1\" SizeY=\"1\""));
+        fs::remove_file(main).unwrap();
+        fs::remove_file(label).unwrap();
+        fs::remove_file(preview).unwrap();
+    }
+
+    #[test]
+    fn czi_timestamp_origin_is_per_scene_without_acquisition_date() {
+        let path = write_synthetic_czi_entries(
+            "scene_timestamp_origins",
+            vec![
+                (directory_entry_scene(0, 0, 0, 2, 1), vec![1, 2]),
+                (directory_entry_scene(0, 0, 1, 2, 1), vec![3, 4]),
+            ],
+        );
+        let mut reader = ZeissCziReader::new();
+        reader.set_id(&path).unwrap();
+        reader.entries[0].timestamp = Some(100.0);
+        reader.entries[1].timestamp = Some(200.0);
+        let ome = reader.ome_metadata().unwrap();
+        assert_eq!(ome.images[0].planes[0].delta_t, Some(0.0));
+        assert_eq!(ome.images[1].planes[0].delta_t, Some(0.0));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn czi_hardware_objectives_overlay_information_and_empty_light_types_are_skipped() {
+        let xml = r#"<Metadata><Information><Image><ObjectiveSettings><ObjectiveRef Id="info-objective"/></ObjectiveSettings><Dimensions><Channels><Channel><LightSource Id="empty"/><Intensity>50 %</Intensity></Channel></Channels></Dimensions></Image><Instrument>
+        <Objectives><Objective Id="info-objective"><Manufacturer><Manufacturer>Preserved maker</Manufacturer><Model>Information lens</Model></Manufacturer><NominalMagnification>20</NominalMagnification></Objective></Objectives>
+        <LightSources><LightSource Id="typed"><LightSourceType><Laser/></LightSourceType></LightSource><LightSource Id="empty" Name="LED skipped"><LightSourceType/></LightSource><LightSource Id="inferred" Name="LED inferred"/><LightSource Id="modeled"><Manufacturer><Model>Unspecified type</Model></Manufacturer></LightSource><LightSource Id="unknown"><LightSourceType><Unknown/></LightSourceType></LightSource><LightSource Id="text"><LightSourceType>Arc</LightSourceType></LightSource></LightSources>
+        </Instrument></Information><HardwareSetting><Microscope Name="Hardware microscope"/><ObjectiveChanger><ChangerElements>
+        <Objective Model="Hardware lens A" UniqueName="serial-A"><Immersions>Air</Immersions><Magnification>40</Magnification><NumericalAperture>0.8</NumericalAperture><WorkingDistance>300</WorkingDistance></Objective>
+        <Objective Model="Hardware lens B" UniqueName="serial-B"><Immersions>Oil</Immersions><Magnification>63</Magnification><NumericalAperture>1.4</NumericalAperture><WorkingDistance>190</WorkingDistance></Objective>
+        </ChangerElements><Position>2</Position></ObjectiveChanger></HardwareSetting></Metadata>"#;
+        let path = write_synthetic_czi_with_xml(
+            "hardware_instrument_overlay",
+            vec![(directory_entry(0, 0, 0, 2, 1), vec![1, 2])],
+            xml,
+        );
+        let mut reader = ZeissCziReader::new();
+        reader.set_id(&path).unwrap();
+        let ome = reader.ome_metadata().unwrap();
+        let instrument = &ome.instruments[0];
+        assert_eq!(
+            instrument.microscope_model.as_deref(),
+            Some("Hardware microscope")
+        );
+        assert_eq!(instrument.objectives.len(), 2);
+        assert_eq!(
+            instrument.objectives[0].manufacturer.as_deref(),
+            Some("Preserved maker")
+        );
+        assert_eq!(
+            instrument.objectives[0].model.as_deref(),
+            Some("Hardware lens A")
+        );
+        assert_eq!(
+            instrument.objectives[1].id.as_deref(),
+            Some("Objective:0:1")
+        );
+        assert_eq!(
+            instrument.objectives[1].serial_number.as_deref(),
+            Some("serial-B")
+        );
+        assert_eq!(instrument.objectives[1].nominal_magnification, Some(63.0));
+        assert_eq!(ome.images[0].objective_ref, Some(1));
+        assert_eq!(instrument.light_sources.len(), 3);
+        assert_eq!(
+            instrument.light_sources[0].id.as_deref(),
+            Some("LightSource:0:0")
+        );
+        assert_eq!(
+            instrument.light_sources[1].id.as_deref(),
+            Some("LightSource:0:2")
+        );
+        assert_eq!(
+            instrument.light_sources[2].id.as_deref(),
+            Some("LightSource:0:5")
+        );
+        assert_eq!(ome.images[0].channels[0].light_source_settings_id, None);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn czi_subblock_tags_and_optical_settings_project_to_structured_ome() {
+        let xml = r#"<Metadata><Information><Image><AcquisitionDateAndTime>2020-01-02T03:04:05Z</AcquisitionDateAndTime>
+          <ObjectiveSettings><ObjectiveRef Id="Objective:0:chosen"/><RefractiveIndex>1.515</RefractiveIndex><CorrectionCollar>0.17</CorrectionCollar><Medium>Oil</Medium></ObjectiveSettings>
+          <Dimensions><Channels><Channel Name="Green"><PinholeSize>1.2</PinholeSize><IlluminationType>Epifluorescence</IlluminationType><AcquisitionMode>WideField</AcquisitionMode><DetectorSettings><Detector Id="Cam 1"/><Binning>2,2</Binning></DetectorSettings><LightSource Id="laser1"/><Intensity>25 %</Intensity><FilterSetRef Id="FS:1"/></Channel></Channels></Dimensions></Image>
+          <Instrument><Objectives><Objective Id="Objective:0:chosen"><Manufacturer><Manufacturer>Maker</Manufacturer><Model>Plan Apo</Model><SerialNumber>OBJ42</SerialNumber></Manufacturer><NominalMagnification>63</NominalMagnification><LensNA>1.4</LensNA><Immersion>Oil</Immersion></Objective></Objectives>
+          <Detectors><Detector Id="Cam 1"><Manufacturer><Manufacturer>Camera Maker</Manufacturer><Model>Camera A</Model><SerialNumber>CAM42</SerialNumber><LotNumber>LOT1</LotNumber></Manufacturer><Gain>3</Gain><Zoom>2,2</Zoom><AmplificationGain>4</AmplificationGain><Type>CCD</Type></Detector></Detectors>
+          <LightSources><LightSource Id="laser1" Name="Laser488"><LightSourceType><Laser/></LightSourceType><Manufacturer><Model>Laser A</Model><SerialNumber>LAS42</SerialNumber></Manufacturer><Power>10</Power></LightSource></LightSources>
+          <FilterSets><FilterSet Id="FS:1"><Manufacturer><Model>Filter cube</Model></Manufacturer><ExcitationFilters><ExcitationFilterRef Id="EX:1"/></ExcitationFilters><EmissionFilters><EmissionFilterRef>EM:1</EmissionFilterRef></EmissionFilters><DichroicRef Id="D:1"/></FilterSet></FilterSets></Instrument></Information></Metadata>"#;
+        let path = write_synthetic_czi_with_xml(
+            "rich_subblock",
+            vec![(directory_entry(0, 0, 0, 2, 1), vec![7, 8])],
+            xml,
+        );
+        let first = parse_czi_file(&mut BufReader::new(File::open(&path).unwrap()))
+            .unwrap()
+            .1[0]
+            .file_position as usize;
+        let tags = br#"<METADATA><Tags><StageXPosition>1.5</StageXPosition><StageYPosition>2.5</StageYPosition><FocusPosition>3.5</FocusPosition><AcquisitionTime>2020-01-02T04:04:06.250+01:00</AcquisitionTime><ExposureTime>0.02</ExposureTime></Tags></METADATA>"#;
+        let mut bytes = fs::read(&path).unwrap();
+        put_i32(&mut bytes, first + SEG_HEADER, tags.len() as i32);
+        let old_size = read_u64(&bytes, first + 16);
+        put_u64(&mut bytes, first + 16, old_size + tags.len() as u64);
+        put_u64(&mut bytes, first + 24, old_size + tags.len() as u64);
+        bytes.splice(
+            first + SEG_HEADER + 256..first + SEG_HEADER + 256,
+            tags.iter().copied(),
+        );
+        fs::write(&path, bytes).unwrap();
+        let mut reader = ZeissCziReader::new();
+        reader.set_id(&path).unwrap();
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![7, 8]);
+        let ome = reader.ome_metadata().unwrap();
+        let image = &ome.images[0];
+        assert_eq!(image.objective_ref, Some(0));
+        assert_eq!(image.objective_settings_refractive_index, Some(1.515));
+        assert_eq!(image.objective_settings_correction_collar, Some(0.17));
+        assert_eq!(image.objective_settings_medium.as_deref(), Some("Oil"));
+        assert_eq!(
+            image.acquisition_date.as_deref(),
+            Some("2020-01-02T03:04:05Z")
+        );
+        assert_eq!(
+            (
+                image.planes[0].position_x,
+                image.planes[0].position_y,
+                image.planes[0].position_z
+            ),
+            (Some(1.5), Some(2.5), Some(3.5))
+        );
+        assert_eq!(image.planes[0].position_x_unit.as_deref(), Some("µm"));
+        assert_eq!(image.planes[0].delta_t, Some(1.25));
+        assert_eq!(image.planes[0].exposure_time, Some(0.02));
+        assert_eq!(image.stage_label.as_ref().unwrap().x, Some(1.5));
+        let channel = &image.channels[0];
+        assert_eq!(channel.detector_ref.as_deref(), Some("Detector:Cam1"));
+        assert_eq!(channel.detector_settings_binning.as_deref(), Some("2x2"));
+        assert_eq!(channel.pinhole_size, Some(1.2));
+        assert_eq!(
+            channel.light_source_settings_id.as_deref(),
+            Some("LightSource:0:0")
+        );
+        assert_eq!(channel.light_source_settings_attenuation, Some(0.75));
+        assert_eq!(channel.filter_set_ref.as_deref(), Some("FS:1"));
+        let instrument = &ome.instruments[0];
+        assert_eq!(instrument.objectives[0].model.as_deref(), Some("Plan Apo"));
+        assert_eq!(
+            instrument.detectors[0].serial_number.as_deref(),
+            Some("CAM42")
+        );
+        assert_eq!(instrument.detectors[0].zoom, Some(2.0));
+        assert_eq!(instrument.detectors[0].amplification_gain, Some(4.0));
+        assert_eq!(instrument.light_sources[0].power, Some(10.0));
+        assert_eq!(
+            instrument.filter_sets[0].excitation_filter_ids,
+            vec!["EX:1"]
+        );
+        assert_eq!(instrument.filter_sets[0].emission_filter_ids, vec!["EM:1"]);
+        let document = ome.to_ome_xml(reader.metadata());
+        assert!(document.contains("FilterSetRef ID=\"FS:1\""));
+        assert!(document.contains("CorrectionCollar=\"0.17\""));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn czi_ome_metadata_parses_scaling_distance_attributes_like_java() {
         let entries = vec![(directory_entry(0, 0, 0, 2, 1), vec![1, 2])];
         let xml = r#"<Metadata>
@@ -3268,9 +4767,13 @@ mod tests {
         reader.set_id(&path).unwrap();
 
         assert!(reader.metadata().is_rgb);
+        assert_eq!(reader.metadata().size_c, 3);
+        assert_eq!(reader.metadata().image_count, 1);
         let ome = reader.ome_metadata().unwrap();
         assert_eq!(ome.images[0].channels[0].name.as_deref(), Some("RGB"));
         assert_eq!(ome.images[0].channels[0].color, None);
+        assert_eq!(ome.images[0].channels.len(), 1);
+        assert_eq!(ome.images[0].channels[0].samples_per_pixel, 3);
 
         fs::remove_file(path).unwrap();
     }
@@ -3286,7 +4789,7 @@ mod tests {
         reader.set_id(&path).unwrap();
 
         let meta = reader.metadata();
-        assert_eq!(meta.size_c, 2);
+        assert_eq!(meta.size_c, 6);
         assert_eq!(meta.image_count, 2);
         assert_eq!(meta.pixel_type, PixelType::Uint16);
         assert!(meta.is_rgb);
@@ -3393,6 +4896,62 @@ mod tests {
     }
 
     #[test]
+    fn czi_flattened_levels_have_independent_metadata_pixels_and_calibration() {
+        let entries = vec![
+            (
+                directory_entry_dims(0, 0, 0, 0, 0, 4, 2, 0),
+                vec![1, 2, 3, 4, 5, 6, 7, 8],
+            ),
+            (directory_entry_dims(0, 0, 0, 0, 0, 2, 1, 1), vec![9, 10]),
+        ];
+        let xml = r#"<Metadata><Scaling><Items><Distance Id="X" Unit="m"><Value>0.0000005</Value></Distance><Distance Id="Y" Unit="m"><Value>0.00000075</Value></Distance></Items></Scaling></Metadata>"#;
+        let path = write_synthetic_czi_with_xml("flattened_pyramid", entries, xml);
+        let mut reader = ZeissCziReader::new();
+        reader.set_id(&path).unwrap();
+        assert!(reader.has_flattened_resolutions());
+        assert_eq!(reader.series_count(), 2);
+        assert_eq!(reader.resolution_count(), 1);
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        reader.set_series(1).unwrap();
+        assert_eq!(reader.series(), 1);
+        assert_eq!((reader.metadata().size_x, reader.metadata().size_y), (2, 1));
+        assert_eq!(reader.metadata().resolution_count, 1);
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![9, 10]);
+        assert!(reader.set_resolution(1).is_err());
+        reader.set_resolution(0).unwrap();
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![9, 10]);
+        let ome = reader.ome_metadata().unwrap();
+        assert_eq!(ome.images.len(), 2);
+        assert_eq!(
+            (ome.images[0].physical_size_x, ome.images[0].physical_size_y),
+            (Some(0.5), Some(0.75))
+        );
+        assert_eq!(
+            (ome.images[1].physical_size_x, ome.images[1].physical_size_y),
+            (Some(1.0), Some(1.5))
+        );
+        reader.set_series(0).unwrap();
+        assert_eq!(
+            reader.ome_metadata().unwrap().images[1].physical_size_x,
+            Some(1.0)
+        );
+        assert!(reader.set_flattened_resolutions(false).is_err());
+        reader.close().unwrap();
+        reader.set_flattened_resolutions(false).unwrap();
+        reader.set_id(&path).unwrap();
+        assert_eq!(reader.series_count(), 1);
+        assert_eq!(reader.resolution_count(), 2);
+        assert_eq!(reader.ome_metadata().unwrap().images.len(), 1);
+        reader.set_resolution(1).unwrap();
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![9, 10]);
+        assert_eq!(
+            reader.ome_metadata().unwrap().images[0].physical_size_x,
+            Some(0.5)
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn czi_selects_pyramid_resolution_level() {
         let entries = vec![
             (
@@ -3403,6 +4962,7 @@ mod tests {
         ];
         let path = write_synthetic_czi_entries("pyramid_levels", entries);
         let mut reader = ZeissCziReader::new();
+        reader.set_flattened_resolutions(false).unwrap();
         reader.set_id(&path).unwrap();
 
         assert_eq!(reader.resolution_count(), 2);
@@ -3431,6 +4991,7 @@ mod tests {
         ];
         let path = write_synthetic_czi_entries("stored_xy_pyramid", entries);
         let mut reader = ZeissCziReader::new();
+        reader.set_flattened_resolutions(false).unwrap();
         reader.set_id(&path).unwrap();
 
         assert_eq!(reader.resolution_count(), 2);
@@ -3566,6 +5127,7 @@ mod tests {
         ];
         let path = write_synthetic_czi_entries("rgb_pyramid_sparse_white", entries);
         let mut reader = ZeissCziReader::new();
+        reader.set_flattened_resolutions(false).unwrap();
         reader.set_id(&path).unwrap();
 
         assert_eq!(reader.resolution_count(), 2);
@@ -3844,6 +5406,7 @@ mod tests {
         ];
         let path = write_synthetic_czi_entries("r_size_one_pyramid", entries);
         let mut reader = ZeissCziReader::new();
+        reader.set_flattened_resolutions(false).unwrap();
         reader.set_id(&path).unwrap();
 
         let meta = reader.metadata();

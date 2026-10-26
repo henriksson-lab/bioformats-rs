@@ -4143,6 +4143,7 @@ pub struct FilePatternReader {
     meta: Option<ImageMetadata>,
     layout: Option<StrictRawLayout>,
     stitcher: Option<FileStitcher>,
+    flattened_resolutions: bool,
 }
 
 impl FilePatternReader {
@@ -4152,6 +4153,7 @@ impl FilePatternReader {
             meta: None,
             layout: None,
             stitcher: None,
+            flattened_resolutions: true,
         }
     }
 
@@ -4263,6 +4265,20 @@ impl Default for FilePatternReader {
 }
 
 impl FormatReader for FilePatternReader {
+    fn has_flattened_resolutions(&self) -> bool {
+        self.flattened_resolutions
+    }
+
+    fn set_flattened_resolutions(&mut self, flattened: bool) -> Result<()> {
+        if self.path.is_some() {
+            return Err(BioFormatsError::Format(
+                "set_flattened_resolutions must be called before set_id".into(),
+            ));
+        }
+        self.flattened_resolutions = flattened;
+        Ok(())
+    }
+
     fn is_this_type_by_name(&self, path: &Path) -> bool {
         let ext = path
             .extension()
@@ -4308,17 +4324,19 @@ impl FormatReader for FilePatternReader {
             ));
         }
 
+        let options = crate::registry::ImageReaderOptions::default()
+            .flattened_resolutions(self.flattened_resolutions);
         let stitcher = if let Some(expanded) = Self::expand_pattern(&target)? {
             match expanded {
                 ExpandedFilePattern::Explicit(files) => {
-                    FileStitcher::from_files_with_pattern(files, &target)?
+                    FileStitcher::from_files_with_pattern_and_options(files, &target, options)?
                 }
                 ExpandedFilePattern::Glob { files, pattern } => {
-                    FileStitcher::from_files_with_file_pattern(files, pattern)?
+                    FileStitcher::from_files_with_file_pattern_and_options(files, pattern, options)?
                 }
             }
         } else {
-            FileStitcher::open(&target)?
+            FileStitcher::open_with_options(&target, options)?
         };
         self.path = Some(path.to_path_buf());
         self.stitcher = Some(stitcher);
@@ -4471,6 +4489,59 @@ mod file_pattern_resolution_tests {
     }
 
     #[test]
+    fn nested_resolution_options_survive_lazy_multifile_reopens() {
+        let dir = unique_dir("nested_multifile");
+        std::fs::create_dir(&dir).unwrap();
+        for t in 0..2 {
+            std::fs::write(
+                dir.join(format!(
+                    "pyr_t{t}&sizeX=8&sizeY=4&resolutions=3&resolutionScale=2.fake"
+                )),
+                [],
+            )
+            .unwrap();
+        }
+        // Exercise explicit expansion and the independently expanded glob path.
+        for (tag, text) in [
+            (
+                "explicit",
+                "pyr_t<0-1>&sizeX=8&sizeY=4&resolutions=3&resolutionScale=2.fake",
+            ),
+            (
+                "glob",
+                "pyr_t*&sizeX=8&sizeY=4&resolutions=3&resolutionScale=2.fake",
+            ),
+        ] {
+            let pattern = dir.join(format!("{tag}.pattern"));
+            std::fs::write(&pattern, text).unwrap();
+            let mut reader = FilePatternReader::new();
+            reader.set_flattened_resolutions(false).unwrap();
+            reader.set_id(&pattern).unwrap();
+            assert!(!reader.has_flattened_resolutions());
+            assert_eq!(reader.series_count(), 1);
+            assert_eq!(reader.resolution_count(), 3);
+            assert_eq!(reader.metadata().image_count, 2);
+            reader.set_resolution(1).unwrap();
+            assert_eq!(
+                (
+                    reader.metadata().size_x,
+                    reader.metadata().size_y,
+                    reader.metadata().image_count
+                ),
+                (4, 2, 2)
+            );
+            assert_eq!(reader.open_bytes(0).unwrap().len(), 8);
+            assert_eq!(reader.open_bytes(1).unwrap().len(), 8);
+            assert_eq!(reader.open_bytes(0).unwrap().len(), 8);
+            reader.set_resolution(2).unwrap();
+            assert_eq!(reader.open_bytes(1).unwrap().len(), 2);
+            reader.close().unwrap();
+            std::fs::remove_file(pattern).unwrap();
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn forwards_wrapped_reader_resolution_api_like_java() {
         let dir = unique_dir("pyr");
         std::fs::create_dir(&dir).unwrap();
@@ -4479,8 +4550,24 @@ mod file_pattern_resolution_tests {
         std::fs::write(&fake, []).unwrap();
         std::fs::write(&pattern, fake.to_string_lossy().as_bytes()).unwrap();
 
+        let mut flattened = FilePatternReader::new();
+        flattened.set_id(&pattern).unwrap();
+        assert!(flattened.has_flattened_resolutions());
+        assert_eq!(flattened.series_count(), 3);
+        assert_eq!(flattened.resolution_count(), 1);
+        flattened.set_series(1).unwrap();
+        assert_eq!(
+            (flattened.metadata().size_x, flattened.metadata().size_y),
+            (4, 2)
+        );
+        assert_eq!(flattened.open_bytes(0).unwrap().len(), 8);
+        flattened.close().unwrap();
+
         let mut reader = FilePatternReader::new();
+        reader.set_flattened_resolutions(false).unwrap();
         reader.set_id(&pattern).unwrap();
+        assert!(!reader.has_flattened_resolutions());
+        assert!(reader.set_flattened_resolutions(true).is_err());
 
         assert_eq!(reader.series_count(), 1);
         assert_eq!(reader.resolution_count(), 3);

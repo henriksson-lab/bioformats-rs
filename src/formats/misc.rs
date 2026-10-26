@@ -5217,6 +5217,7 @@ mod netcdf3 {
 /// parser — mirroring `MINCReader.initFile`, which uses a generic NetCDF
 /// service that transparently reads either backing format.
 pub struct MincReader {
+    flipped: [bool; 3],
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
     pixel_data: Option<Vec<u8>>,
@@ -5225,6 +5226,7 @@ pub struct MincReader {
 impl MincReader {
     pub fn new() -> Self {
         MincReader {
+            flipped: [false; 3],
             path: None,
             meta: None,
             pixel_data: None,
@@ -5240,6 +5242,7 @@ impl MincReader {
     /// dimensions with `time` as the optional T axis. NetCDF stores values in
     /// big-endian byte order on disk.
     fn set_id_netcdf3(&mut self, path: &Path) -> Result<()> {
+        self.flipped = [false; 3];
         use netcdf3::{NetCdf3, NC_BYTE, NC_CHAR, NC_DOUBLE, NC_FLOAT, NC_INT, NC_SHORT};
         use std::io::Read as _;
 
@@ -5361,6 +5364,54 @@ impl Default for MincReader {
 }
 
 impl FormatReader for MincReader {
+    fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
+        let meta = self.meta.as_ref()?;
+        let mut ome = crate::common::ome_metadata::OmeMetadata::from_image_metadata(meta);
+        if let Some(image) = ome.images.first_mut() {
+            for (key, target) in [
+                ("PhysicalSizeX", &mut image.physical_size_x),
+                ("PhysicalSizeY", &mut image.physical_size_y),
+                ("PhysicalSizeZ", &mut image.physical_size_z),
+            ] {
+                if let Some(MetadataValue::Float(value)) = meta.series_metadata.get(key) {
+                    *target = Some(*value);
+                }
+            }
+        }
+        Some(ome)
+    }
+
+    fn axis_orientations(&self) -> [Option<crate::common::orientation::Orientation>; 5] {
+        use crate::common::orientation::{AnatomicalOrientation::*, Orientation, OrientationType};
+        if self.meta.is_none() {
+            return [None; 5];
+        }
+        let terms = [
+            if self.flipped[0] {
+                RightToLeft
+            } else {
+                LeftToRight
+            },
+            if self.flipped[1] {
+                AnteriorToPosterior
+            } else {
+                PosteriorToAnterior
+            },
+            if self.flipped[2] {
+                SuperiorToInferior
+            } else {
+                InferiorToSuperior
+            },
+        ];
+        [
+            Some(Orientation::new(OrientationType::Anatomical, terms[0])),
+            Some(Orientation::new(OrientationType::Anatomical, terms[1])),
+            Some(Orientation::new(OrientationType::Anatomical, terms[2])),
+            None,
+            None,
+        ]
+    }
+
     fn is_this_type_by_name(&self, path: &Path) -> bool {
         let ext = path
             .extension()
@@ -5549,6 +5600,34 @@ impl FormatReader for MincReader {
                 }
             };
 
+        let mut minc_metadata = HashMap::new();
+        self.flipped = [false; 3];
+        if is_minc2 {
+            for (index, axis) in ["xspace", "yspace", "zspace"].into_iter().enumerate() {
+                if let Ok(dimension) = file.dataset(&format!("/minc-2.0/dimensions/{axis}")) {
+                    if let Some(step) = dimension
+                        .attr("step")
+                        .ok()
+                        .and_then(|a| a.read::<f64>().ok())
+                        .and_then(|v| v.first().copied())
+                    {
+                        self.flipped[index] = step < 0.0;
+                        let unit = dimension
+                            .attr("units")
+                            .ok()
+                            .map(|a| a.read_string())
+                            .unwrap_or_default();
+                        if let Some((value, _)) = crate::common::ome_metadata::get_physical_size(
+                            step.abs(),
+                            Some(unit.trim_matches('"')),
+                        ) {
+                            let key = ["PhysicalSizeX", "PhysicalSizeY", "PhysicalSizeZ"][index];
+                            minc_metadata.insert(key.into(), MetadataValue::Float(value));
+                        }
+                    }
+                }
+            }
+        }
         // Java: imageCount = sizeZ * sizeT * sizeC (sizeC == 1).
         let image_count = size_z.max(1) * size_t.max(1);
         self.path = Some(path.to_path_buf());
@@ -5571,7 +5650,7 @@ impl FormatReader for MincReader {
             is_little_endian: true,
             resolution_count: 1,
             thumbnail: false,
-            series_metadata: HashMap::new(),
+            series_metadata: minc_metadata,
             lookup_table: None,
             modulo_z: None,
             modulo_c: None,
@@ -5581,6 +5660,7 @@ impl FormatReader for MincReader {
     }
 
     fn close(&mut self) -> Result<()> {
+        self.flipped = [false; 3];
         self.path = None;
         self.meta = None;
         self.pixel_data = None;
@@ -8420,5 +8500,85 @@ mod qt_writer_tests {
         assert_eq!(&bytes[48 + 4..48 + 8], b"moov");
 
         let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[cfg(test)]
+mod minc_orientation_update_tests {
+    use super::*;
+
+    #[test]
+    fn minc2_negative_steps_preserve_orientation_and_positive_physical_sizes() {
+        use crate::common::orientation::AnatomicalOrientation::*;
+        use hdf5_pure_rust::engine::writer::{AttrSpec, DatasetSpec, DtypeSpec, HdfFileWriter};
+        let path =
+            std::env::temp_dir().join(format!("bf_minc_orientation_{}.mnc", std::process::id()));
+        let mut writer = HdfFileWriter::new(std::fs::File::create(&path).unwrap());
+        writer.begin().unwrap();
+        writer.create_root_group().unwrap();
+        writer.create_group("/", "minc-2.0").unwrap();
+        writer.create_group("/minc-2.0", "dimensions").unwrap();
+        writer.create_group("/minc-2.0", "image").unwrap();
+        writer.create_group("/minc-2.0/image", "0").unwrap();
+        for (name, step) in [("xspace", -0.25f64), ("yspace", 0.5), ("zspace", -2.0)] {
+            writer
+                .create_dataset_with_attrs(
+                    "/minc-2.0/dimensions",
+                    &DatasetSpec {
+                        name,
+                        shape: &[1],
+                        max_shape: None,
+                        dtype: DtypeSpec::U8,
+                        data: &[0],
+                    },
+                    &[AttrSpec {
+                        name: "step",
+                        shape: &[],
+                        dtype: DtypeSpec::F64,
+                        data: &step.to_le_bytes(),
+                    }],
+                )
+                .unwrap();
+        }
+        writer
+            .create_dataset_with_attrs(
+                "/minc-2.0/image/0",
+                &DatasetSpec {
+                    name: "image",
+                    shape: &[1, 2, 2],
+                    max_shape: None,
+                    dtype: DtypeSpec::U8,
+                    data: &[1, 2, 3, 4],
+                },
+                &[],
+            )
+            .unwrap();
+        writer.finalize().unwrap();
+        let mut reader = MincReader::new();
+        reader.set_id(&path).unwrap();
+        // Preserve the reader's existing Java-compatible vertical row flip.
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![3, 4, 1, 2]);
+        assert_eq!(
+            reader.axis_orientations().map(|o| o.map(|v| v.term)),
+            [
+                Some(RightToLeft),
+                Some(PosteriorToAnterior),
+                Some(SuperiorToInferior),
+                None,
+                None
+            ]
+        );
+        let ome = reader.ome_metadata().unwrap();
+        assert_eq!(
+            (
+                ome.images[0].physical_size_x,
+                ome.images[0].physical_size_y,
+                ome.images[0].physical_size_z
+            ),
+            (Some(0.25), Some(0.5), Some(2.0))
+        );
+        reader.close().unwrap();
+        assert_eq!(reader.axis_orientations(), [None; 5]);
+        std::fs::remove_file(path).unwrap();
     }
 }

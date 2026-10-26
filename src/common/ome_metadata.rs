@@ -34,9 +34,59 @@ pub fn create_lsid(object_type: &str, indexes: &[usize]) -> String {
     lsid
 }
 
+/// Compact OME Pixels description; proprietary metadata remains on the reader.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct OmePixels {
+    pub size_x: u32,
+    pub size_y: u32,
+    pub size_z: u32,
+    pub size_c: u32,
+    pub size_t: u32,
+    pub pixel_type: crate::common::pixel_type::PixelType,
+    pub bits_per_pixel: u16,
+    pub dimension_order: crate::common::metadata::DimensionOrder,
+    pub is_little_endian: bool,
+}
+
+impl From<&ImageMetadata> for OmePixels {
+    fn from(meta: &ImageMetadata) -> Self {
+        Self {
+            size_x: meta.size_x,
+            size_y: meta.size_y,
+            size_z: meta.size_z,
+            size_c: meta.size_c,
+            size_t: meta.size_t,
+            pixel_type: meta.pixel_type,
+            bits_per_pixel: meta.bits_per_pixel,
+            dimension_order: meta.dimension_order,
+            is_little_endian: meta.is_little_endian,
+        }
+    }
+}
+
+impl From<&OmePixels> for ImageMetadata {
+    fn from(pixels: &OmePixels) -> Self {
+        Self {
+            size_x: pixels.size_x,
+            size_y: pixels.size_y,
+            size_z: pixels.size_z,
+            size_c: pixels.size_c,
+            size_t: pixels.size_t,
+            pixel_type: pixels.pixel_type,
+            bits_per_pixel: pixels.bits_per_pixel,
+            dimension_order: pixels.dimension_order,
+            is_little_endian: pixels.is_little_endian,
+            ..Default::default()
+        }
+    }
+}
+
 /// Metadata for one image series.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct OmeImage {
+    /// Core pixel description for this image, retained independently of other series.
+    #[serde(default)]
+    pub pixels: Option<OmePixels>,
     pub name: Option<String>,
     pub description: Option<String>,
     /// Acquisition timestamp/date string as represented in OME-XML.
@@ -76,6 +126,10 @@ pub struct OmeImage {
     pub roi_refs: Vec<String>,
     /// Refractive index from `<ObjectiveSettings RefractiveIndex="...">`.
     pub objective_settings_refractive_index: Option<f64>,
+    #[serde(default)]
+    pub objective_settings_correction_collar: Option<f64>,
+    #[serde(default)]
+    pub objective_settings_medium: Option<String>,
     /// Per-channel light paths.
     pub light_paths: Vec<OmeLightPath>,
     /// Modulo annotation for Z (sub-dimensions within Z).
@@ -109,6 +163,8 @@ pub struct OmeStageLabel {
 /// Per-channel metadata.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct OmeChannel {
+    #[serde(default)]
+    pub filter_set_ref: Option<String>,
     pub name: Option<String>,
     /// Samples (components) per pixel — 1 for greyscale, 3 for RGB.
     pub samples_per_pixel: u32,
@@ -150,6 +206,9 @@ pub struct OmeChannel {
 /// Instrument metadata (microscope, objectives, detectors, light sources).
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct OmeInstrument {
+    #[serde(default)]
+    pub microscope_type: Option<String>,
+
     pub id: Option<String>,
     pub microscope_model: Option<String>,
     pub microscope_manufacturer: Option<String>,
@@ -159,11 +218,15 @@ pub struct OmeInstrument {
     pub light_sources: Vec<OmeLightSource>,
     pub filters: Vec<OmeFilter>,
     pub dichroics: Vec<OmeDichroic>,
+    #[serde(default)]
+    pub filter_sets: Vec<OmeFilterSet>,
 }
 
 /// Objective lens metadata.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct OmeObjective {
+    #[serde(default)]
+    pub iris: Option<bool>,
     pub id: Option<String>,
     pub model: Option<String>,
     pub manufacturer: Option<String>,
@@ -185,6 +248,18 @@ pub struct OmeObjective {
 /// Detector metadata.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct OmeDetector {
+    #[serde(default)]
+    pub zoom: Option<f64>,
+    #[serde(default)]
+    pub amplification_gain: Option<f64>,
+    #[serde(default)]
+    pub serial_number: Option<String>,
+    #[serde(default)]
+    pub lot_number: Option<String>,
+
+    /// Detector voltage in volts, distinct from channel DetectorSettings voltage.
+    #[serde(default)]
+    pub voltage: Option<f64>,
     pub id: Option<String>,
     pub model: Option<String>,
     pub manufacturer: Option<String>,
@@ -197,6 +272,15 @@ pub struct OmeDetector {
 /// Light source metadata.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct OmeLightSource {
+    #[serde(default)]
+    pub laser_type: Option<String>,
+    #[serde(default)]
+    pub laser_medium: Option<String>,
+    #[serde(default)]
+    pub serial_number: Option<String>,
+    #[serde(default)]
+    pub lot_number: Option<String>,
+
     pub id: Option<String>,
     pub model: Option<String>,
     pub manufacturer: Option<String>,
@@ -230,6 +314,22 @@ pub struct OmeDichroic {
     pub manufacturer: Option<String>,
 }
 
+/// Instrument filter set and its optical component references.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct OmeFilterSet {
+    #[serde(default)]
+    pub serial_number: Option<String>,
+    #[serde(default)]
+    pub lot_number: Option<String>,
+
+    pub id: Option<String>,
+    pub model: Option<String>,
+    pub manufacturer: Option<String>,
+    pub excitation_filter_ids: Vec<String>,
+    pub dichroic_ref: Option<String>,
+    pub emission_filter_ids: Vec<String>,
+}
+
 /// Light path: the combination of filters and dichroics used for a channel.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct OmeLightPath {
@@ -249,6 +349,14 @@ pub struct OmeROI {
 /// A single shape within an ROI.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum OmeShape {
+    /// OME Shape styling/affine transform without changing its geometry.
+    /// The transform stores A00, A01, A02, A10, A11, A12 in that order.
+    Styled {
+        shape: Box<OmeShape>,
+        font_size: Option<f64>,
+        stroke_width: Option<f64>,
+        transform: Option<[f64; 6]>,
+    },
     Label {
         x: f64,
         y: f64,
@@ -322,6 +430,8 @@ pub enum OmeShape {
 /// Experimenter metadata.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct OmeExperimenter {
+    #[serde(default)]
+    pub user_name: Option<String>,
     pub id: Option<String>,
     pub first_name: Option<String>,
     pub last_name: Option<String>,
@@ -439,7 +549,8 @@ pub struct OmePlane {
 // ─── Serialisation ───────────────────────────────────────────────────────────
 
 impl OmeMetadata {
-    /// Serialize to OME-XML string suitable for embedding in a TIFF ImageDescription tag.
+    /// Serialize a metadata-only OME-XML document. Pixel storage mappings are
+    /// supplied by the writer when embedding this metadata in an image file.
     pub fn to_ome_xml(&self, meta: &crate::metadata::ImageMetadata) -> String {
         use std::fmt::Write;
         let mut xml = String::new();
@@ -449,10 +560,79 @@ impl OmeMetadata {
             r#"<OME xmlns="http://www.openmicroscopy.org/Schemas/OME/2016-06" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://www.openmicroscopy.org/Schemas/OME/2016-06 http://www.openmicroscopy.org/Schemas/OME/2016-06/ome.xsd">"#
         );
 
+        for (pi, plate) in self.plates.iter().enumerate() {
+            let default_id = create_lsid("Plate", &[pi]);
+            let _ = write!(
+                xml,
+                r#"<Plate ID="{}""#,
+                xml_escape(plate.id.as_deref().unwrap_or(&default_id))
+            );
+            if let Some(v) = &plate.name {
+                let _ = write!(xml, r#" Name="{}""#, xml_escape(v));
+            }
+            if plate.rows > 0 {
+                let _ = write!(xml, r#" Rows="{}""#, plate.rows);
+            }
+            if plate.columns > 0 {
+                let _ = write!(xml, r#" Columns="{}""#, plate.columns);
+            }
+            xml.push('>');
+            for (wi, well) in plate.wells.iter().enumerate() {
+                let default_id = create_lsid("Well", &[pi, wi]);
+                let _ = write!(
+                    xml,
+                    r#"<Well ID="{}" Row="{}" Column="{}">"#,
+                    xml_escape(well.id.as_deref().unwrap_or(&default_id)),
+                    well.row,
+                    well.column
+                );
+                for (si, sample) in well.well_samples.iter().enumerate() {
+                    let default_id = create_lsid("WellSample", &[pi, wi, si]);
+                    let _ = write!(
+                        xml,
+                        r#"<WellSample ID="{}" Index="{}""#,
+                        xml_escape(sample.id.as_deref().unwrap_or(&default_id)),
+                        sample.index
+                    );
+                    if let Some(v) = sample.position_x {
+                        let _ = write!(xml, r#" PositionX="{v}""#);
+                    }
+                    if let Some(v) = sample.position_y {
+                        let _ = write!(xml, r#" PositionY="{v}""#);
+                    }
+                    xml.push('>');
+                    if let Some(i) = sample.image_ref.filter(|&i| i < self.images.len()) {
+                        let _ = write!(xml, r#"<ImageRef ID="Image:{i}"/>"#);
+                    }
+                    xml.push_str("</WellSample>");
+                }
+                xml.push_str("</Well>");
+            }
+            xml.push_str("</Plate>");
+        }
+        for (si, screen) in self.screens.iter().enumerate() {
+            let default_id = create_lsid("Screen", &[si]);
+            let _ = write!(
+                xml,
+                r#"<Screen ID="{}""#,
+                xml_escape(screen.id.as_deref().unwrap_or(&default_id))
+            );
+            if let Some(v) = &screen.name {
+                let _ = write!(xml, r#" Name="{}""#, xml_escape(v));
+            }
+            if let Some(v) = &screen.protocol_description {
+                let _ = write!(xml, r#" ProtocolDescription="{}""#, xml_escape(v));
+            }
+            xml.push_str("/>");
+        }
+
         for (ei, experimenter) in self.experimenters.iter().enumerate() {
             let default_id = format!("Experimenter:{ei}");
             let exp_id = experimenter.id.as_deref().unwrap_or(&default_id);
             let _ = write!(xml, r#"<Experimenter ID="{}""#, xml_escape(exp_id));
+            if let Some(v) = &experimenter.user_name {
+                let _ = write!(xml, r#" UserName="{}""#, xml_escape(v));
+            }
             if let Some(v) = &experimenter.first_name {
                 let _ = write!(xml, r#" FirstName="{}""#, xml_escape(v));
             }
@@ -477,8 +657,12 @@ impl OmeMetadata {
             if inst.microscope_model.is_some()
                 || inst.microscope_manufacturer.is_some()
                 || inst.microscope_serial_number.is_some()
+                || inst.microscope_type.is_some()
             {
                 let _ = write!(xml, "<Microscope");
+                if let Some(v) = &inst.microscope_type {
+                    let _ = write!(xml, r#" Type="{}""#, xml_escape(v));
+                }
                 if let Some(m) = &inst.microscope_model {
                     let _ = write!(xml, r#" Model="{}""#, xml_escape(m));
                 }
@@ -491,36 +675,40 @@ impl OmeMetadata {
                 xml.push_str("/>");
             }
 
-            for (oi, obj) in inst.objectives.iter().enumerate() {
-                let default_obj_id = format!("Objective:{ii}:{oi}");
-                let obj_id = obj.id.as_deref().unwrap_or(&default_obj_id);
-                let _ = write!(xml, r#"<Objective ID="{}""#, xml_escape(obj_id));
-                if let Some(v) = &obj.model {
+            for (li, ls) in inst.light_sources.iter().enumerate() {
+                let ls_tag = ome_light_source_tag(ls.light_source_type.as_deref())
+                    .unwrap_or("GenericExcitationSource");
+                let default_ls_id = format!("LightSource:{ii}:{li}");
+                let ls_id = ls.id.as_deref().unwrap_or(&default_ls_id);
+                let _ = write!(xml, r#"<{ls_tag} ID="{}""#, xml_escape(ls_id));
+                if let Some(v) = &ls.model {
                     let _ = write!(xml, r#" Model="{}""#, xml_escape(v));
                 }
-                if let Some(v) = &obj.manufacturer {
+                if let Some(v) = &ls.manufacturer {
                     let _ = write!(xml, r#" Manufacturer="{}""#, xml_escape(v));
                 }
-                if let Some(v) = &obj.serial_number {
+                if let Some(v) = &ls.serial_number {
                     let _ = write!(xml, r#" SerialNumber="{}""#, xml_escape(v));
                 }
-                if let Some(v) = obj.nominal_magnification {
-                    let _ = write!(xml, r#" NominalMagnification="{v}""#);
+                if let Some(v) = &ls.lot_number {
+                    let _ = write!(xml, r#" LotNumber="{}""#, xml_escape(v));
                 }
-                if let Some(v) = obj.calibrated_magnification {
-                    let _ = write!(xml, r#" CalibratedMagnification="{v}""#);
+                if ls_tag == "Laser" {
+                    if let Some(v) = &ls.laser_type {
+                        let _ = write!(xml, r#" Type="{}""#, xml_escape(v));
+                    }
+                    if let Some(v) = &ls.laser_medium {
+                        let _ = write!(xml, r#" LaserMedium="{}""#, xml_escape(v));
+                    }
                 }
-                if let Some(v) = obj.lens_na {
-                    let _ = write!(xml, r#" LensNA="{v}""#);
+                if let Some(v) = ls.power {
+                    let _ = write!(xml, r#" Power="{v}""#);
                 }
-                if let Some(v) = &obj.immersion {
-                    let _ = write!(xml, r#" Immersion="{}""#, xml_escape(v));
-                }
-                if let Some(v) = &obj.correction {
-                    let _ = write!(xml, r#" Correction="{}""#, xml_escape(v));
-                }
-                if let Some(v) = obj.working_distance {
-                    let _ = write!(xml, r#" WorkingDistance="{v}""#);
+                // Wavelength is only valid on the OME <Laser> element.
+                if ls_tag == "Laser" {
+                    if let Some(v) = ls.wavelength {
+                        let _ = write!(xml, r#" Wavelength="{v}""#);
+                    }
                 }
                 xml.push_str("/>");
             }
@@ -544,33 +732,92 @@ impl OmeMetadata {
                 if let Some(v) = det.offset {
                     let _ = write!(xml, r#" Offset="{v}""#);
                 }
+                if let Some(v) = det.zoom {
+                    let _ = write!(xml, r#" Zoom="{v}""#);
+                }
+                if let Some(v) = det.amplification_gain {
+                    let _ = write!(xml, r#" AmplificationGain="{v}""#);
+                }
+                if let Some(v) = &det.serial_number {
+                    let _ = write!(xml, r#" SerialNumber="{}""#, xml_escape(v));
+                }
+                if let Some(v) = &det.lot_number {
+                    let _ = write!(xml, r#" LotNumber="{}""#, xml_escape(v));
+                }
+                if let Some(v) = det.voltage {
+                    let _ = write!(xml, r#" Voltage="{v}" VoltageUnit="V""#);
+                }
                 xml.push_str("/>");
             }
 
-            for (li, ls) in inst.light_sources.iter().enumerate() {
-                let ls_tag = ome_light_source_tag(ls.light_source_type.as_deref())
-                    .unwrap_or("GenericExcitationSource");
-                let default_ls_id = format!("LightSource:{ii}:{li}");
-                let ls_id = ls.id.as_deref().unwrap_or(&default_ls_id);
-                let _ = write!(xml, r#"<{ls_tag} ID="{}""#, xml_escape(ls_id));
-                if let Some(v) = &ls.model {
+            for (oi, obj) in inst.objectives.iter().enumerate() {
+                let default_obj_id = format!("Objective:{ii}:{oi}");
+                let obj_id = obj.id.as_deref().unwrap_or(&default_obj_id);
+                let _ = write!(xml, r#"<Objective ID="{}""#, xml_escape(obj_id));
+                if let Some(v) = &obj.model {
                     let _ = write!(xml, r#" Model="{}""#, xml_escape(v));
                 }
-                if let Some(v) = &ls.manufacturer {
+                if let Some(v) = &obj.manufacturer {
                     let _ = write!(xml, r#" Manufacturer="{}""#, xml_escape(v));
                 }
-                if let Some(v) = ls.power {
-                    let _ = write!(xml, r#" Power="{v}""#);
+                if let Some(v) = &obj.serial_number {
+                    let _ = write!(xml, r#" SerialNumber="{}""#, xml_escape(v));
                 }
-                // Wavelength is only valid on the OME <Laser> element.
-                if ls_tag == "Laser" {
-                    if let Some(v) = ls.wavelength {
-                        let _ = write!(xml, r#" Wavelength="{v}""#);
-                    }
+                if let Some(v) = obj.nominal_magnification {
+                    let _ = write!(xml, r#" NominalMagnification="{v}""#);
+                }
+                if let Some(v) = obj.calibrated_magnification {
+                    let _ = write!(xml, r#" CalibratedMagnification="{v}""#);
+                }
+                if let Some(v) = obj.iris {
+                    let _ = write!(xml, r#" Iris="{v}""#);
+                }
+                if let Some(v) = obj.lens_na {
+                    let _ = write!(xml, r#" LensNA="{v}""#);
+                }
+                if let Some(v) = &obj.immersion {
+                    let _ = write!(xml, r#" Immersion="{}""#, xml_escape(v));
+                }
+                if let Some(v) = &obj.correction {
+                    let _ = write!(xml, r#" Correction="{}""#, xml_escape(v));
+                }
+                if let Some(v) = obj.working_distance {
+                    let _ = write!(xml, r#" WorkingDistance="{v}""#);
                 }
                 xml.push_str("/>");
             }
 
+            for (fi, set) in inst.filter_sets.iter().enumerate() {
+                let default_id = create_lsid("FilterSet", &[ii, fi]);
+                let _ = write!(
+                    xml,
+                    r#"<FilterSet ID="{}""#,
+                    xml_escape(set.id.as_deref().unwrap_or(&default_id))
+                );
+                if let Some(model) = &set.model {
+                    let _ = write!(xml, r#" Model="{}""#, xml_escape(model));
+                }
+                if let Some(manufacturer) = &set.manufacturer {
+                    let _ = write!(xml, r#" Manufacturer="{}""#, xml_escape(manufacturer));
+                }
+                if let Some(v) = &set.serial_number {
+                    let _ = write!(xml, r#" SerialNumber="{}""#, xml_escape(v));
+                }
+                if let Some(v) = &set.lot_number {
+                    let _ = write!(xml, r#" LotNumber="{}""#, xml_escape(v));
+                }
+                xml.push('>');
+                for id in &set.excitation_filter_ids {
+                    let _ = write!(xml, r#"<ExcitationFilterRef ID="{}"/>"#, xml_escape(id));
+                }
+                if let Some(id) = &set.dichroic_ref {
+                    let _ = write!(xml, r#"<DichroicRef ID="{}"/>"#, xml_escape(id));
+                }
+                for id in &set.emission_filter_ids {
+                    let _ = write!(xml, r#"<EmissionFilterRef ID="{}"/>"#, xml_escape(id));
+                }
+                xml.push_str("</FilterSet>");
+            }
             for (fi, filter) in inst.filters.iter().enumerate() {
                 let default_f_id = format!("Filter:{ii}:{fi}");
                 let f_id = filter.id.as_deref().unwrap_or(&default_f_id);
@@ -584,13 +831,18 @@ impl OmeMetadata {
                 if let Some(v) = &filter.filter_type {
                     let _ = write!(xml, r#" Type="{}""#, xml_escape(v));
                 }
-                if let Some(v) = filter.cut_in {
-                    let _ = write!(xml, r#" CutIn="{v}""#);
+                if filter.cut_in.is_some() || filter.cut_out.is_some() {
+                    xml.push_str("><TransmittanceRange");
+                    if let Some(v) = filter.cut_in {
+                        let _ = write!(xml, r#" CutIn="{v}""#);
+                    }
+                    if let Some(v) = filter.cut_out {
+                        let _ = write!(xml, r#" CutOut="{v}""#);
+                    }
+                    xml.push_str("/></Filter>");
+                } else {
+                    xml.push_str("/>");
                 }
-                if let Some(v) = filter.cut_out {
-                    let _ = write!(xml, r#" CutOut="{v}""#);
-                }
-                xml.push_str("/>");
             }
 
             for (di, dc) in inst.dichroics.iter().enumerate() {
@@ -609,24 +861,15 @@ impl OmeMetadata {
             xml.push_str("</Instrument>");
         }
 
-        let images = if self.images.is_empty() {
-            Vec::new()
-        } else {
-            // This serializer is given one ImageMetadata, so it can only write
-            // dimensions/pixel type honestly for one OME Image.
-            self.images.iter().take(1).collect()
-        };
-
-        for (i, img) in images.into_iter().enumerate() {
+        for (i, img) in self.images.iter().enumerate() {
+            let per_image_metadata = img.pixels.as_ref().map(ImageMetadata::from);
+            let meta = per_image_metadata.as_ref().unwrap_or(meta);
             let _ = write!(
                 xml,
                 r#"<Image ID="Image:{i}" Name="{}">"#,
                 xml_escape(img.name.as_deref().unwrap_or(&format!("Series {i}")))
             );
 
-            if let Some(desc) = &img.description {
-                let _ = write!(xml, "<Description>{}</Description>", xml_escape(desc));
-            }
             if let Some(date) = &img.acquisition_date {
                 let _ = write!(
                     xml,
@@ -634,6 +877,38 @@ impl OmeMetadata {
                     xml_escape(date)
                 );
             }
+            if let Some(desc) = &img.description {
+                let _ = write!(xml, "<Description>{}</Description>", xml_escape(desc));
+            }
+            // InstrumentRef
+            if let Some(inst_idx) = img.instrument_ref {
+                if let Some(inst) = self.instruments.get(inst_idx) {
+                    let default_id = format!("Instrument:{inst_idx}");
+                    let inst_id = inst.id.as_deref().unwrap_or(&default_id);
+                    let _ = write!(xml, r#"<InstrumentRef ID="{}"/>"#, xml_escape(inst_id));
+                }
+            }
+            // ObjectiveSettings
+            if let (Some(inst_idx), Some(obj_idx)) = (img.instrument_ref, img.objective_ref) {
+                if let Some(inst) = self.instruments.get(inst_idx) {
+                    if let Some(obj) = inst.objectives.get(obj_idx) {
+                        let default_id = format!("Objective:{inst_idx}:{obj_idx}");
+                        let obj_id = obj.id.as_deref().unwrap_or(&default_id);
+                        let _ = write!(xml, r#"<ObjectiveSettings ID="{}""#, xml_escape(obj_id));
+                        if let Some(v) = img.objective_settings_refractive_index {
+                            let _ = write!(xml, r#" RefractiveIndex="{v}""#);
+                        }
+                        if let Some(v) = img.objective_settings_correction_collar {
+                            let _ = write!(xml, r#" CorrectionCollar="{v}""#);
+                        }
+                        if let Some(v) = &img.objective_settings_medium {
+                            let _ = write!(xml, r#" Medium="{}""#, xml_escape(v));
+                        }
+                        xml.push_str("/>");
+                    }
+                }
+            }
+
             if let Some(v) = img.imaging_environment_temperature {
                 let _ = write!(
                     xml,
@@ -641,10 +916,11 @@ impl OmeMetadata {
                 );
             }
             if let Some(stage_label) = &img.stage_label {
-                xml.push_str("<StageLabel");
-                if let Some(name) = &stage_label.name {
-                    let _ = write!(xml, r#" Name="{}""#, xml_escape(name));
-                }
+                let _ = write!(
+                    xml,
+                    r#"<StageLabel Name="{}""#,
+                    xml_escape(stage_label.name.as_deref().unwrap_or(""))
+                );
                 if let Some(v) = stage_label.x {
                     let _ = write!(xml, r#" X="{v}""#);
                     if let Some(unit) = &stage_label.x_unit {
@@ -666,33 +942,6 @@ impl OmeMetadata {
                 xml.push_str("/>");
             }
 
-            // InstrumentRef
-            if let Some(inst_idx) = img.instrument_ref {
-                if let Some(inst) = self.instruments.get(inst_idx) {
-                    let default_id = format!("Instrument:{inst_idx}");
-                    let inst_id = inst.id.as_deref().unwrap_or(&default_id);
-                    let _ = write!(xml, r#"<InstrumentRef ID="{}"/>"#, xml_escape(inst_id));
-                }
-            }
-            // ObjectiveSettings
-            if let (Some(inst_idx), Some(obj_idx)) = (img.instrument_ref, img.objective_ref) {
-                if let Some(inst) = self.instruments.get(inst_idx) {
-                    if let Some(obj) = inst.objectives.get(obj_idx) {
-                        let default_id = format!("Objective:{inst_idx}:{obj_idx}");
-                        let obj_id = obj.id.as_deref().unwrap_or(&default_id);
-                        let _ = write!(xml, r#"<ObjectiveSettings ID="{}""#, xml_escape(obj_id));
-                        if let Some(v) = img.objective_settings_refractive_index {
-                            let _ = write!(xml, r#" RefractiveIndex="{v}""#);
-                        }
-                        xml.push_str("/>");
-                    }
-                }
-            }
-
-            for roi_id in &img.roi_refs {
-                let _ = write!(xml, r#"<ROIRef ID="{}"/>"#, xml_escape(roi_id));
-            }
-
             // Pixels element
             let dim_order = format!("{:?}", meta.dimension_order);
             let pt_str = ome_pixel_type_str(meta.pixel_type);
@@ -707,6 +956,9 @@ impl OmeMetadata {
                 !meta.is_little_endian
             );
 
+            if meta.bits_per_pixel > 0 {
+                let _ = write!(xml, r#" SignificantBits="{}""#, meta.bits_per_pixel);
+            }
             if let Some(v) = img.physical_size_x {
                 let unit = img.physical_size_x_unit.as_deref().unwrap_or("µm");
                 let _ = write!(xml, r#" PhysicalSizeX="{v}" PhysicalSizeXUnit="{unit}""#);
@@ -775,7 +1027,11 @@ impl OmeMetadata {
                         || path.dichroic_id.is_some()
                         || !path.emission_filter_ids.is_empty()
                 });
-                if has_light_source_settings || has_detector_settings || has_light_path {
+                if has_light_source_settings
+                    || has_detector_settings
+                    || has_light_path
+                    || ch.filter_set_ref.is_some()
+                {
                     xml.push('>');
                     if has_light_source_settings {
                         let _ = write!(
@@ -812,6 +1068,9 @@ impl OmeMetadata {
                         }
                         xml.push_str("/>");
                     }
+                    if let Some(id) = &ch.filter_set_ref {
+                        let _ = write!(xml, r#"<FilterSetRef ID="{}"/>"#, xml_escape(id));
+                    }
                     if let Some(path) = light_path {
                         if has_light_path {
                             xml.push_str("<LightPath>");
@@ -838,40 +1097,8 @@ impl OmeMetadata {
                 }
             }
 
-            // Modulo annotations
-            if let Some(m) = &img.modulo_z {
-                let _ = write!(
-                    xml,
-                    r#"<ModuloAlongZ Type="{}" Start="{}" Step="{}" End="{}" Unit="{}"/>"#,
-                    xml_escape(&m.modulo_type),
-                    m.start,
-                    m.step,
-                    m.end,
-                    xml_escape(&m.unit)
-                );
-            }
-            if let Some(m) = &img.modulo_c {
-                let _ = write!(
-                    xml,
-                    r#"<ModuloAlongC Type="{}" Start="{}" Step="{}" End="{}" Unit="{}"/>"#,
-                    xml_escape(&m.modulo_type),
-                    m.start,
-                    m.step,
-                    m.end,
-                    xml_escape(&m.unit)
-                );
-            }
-            if let Some(m) = &img.modulo_t {
-                let _ = write!(
-                    xml,
-                    r#"<ModuloAlongT Type="{}" Start="{}" Step="{}" End="{}" Unit="{}"/>"#,
-                    xml_escape(&m.modulo_type),
-                    m.start,
-                    m.step,
-                    m.end,
-                    xml_escape(&m.unit)
-                );
-            }
+            // The model describes pixels but carries no file/IFD storage mappings.
+            xml.push_str("<MetadataOnly/>");
 
             // Planes
             for plane in &img.planes {
@@ -907,24 +1134,22 @@ impl OmeMetadata {
                 xml.push_str("/>");
             }
 
-            xml.push_str("</Pixels></Image>");
+            xml.push_str("</Pixels>");
+            for roi_id in &img.roi_refs {
+                let _ = write!(xml, r#"<ROIRef ID="{}"/>"#, xml_escape(roi_id));
+            }
+
+            if img.modulo_z.is_some() || img.modulo_c.is_some() || img.modulo_t.is_some() {
+                let _ = write!(xml, r#"<AnnotationRef ID="Annotation:Modulo:{i}"/>"#);
+            }
+            xml.push_str("</Image>");
         }
 
-        for (ri, roi) in self.rois.iter().enumerate() {
-            let default_id = create_lsid("ROI", &[ri]);
-            let roi_id = roi.id.as_deref().unwrap_or(&default_id);
-            let _ = write!(xml, r#"<ROI ID="{}""#, xml_escape(roi_id));
-            if let Some(name) = &roi.name {
-                let _ = write!(xml, r#" Name="{}""#, xml_escape(name));
-            }
-            xml.push_str("><Union>");
-            for shape in &roi.shapes {
-                write_ome_shape_xml(&mut xml, shape);
-            }
-            xml.push_str("</Union></ROI>");
-        }
-
-        if !self.annotations.is_empty() {
+        if !self.annotations.is_empty()
+            || self.images.iter().any(|img| {
+                img.modulo_z.is_some() || img.modulo_c.is_some() || img.modulo_t.is_some()
+            })
+        {
             xml.push_str("<StructuredAnnotations>");
             for (ai, annotation) in self.annotations.iter().enumerate() {
                 match annotation {
@@ -983,7 +1208,56 @@ impl OmeMetadata {
                     }
                 }
             }
+            for (i, img) in self.images.iter().enumerate() {
+                if img.modulo_z.is_none() && img.modulo_c.is_none() && img.modulo_t.is_none() {
+                    continue;
+                }
+                let _ = write!(
+                    xml,
+                    r#"<XMLAnnotation ID="Annotation:Modulo:{i}" Namespace="openmicroscopy.org/omero/dimension/modulo"><Value><Modulo xmlns="http://www.openmicroscopy.org/Schemas/Additions/2011-09">"#
+                );
+                for (dim, modulo) in [
+                    ("Z", &img.modulo_z),
+                    ("C", &img.modulo_c),
+                    ("T", &img.modulo_t),
+                ] {
+                    if let Some(m) = modulo {
+                        let _ = write!(
+                            xml,
+                            r#"<ModuloAlong{dim} Type="{}" Start="{}" Step="{}" End="{}" Unit="{}">"#,
+                            xml_escape(&m.modulo_type),
+                            m.start,
+                            m.step,
+                            m.end,
+                            xml_escape(&m.unit)
+                        );
+                        for label in &m.labels {
+                            let _ = write!(xml, "<Label>{}</Label>", xml_escape(label));
+                        }
+                        let _ = write!(xml, "</ModuloAlong{dim}>");
+                    }
+                }
+                xml.push_str("</Modulo></Value></XMLAnnotation>");
+            }
             xml.push_str("</StructuredAnnotations>");
+        }
+
+        for (ri, roi) in self.rois.iter().enumerate() {
+            let default_id = create_lsid("ROI", &[ri]);
+            let roi_id = roi.id.as_deref().unwrap_or(&default_id);
+            let _ = write!(xml, r#"<ROI ID="{}""#, xml_escape(roi_id));
+            if let Some(name) = &roi.name {
+                let _ = write!(xml, r#" Name="{}""#, xml_escape(name));
+            }
+            xml.push_str("><Union>");
+            for (si, shape) in roi.shapes.iter().enumerate() {
+                let start = xml.len();
+                write_ome_shape_xml(&mut xml, shape);
+                if let Some(end) = xml[start..].find(char::is_whitespace) {
+                    xml.insert_str(start + end, &format!(r#" ID="Shape:{ri}:{si}""#));
+                }
+            }
+            xml.push_str("</Union></ROI>");
         }
 
         xml.push_str("</OME>");
@@ -1029,6 +1303,49 @@ fn write_ome_shape_xml(xml: &mut String, shape: &OmeShape) {
     use std::fmt::Write;
 
     match shape {
+        OmeShape::Styled {
+            shape,
+            font_size,
+            stroke_width,
+            transform,
+        } => {
+            let mut inner = String::new();
+            write_ome_shape_xml(&mut inner, shape);
+            for (name, value) in [("FontSize", font_size), ("StrokeWidth", stroke_width)] {
+                if let Some(value) = value {
+                    let prefix = format!(" {name}=\"");
+                    if let Some(start) = inner.find(&prefix) {
+                        if let Some(end) = inner[start + prefix.len()..].find('"') {
+                            inner.replace_range(start..start + prefix.len() + end + 1, "");
+                        }
+                    }
+                    if let Some(close) = inner.find('>') {
+                        let insert = if inner.as_bytes().get(close.wrapping_sub(1)) == Some(&b'/') {
+                            close - 1
+                        } else {
+                            close
+                        };
+                        inner.insert_str(insert, &format!(r#" {name}="{value}""#));
+                    }
+                }
+            }
+            if let Some(matrix) = transform {
+                if let Some(close) = inner.find('>') {
+                    let tag_end = inner.find(char::is_whitespace).unwrap_or(close);
+                    let tag_name = inner[1..tag_end].to_string();
+                    let element = format!(
+                        r#"<Transform A00="{}" A01="{}" A02="{}" A10="{}" A11="{}" A12="{}"/>"#,
+                        matrix[0], matrix[1], matrix[2], matrix[3], matrix[4], matrix[5]
+                    );
+                    if inner.as_bytes().get(close.wrapping_sub(1)) == Some(&b'/') {
+                        inner.replace_range(close - 1..=close, &format!(">{element}</{tag_name}>"));
+                    } else {
+                        inner.insert_str(close + 1, &element);
+                    }
+                }
+            }
+            xml.push_str(&inner);
+        }
         OmeShape::Label {
             x,
             y,
@@ -1278,6 +1595,7 @@ impl OmeMetadata {
         let spp = rgb_channel_count(meta);
         let channel_count = effective_size_c(meta) as usize;
         let image = &mut self.images[image_index];
+        image.pixels = Some(OmePixels::from(meta));
         if image.channels.len() < channel_count {
             image
                 .channels
@@ -1594,6 +1912,49 @@ impl OmeMetadata {
                 .unwrap_or(img_xml.len());
             let pixels_xml = pixels_pos.map(|p| &img_xml[p..pixels_end]);
 
+            let pixels = pixels_xml.and_then(|xml| {
+                let pt = start_tag_at(xml, all_tag_positions(xml, "Pixels").into_iter().next()?);
+                use crate::common::metadata::DimensionOrder::*;
+                use crate::common::pixel_type::PixelType;
+                let pixel_type = match xml_attr(pt, "Type").as_deref()? {
+                    "bit" => PixelType::Bit,
+                    "int8" => PixelType::Int8,
+                    "uint8" => PixelType::Uint8,
+                    "int16" => PixelType::Int16,
+                    "uint16" => PixelType::Uint16,
+                    "int32" => PixelType::Int32,
+                    "uint32" => PixelType::Uint32,
+                    "float" => PixelType::Float32,
+                    "double" => PixelType::Float64,
+                    _ => return None,
+                };
+                let dimension_order = match xml_attr(pt, "DimensionOrder").as_deref()? {
+                    "XYCZT" => XYCZT,
+                    "XYCTZ" => XYCTZ,
+                    "XYTCZ" => XYTCZ,
+                    "XYTZC" => XYTZC,
+                    "XYZCT" => XYZCT,
+                    "XYZTC" => XYZTC,
+                    _ => return None,
+                };
+                Some(OmePixels {
+                    size_x: xml_attr(pt, "SizeX")?.parse().ok()?,
+                    size_y: xml_attr(pt, "SizeY")?.parse().ok()?,
+                    size_z: xml_attr(pt, "SizeZ")?.parse().ok()?,
+                    size_c: xml_attr(pt, "SizeC")?.parse().ok()?,
+                    size_t: xml_attr(pt, "SizeT")?.parse().ok()?,
+                    pixel_type,
+                    dimension_order,
+                    bits_per_pixel: xml_attr(pt, "SignificantBits")
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(if pixel_type == PixelType::Bit {
+                            1
+                        } else {
+                            (pixel_type.bytes_per_sample() * 8) as u16
+                        }),
+                    is_little_endian: xml_attr(pt, "BigEndian").as_deref() != Some("true"),
+                })
+            });
             let mut channels = pixels_xml.map(parse_channels).unwrap_or_default();
             if let Some(pixels_xml) = pixels_xml {
                 let pixels_tag = start_tag_at(pixels_xml, 0);
@@ -1606,12 +1967,50 @@ impl OmeMetadata {
                     ..Default::default()
                 });
             }
+            let light_paths = pixels_xml
+                .map(|pixels| {
+                    all_tag_positions(pixels, "Channel")
+                        .into_iter()
+                        .map(|p| {
+                            let channel = first_xml_block(&pixels[p..], "Channel").unwrap_or("");
+                            let path = first_xml_block(channel, "LightPath").unwrap_or("");
+                            let refs = |tag| {
+                                all_tag_positions(path, tag)
+                                    .into_iter()
+                                    .filter_map(|p| xml_attr(start_tag_at(path, p), "ID"))
+                                    .collect()
+                            };
+                            OmeLightPath {
+                                excitation_filter_ids: refs("ExcitationFilterRef"),
+                                dichroic_id: all_tag_positions(path, "DichroicRef")
+                                    .into_iter()
+                                    .next()
+                                    .and_then(|p| xml_attr(start_tag_at(path, p), "ID")),
+                                emission_filter_ids: refs("EmissionFilterRef"),
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let imaging_environment_temperature = all_tag_positions(img_xml, "ImagingEnvironment")
+                .into_iter()
+                .next()
+                .and_then(|p| {
+                    let tag = start_tag_at(img_xml, p);
+                    let value = xml_attr(tag, "Temperature")?.parse::<f64>().ok()?;
+                    Some(match xml_attr(tag, "TemperatureUnit").as_deref() {
+                        Some("K") => value - 273.15,
+                        Some("°F") => (value - 32.0) * 5.0 / 9.0,
+                        _ => value,
+                    })
+                });
             let planes = pixels_xml.map(parse_planes).unwrap_or_default();
             let modulo_z = parse_modulo(xml, img_xml, "Z");
             let modulo_c = parse_modulo(xml, img_xml, "C");
             let modulo_t = parse_modulo(xml, img_xml, "T");
 
             images.push(OmeImage {
+                pixels,
                 name,
                 description,
                 acquisition_date,
@@ -1624,6 +2023,8 @@ impl OmeMetadata {
                 time_increment,
                 stage_label,
                 channels,
+                light_paths,
+                imaging_environment_temperature,
                 planes,
                 roi_refs,
                 modulo_z,
@@ -1674,6 +2075,9 @@ impl OmeMetadata {
                 }
                 images[i].objective_settings_refractive_index =
                     xml_attr(tag, "RefractiveIndex").and_then(|s| s.parse().ok());
+                images[i].objective_settings_correction_collar =
+                    xml_attr(tag, "CorrectionCollar").and_then(|s| s.parse().ok());
+                images[i].objective_settings_medium = xml_attr(tag, "Medium");
             }
         }
 
@@ -1690,6 +2094,7 @@ impl OmeMetadata {
                 let tag = start_tag_at(xml, pos);
                 OmeExperimenter {
                     id: xml_attr(tag, "ID"),
+                    user_name: xml_attr(tag, "UserName"),
                     first_name: xml_attr(tag, "FirstName"),
                     last_name: xml_attr(tag, "LastName"),
                     email: xml_attr(tag, "Email"),
@@ -1704,13 +2109,91 @@ impl OmeMetadata {
         // Parse <StructuredAnnotations> block
         let annotations = parse_structured_annotations(xml);
 
+        let image_ids: Vec<_> = all_tag_positions(xml, "Image")
+            .into_iter()
+            .map(|p| xml_attr(start_tag_at(xml, p), "ID"))
+            .collect();
+        let plates = all_tag_positions(xml, "Plate")
+            .into_iter()
+            .map(|p| {
+                let body = first_xml_block(&xml[p..], "Plate").unwrap_or("");
+                let tag = start_tag_at(xml, p);
+                OmePlate {
+                    id: xml_attr(tag, "ID"),
+                    name: xml_attr(tag, "Name"),
+                    rows: xml_attr(tag, "Rows")
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(0),
+                    columns: xml_attr(tag, "Columns")
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(0),
+                    wells: all_tag_positions(body, "Well")
+                        .into_iter()
+                        .map(|p| {
+                            let well_body = first_xml_block(&body[p..], "Well").unwrap_or("");
+                            let tag = start_tag_at(body, p);
+                            OmeWell {
+                                id: xml_attr(tag, "ID"),
+                                row: xml_attr(tag, "Row")
+                                    .and_then(|v| v.parse().ok())
+                                    .unwrap_or(0),
+                                column: xml_attr(tag, "Column")
+                                    .and_then(|v| v.parse().ok())
+                                    .unwrap_or(0),
+                                well_samples: all_tag_positions(well_body, "WellSample")
+                                    .into_iter()
+                                    .map(|p| {
+                                        let sample = first_xml_block(&well_body[p..], "WellSample")
+                                            .unwrap_or("");
+                                        let tag = start_tag_at(well_body, p);
+                                        let image_ref = all_tag_positions(sample, "ImageRef")
+                                            .into_iter()
+                                            .next()
+                                            .and_then(|p| xml_attr(start_tag_at(sample, p), "ID"))
+                                            .and_then(|id| {
+                                                image_ids
+                                                    .iter()
+                                                    .position(|v| v.as_deref() == Some(&id))
+                                            });
+                                        OmeWellSample {
+                                            id: xml_attr(tag, "ID"),
+                                            index: xml_attr(tag, "Index")
+                                                .and_then(|v| v.parse().ok())
+                                                .unwrap_or(0),
+                                            image_ref,
+                                            position_x: xml_attr(tag, "PositionX")
+                                                .and_then(|v| v.parse().ok()),
+                                            position_y: xml_attr(tag, "PositionY")
+                                                .and_then(|v| v.parse().ok()),
+                                        }
+                                    })
+                                    .collect(),
+                            }
+                        })
+                        .collect(),
+                }
+            })
+            .collect();
+        let screens = all_tag_positions(xml, "Screen")
+            .into_iter()
+            .map(|p| {
+                let tag = start_tag_at(xml, p);
+                OmeScreen {
+                    id: xml_attr(tag, "ID"),
+                    name: xml_attr(tag, "Name"),
+                    protocol_description: xml_attr(tag, "ProtocolDescription"),
+                }
+            })
+            .collect();
+
         OmeMetadata {
             images,
             instruments,
             experimenters,
             rois,
             annotations,
-            ..Default::default()
+            plates,
+            screens,
         }
     }
 
@@ -1740,7 +2223,11 @@ fn parse_channels(pixels_xml: &str) -> Vec<OmeChannel> {
             let tag = start_tag_at(pixels_xml, pos);
             // Round-trip the `<LightSourceSettings>` child element if present.
             let body_start = pos + tag.len();
-            let body_end = find_end_tag(pixels_xml, "Channel", body_start).unwrap_or(body_start);
+            let body_end = if tag.trim_end().ends_with("/>") {
+                body_start
+            } else {
+                find_end_tag(pixels_xml, "Channel", body_start).unwrap_or(body_start)
+            };
             let body = pixels_xml.get(pos..body_end.max(pos)).unwrap_or("");
             let (lss_id, lss_atten) = all_tag_positions(body, "LightSourceSettings")
                 .into_iter()
@@ -1753,7 +2240,28 @@ fn parse_channels(pixels_xml: &str) -> Vec<OmeChannel> {
                     )
                 })
                 .unwrap_or((None, None));
+            let detector = all_tag_positions(body, "DetectorSettings")
+                .into_iter()
+                .next()
+                .map(|p| start_tag_at(body, p))
+                .unwrap_or("");
             OmeChannel {
+                pinhole_size: xml_attr(tag, "PinholeSize").and_then(|v| v.parse().ok()),
+                fluor: xml_attr(tag, "Fluor"),
+                nd_filter: xml_attr(tag, "NDFilter").and_then(|v| v.parse().ok()),
+                illumination_type: xml_attr(tag, "IlluminationType"),
+                contrast_method: xml_attr(tag, "ContrastMethod"),
+                acquisition_mode: xml_attr(tag, "AcquisitionMode"),
+                detector_ref: xml_attr(detector, "ID"),
+                detector_settings_gain: xml_attr(detector, "Gain").and_then(|v| v.parse().ok()),
+                detector_settings_offset: xml_attr(detector, "Offset").and_then(|v| v.parse().ok()),
+                detector_settings_voltage: xml_attr(detector, "Voltage")
+                    .and_then(|v| v.parse().ok()),
+                detector_settings_binning: xml_attr(detector, "Binning"),
+                filter_set_ref: all_tag_positions(body, "FilterSetRef")
+                    .into_iter()
+                    .next()
+                    .and_then(|pos| xml_attr(start_tag_at(body, pos), "ID")),
                 name: xml_attr(tag, "Name"),
                 samples_per_pixel: xml_attr(tag, "SamplesPerPixel")
                     .and_then(|s| s.parse().ok())
@@ -1946,12 +2454,13 @@ fn parse_instruments(xml: &str) -> Vec<OmeInstrument> {
             let tag = start_tag_at(xml, pos);
             let id = xml_attr(tag, "ID");
 
-            let inst_end = find_end_tag(xml, "Instrument", pos)
-                .map(|e| xml[e..].find('>').map(|gt| e + gt + 1).unwrap_or(xml.len()))
-                .unwrap_or(xml.len());
-            let inst_xml = &xml[pos..inst_end];
+            let inst_xml = first_xml_block(&xml[pos..], "Instrument").unwrap_or(tag);
 
             // Microscope
+            let microscope_type = all_tag_positions(inst_xml, "Microscope")
+                .into_iter()
+                .next()
+                .and_then(|pos| xml_attr(start_tag_at(inst_xml, pos), "Type"));
             let microscope_model = all_tag_positions(inst_xml, "Microscope")
                 .into_iter()
                 .next()
@@ -1971,6 +2480,7 @@ fn parse_instruments(xml: &str) -> Vec<OmeInstrument> {
                 .map(|p| {
                     let t = start_tag_at(inst_xml, p);
                     OmeObjective {
+                        iris: xml_attr(t, "Iris").and_then(|v| v.parse().ok()),
                         id: xml_attr(t, "ID"),
                         model: xml_attr(t, "Model"),
                         manufacturer: xml_attr(t, "Manufacturer"),
@@ -1998,8 +2508,22 @@ fn parse_instruments(xml: &str) -> Vec<OmeInstrument> {
                         model: xml_attr(t, "Model"),
                         manufacturer: xml_attr(t, "Manufacturer"),
                         detector_type: xml_attr(t, "Type"),
+                        zoom: xml_attr(t, "Zoom").and_then(|s| s.parse().ok()),
+                        amplification_gain: xml_attr(t, "AmplificationGain")
+                            .and_then(|s| s.parse().ok()),
+                        serial_number: xml_attr(t, "SerialNumber"),
+                        lot_number: xml_attr(t, "LotNumber"),
                         gain: xml_attr(t, "Gain").and_then(|s| s.parse().ok()),
                         offset: xml_attr(t, "Offset").and_then(|s| s.parse().ok()),
+                        voltage: xml_attr(t, "Voltage").and_then(|s| s.parse().ok()).map(
+                            |value: f64| match xml_attr(t, "VoltageUnit").as_deref().unwrap_or("V")
+                            {
+                                "mV" => value / 1000.0,
+                                "µV" | "uV" => value / 1_000_000.0,
+                                "kV" => value * 1000.0,
+                                _ => value,
+                            },
+                        ),
                     }
                 })
                 .collect();
@@ -2020,6 +2544,10 @@ fn parse_instruments(xml: &str) -> Vec<OmeInstrument> {
                         model: xml_attr(t, "Model"),
                         manufacturer: xml_attr(t, "Manufacturer"),
                         light_source_type: Some(ls_tag.to_string()),
+                        laser_type: xml_attr(t, "Type"),
+                        laser_medium: xml_attr(t, "LaserMedium"),
+                        serial_number: xml_attr(t, "SerialNumber"),
+                        lot_number: xml_attr(t, "LotNumber"),
                         power: xml_attr(t, "Power").and_then(|s| s.parse().ok()),
                         wavelength: xml_attr(t, "Wavelength").and_then(|s| s.parse().ok()),
                     });
@@ -2031,13 +2559,24 @@ fn parse_instruments(xml: &str) -> Vec<OmeInstrument> {
                 .into_iter()
                 .map(|p| {
                     let t = start_tag_at(inst_xml, p);
+                    let end = if t.trim_end().ends_with("/>") {
+                        p + t.len()
+                    } else {
+                        find_end_tag(inst_xml, "Filter", p + t.len()).unwrap_or(p + t.len())
+                    };
+                    let body = &inst_xml[p..end];
+                    let range = all_tag_positions(body, "TransmittanceRange")
+                        .into_iter()
+                        .next()
+                        .map(|p| start_tag_at(body, p))
+                        .unwrap_or(t);
                     OmeFilter {
                         id: xml_attr(t, "ID"),
                         model: xml_attr(t, "Model"),
                         manufacturer: xml_attr(t, "Manufacturer"),
                         filter_type: xml_attr(t, "Type"),
-                        cut_in: xml_attr(t, "CutIn").and_then(|s| s.parse().ok()),
-                        cut_out: xml_attr(t, "CutOut").and_then(|s| s.parse().ok()),
+                        cut_in: xml_attr(range, "CutIn").and_then(|s| s.parse().ok()),
+                        cut_out: xml_attr(range, "CutOut").and_then(|s| s.parse().ok()),
                     }
                 })
                 .collect();
@@ -2055,7 +2594,41 @@ fn parse_instruments(xml: &str) -> Vec<OmeInstrument> {
                 })
                 .collect();
 
+            let filter_sets = all_tag_positions(inst_xml, "FilterSet")
+                .into_iter()
+                .map(|pos| {
+                    let tag = start_tag_at(inst_xml, pos);
+                    let end = if tag.trim_end().ends_with("/>") {
+                        pos + tag.len()
+                    } else {
+                        find_end_tag(inst_xml, "FilterSet", pos + tag.len())
+                            .unwrap_or(pos + tag.len())
+                    };
+                    let body = &inst_xml[pos..end];
+                    let refs = |name| {
+                        all_tag_positions(body, name)
+                            .into_iter()
+                            .filter_map(|i| xml_attr(start_tag_at(body, i), "ID"))
+                            .collect()
+                    };
+                    OmeFilterSet {
+                        serial_number: xml_attr(tag, "SerialNumber"),
+                        lot_number: xml_attr(tag, "LotNumber"),
+                        id: xml_attr(tag, "ID"),
+                        model: xml_attr(tag, "Model"),
+                        manufacturer: xml_attr(tag, "Manufacturer"),
+                        excitation_filter_ids: refs("ExcitationFilterRef"),
+                        dichroic_ref: all_tag_positions(body, "DichroicRef")
+                            .into_iter()
+                            .next()
+                            .and_then(|i| xml_attr(start_tag_at(body, i), "ID")),
+                        emission_filter_ids: refs("EmissionFilterRef"),
+                    }
+                })
+                .collect();
             OmeInstrument {
+                microscope_type,
+                filter_sets,
                 id,
                 microscope_model,
                 microscope_manufacturer,
@@ -2290,6 +2863,77 @@ fn parse_rois(xml: &str) -> Vec<OmeROI> {
                 });
             }
 
+            // Preserve the common OME Shape attributes on each parsed geometry.
+            // The geometry loops above group shapes by type, so use that same order.
+            let mut shape_index = 0;
+            for name in [
+                "Label",
+                "Rectangle",
+                "Ellipse",
+                "Point",
+                "Line",
+                "Polygon",
+                "Polyline",
+                "Mask",
+            ] {
+                for sp in all_tag_positions(union_xml, name) {
+                    let tag = start_tag_at(union_xml, sp);
+                    let font_size = if name == "Label" {
+                        None
+                    } else {
+                        xml_attr(tag, "FontSize").and_then(|v| v.parse().ok())
+                    };
+                    let stroke_width = if name == "Label" {
+                        None
+                    } else {
+                        xml_attr(tag, "StrokeWidth").and_then(|v| v.parse().ok())
+                    };
+                    let transform = if tag.trim_end().ends_with("/>") {
+                        None
+                    } else {
+                        find_end_tag(union_xml, name, sp).and_then(|end| {
+                            let body = &union_xml[sp..end];
+                            let pos = all_tag_positions(body, "Transform").into_iter().next()?;
+                            let t = start_tag_at(body, pos);
+                            let mut matrix = [0.0; 6];
+                            for (i, key) in ["A00", "A01", "A02", "A10", "A11", "A12"]
+                                .into_iter()
+                                .enumerate()
+                            {
+                                matrix[i] = xml_attr(t, key)?.parse().ok()?;
+                            }
+                            Some(matrix)
+                        })
+                    };
+                    if font_size.is_some() || stroke_width.is_some() || transform.is_some() {
+                        if let Some(shape) = shapes.get_mut(shape_index) {
+                            *shape = OmeShape::Styled {
+                                shape: Box::new(shape.clone()),
+                                font_size,
+                                stroke_width,
+                                transform,
+                            };
+                        }
+                    }
+                    shape_index += 1;
+                }
+            }
+            let positions: Vec<usize> = [
+                "Label",
+                "Rectangle",
+                "Ellipse",
+                "Point",
+                "Line",
+                "Polygon",
+                "Polyline",
+                "Mask",
+            ]
+            .into_iter()
+            .flat_map(|name| all_tag_positions(union_xml, name))
+            .collect();
+            let mut ordered: Vec<_> = positions.into_iter().zip(shapes).collect();
+            ordered.sort_by_key(|(pos, _)| *pos);
+            let shapes = ordered.into_iter().map(|(_, shape)| shape).collect();
             OmeROI { id, name, shapes }
         })
         .collect()
@@ -2618,7 +3262,11 @@ fn first_xml_block<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
     let pos = all_tag_positions(xml, tag).into_iter().next()?;
     let start_tag = start_tag_at(xml, pos);
     let content_start = pos + start_tag.len();
-    let end = find_end_tag(xml, tag, content_start).unwrap_or(content_start);
+    let end = if start_tag.trim_end().ends_with("/>") {
+        content_start
+    } else {
+        find_end_tag(xml, tag, content_start).unwrap_or(content_start)
+    };
     xml.get(pos..end)
 }
 
@@ -3312,6 +3960,7 @@ fn generic_objective_from_metadata(meta: &ImageMetadata) -> Option<OmeObjective>
     let metadata = &meta.series_metadata;
     let excluded_prefixes = ["xlef.lms."];
     let objective = OmeObjective {
+        iris: None,
         id: Some(create_lsid("Objective", &[0, 0])),
         model: metadata_string_by_suffix_filtered(
             metadata,
@@ -3396,6 +4045,21 @@ fn generic_detector_from_metadata(meta: &ImageMetadata) -> Option<OmeDetector> {
     let metadata = &meta.series_metadata;
     let excluded_prefixes = ["xlef.lms."];
     let detector = OmeDetector {
+        zoom: metadata_value_f64(metadata_by_suffix_filtered(
+            metadata,
+            &["detector.zoom", "detector.0.zoom"],
+            &excluded_prefixes,
+        ))
+        .filter(|v| v.is_finite()),
+        amplification_gain: None,
+        serial_number: None,
+        lot_number: None,
+        voltage: metadata_value_f64(metadata_by_suffix_filtered(
+            metadata,
+            &["detector.voltage", "detector.0.voltage"],
+            &excluded_prefixes,
+        ))
+        .filter(|v| v.is_finite()),
         id: Some(create_lsid("Detector", &[0, 0])),
         model: metadata_string_by_suffix_filtered(
             metadata,
@@ -3434,7 +4098,9 @@ fn generic_detector_from_metadata(meta: &ImageMetadata) -> Option<OmeDetector> {
         || detector.manufacturer.is_some()
         || detector.detector_type.is_some()
         || detector.gain.is_some()
-        || detector.offset.is_some())
+        || detector.offset.is_some()
+        || detector.voltage.is_some()
+        || detector.zoom.is_some())
     .then_some(detector)
 }
 
@@ -3442,6 +4108,10 @@ fn generic_light_source_from_metadata(meta: &ImageMetadata) -> Option<OmeLightSo
     let metadata = &meta.series_metadata;
     let excluded_prefixes = ["xlef.lms."];
     let light_source = OmeLightSource {
+        laser_type: None,
+        laser_medium: None,
+        serial_number: None,
+        lot_number: None,
         id: Some(create_lsid("LightSource", &[0, 0])),
         model: metadata_string_by_suffix_filtered(
             metadata,
@@ -3603,6 +4273,14 @@ fn generic_dichroic_from_metadata(meta: &ImageMetadata) -> Option<OmeDichroic> {
 fn generic_experimenter_from_metadata(meta: &ImageMetadata) -> Option<OmeExperimenter> {
     let metadata = &meta.series_metadata;
     let experimenter = OmeExperimenter {
+        user_name: metadata_string_by_suffix(
+            metadata,
+            &[
+                "experimenter.user_name",
+                "experimenter.username",
+                "user.username",
+            ],
+        ),
         id: Some(create_lsid("Experimenter", &[0])),
         first_name: metadata_string_by_suffix(
             metadata,
@@ -3650,7 +4328,8 @@ fn generic_experimenter_from_metadata(meta: &ImageMetadata) -> Option<OmeExperim
         ),
     };
 
-    (experimenter.first_name.is_some()
+    (experimenter.user_name.is_some()
+        || experimenter.first_name.is_some()
         || experimenter.last_name.is_some()
         || experimenter.email.is_some()
         || experimenter.institution.is_some())
@@ -3897,6 +4576,262 @@ mod tests {
     use super::*;
     use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
     use crate::common::pixel_type::PixelType;
+
+    #[test]
+    fn self_closing_channel_and_filter_set_do_not_inherit_sibling_children() {
+        let xml = r#"<OME><Instrument ID="Instrument:0"><FilterSet ID="FilterSet:0"/><FilterSet ID="FilterSet:1"><ExcitationFilterRef ID="Filter:1"/></FilterSet></Instrument><Image ID="Image:0"><Pixels><Channel ID="Channel:0"/><Channel ID="Channel:1"><LightSourceSettings ID="LightSource:1"/><DetectorSettings ID="Detector:1"/><FilterSetRef ID="FilterSet:1"/><LightPath><EmissionFilterRef ID="Filter:1"/></LightPath></Channel></Pixels></Image></OME>"#;
+        let ome = OmeMetadata::from_ome_xml(xml);
+        assert!(ome.instruments[0].filter_sets[0]
+            .excitation_filter_ids
+            .is_empty());
+        assert_eq!(
+            ome.instruments[0].filter_sets[1].excitation_filter_ids,
+            ["Filter:1"]
+        );
+        let first = &ome.images[0].channels[0];
+        assert!(first.light_source_settings_id.is_none());
+        assert!(first.detector_ref.is_none());
+        assert!(first.filter_set_ref.is_none());
+        assert_eq!(
+            ome.images[0].channels[1].filter_set_ref.as_deref(),
+            Some("FilterSet:1")
+        );
+        assert!(ome.images[0].light_paths[0].emission_filter_ids.is_empty());
+    }
+
+    #[test]
+    fn rich_ome_graph_roundtrip_and_optional_java_schema_validation() {
+        // Arbitrary input image IDs ensure HCS refs resolve by ID, not a numeric suffix.
+        let input = r#"<OME><Plate ID="Plate:custom" Name="plate &amp; one" Rows="8" Columns="12"><Well ID="Well:custom" Row="2" Column="3"><WellSample ID="WellSample:custom" Index="7" PositionX="-1.5" PositionY="2.5"><ImageRef ID="Image:second"/></WellSample></Well></Plate><Screen ID="Screen:custom" Name="screen" ProtocolDescription="protocol"/><Instrument ID="Instrument:0"><Microscope Type="Other"/><Laser ID="LightSource:0" Type="Other" LaserMedium="Other"/><Detector ID="Detector:0" Type="PMT" Voltage="100"/><Objective ID="Objective:0" Immersion="Oil" Correction="PlanApo"/><FilterSet ID="FilterSet:0"><ExcitationFilterRef ID="Filter:0"/><DichroicRef ID="Dichroic:0"/><EmissionFilterRef ID="Filter:0"/></FilterSet><Filter ID="Filter:0" Type="BandPass"><TransmittanceRange CutIn="400" CutOut="500"/></Filter><Dichroic ID="Dichroic:0"/></Instrument><Image ID="Image:first"><AcquisitionDate>2026-10-26T12:00:00</AcquisitionDate><Description>description</Description><InstrumentRef ID="Instrument:0"/><ObjectiveSettings ID="Objective:0" RefractiveIndex="1.5"/><ImagingEnvironment Temperature="20"/><StageLabel Name="origin" X="1"/><Pixels ID="Pixels:0" DimensionOrder="XYZCT" Type="uint8" SizeX="2" SizeY="3" SizeZ="1" SizeC="1" SizeT="1"><Channel ID="Channel:0" SamplesPerPixel="1"><LightSourceSettings ID="LightSource:0"/><DetectorSettings ID="Detector:0"/><FilterSetRef ID="FilterSet:0"/><LightPath><EmissionFilterRef ID="Filter:0"/></LightPath></Channel><MetadataOnly/><Plane TheZ="0" TheC="0" TheT="0"/></Pixels><ROIRef ID="ROI:0"/></Image><Image ID="Image:second"><Pixels ID="Pixels:1" DimensionOrder="XYCZT" Type="uint16" SizeX="4" SizeY="5" SizeZ="2" SizeC="1" SizeT="1"><Channel ID="Channel:1" SamplesPerPixel="1"/><MetadataOnly/></Pixels></Image><StructuredAnnotations><CommentAnnotation ID="Annotation:0"><Value>annotation</Value></CommentAnnotation></StructuredAnnotations><ROI ID="ROI:0"><Union><Rectangle ID="Shape:0" X="1" Y="2" Width="3" Height="4" FontSize="12" StrokeWidth="0.5"><Transform A00="1" A01="0" A02="10" A10="0" A11="1" A12="20"/></Rectangle></Union></ROI></OME>"#;
+        let mut ome = OmeMetadata::from_ome_xml(input);
+        ome.images[1].modulo_z = Some(crate::metadata::ModuloAnnotation {
+            parent_dimension: "Z".into(),
+            modulo_type: "angle".into(),
+            start: 0.0,
+            step: 90.0,
+            end: 90.0,
+            unit: "degree".into(),
+            labels: vec!["first & zero".into(), "second".into()],
+        });
+        let xml = ome.to_ome_xml(&ImageMetadata::default());
+        let parsed = OmeMetadata::from_ome_xml(&xml);
+        assert_eq!(parsed.images.len(), 2);
+        assert_eq!(parsed.images[1].pixels.as_ref().unwrap().size_x, 4);
+        assert_eq!(parsed.plates[0].name.as_deref(), Some("plate & one"));
+        let well = &parsed.plates[0].wells[0];
+        assert_eq!((well.row, well.column), (2, 3));
+        let sample = &well.well_samples[0];
+        assert_eq!(
+            (sample.index, sample.image_ref, sample.position_x),
+            (7, Some(1), Some(-1.5))
+        );
+        assert_eq!(
+            parsed.screens[0].protocol_description.as_deref(),
+            Some("protocol")
+        );
+        assert_eq!(parsed.instruments[0].filters[0].cut_in, Some(400.0));
+        assert_eq!(parsed.images[0].imaging_environment_temperature, Some(20.0));
+        assert_eq!(
+            parsed.images[0].channels[0].detector_ref.as_deref(),
+            Some("Detector:0")
+        );
+        assert_eq!(
+            parsed.images[0].light_paths[0].emission_filter_ids,
+            ["Filter:0"]
+        );
+        assert_eq!(
+            parsed.images[1].modulo_z.as_ref().unwrap().labels,
+            ["first & zero", "second"]
+        );
+        assert_eq!(xml.matches("<MetadataOnly/>").count(), 2);
+        assert!(xml.find("<StructuredAnnotations>").unwrap() < xml.find("<ROI ID=").unwrap());
+        assert!(xml.find("</Pixels>").unwrap() < xml.find("<ROIRef").unwrap());
+        if let Some(jar) = std::env::var_os("BIOFORMATS_RS_OME_SCHEMA_JAR") {
+            let dir =
+                std::env::temp_dir().join(format!("bioformats-ome-schema-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("rich.ome.xml"), &xml).unwrap();
+            use crate::FormatWriter;
+            let tiff_meta = ImageMetadata {
+                size_x: 2,
+                size_y: 3,
+                size_c: 2,
+                image_count: 2,
+                ..Default::default()
+            };
+            let mut writer = crate::tiff::TiffWriter::new().with_auto_ome_xml();
+            writer.set_metadata(&tiff_meta).unwrap();
+            writer.set_id(&dir.join("mapped.ome.tif")).unwrap();
+            writer.save_bytes(0, &[1, 2, 3, 4, 5, 6]).unwrap();
+            writer.save_bytes(1, &[7, 8, 9, 10, 11, 12]).unwrap();
+            writer.close().unwrap();
+
+            std::fs::write(
+                dir.join("ValidateOme.java"),
+                r#"import java.nio.file.*;
+import loci.common.services.ServiceFactory;
+import loci.formats.services.OMEXMLService;
+public class ValidateOme { public static void main(String[] args) throws Exception {
+  String xml = Files.readString(Path.of(args[0]));
+  OMEXMLService service = new ServiceFactory().getInstance(OMEXMLService.class);
+  if (!service.validateOMEXML(xml, false)) throw new Exception("OME schema validation failed");
+  System.out.println("OME 2016-06 schema validation passed");
+  loci.formats.ImageReader reader = new loci.formats.ImageReader();
+  reader.setId(args[1]);
+  if (reader.getImageCount() != 2 || reader.getSizeC() != 2) throw new Exception("TIFF dimensions changed");
+  for (int p = 0; p < 2; p++) {
+    byte[] bytes = reader.openBytes(p);
+    if (bytes.length != 6) throw new Exception("TIFF plane length changed");
+    for (int k = 0; k < 6; k++) if (bytes[k] != 1 + p * 6 + k) throw new Exception("TIFF pixel mapping changed");
+  }
+  reader.close();
+  System.out.println("Java TIFF core and both mapped planes passed");
+} }"#,
+            )
+            .unwrap();
+            let jar = std::fs::canonicalize(jar).unwrap();
+            let compile = std::process::Command::new("javac")
+                .arg("-cp")
+                .arg(&jar)
+                .arg(dir.join("ValidateOme.java"))
+                .output()
+                .unwrap();
+            assert!(
+                compile.status.success(),
+                "{}",
+                String::from_utf8_lossy(&compile.stderr)
+            );
+            let cp = std::env::join_paths([jar.as_path(), dir.as_path()]).unwrap();
+            let validate = std::process::Command::new("java")
+                .arg("-cp")
+                .arg(cp)
+                .arg("ValidateOme")
+                .arg(dir.join("rich.ome.xml"))
+                .arg(dir.join("mapped.ome.tif"))
+                .output()
+                .unwrap();
+            assert!(
+                validate.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&validate.stdout),
+                String::from_utf8_lossy(&validate.stderr)
+            );
+            eprintln!("{}", String::from_utf8_lossy(&validate.stdout));
+        }
+    }
+
+    #[test]
+    fn ome_xml_preserves_different_series_pixel_descriptions() {
+        use crate::common::metadata::DimensionOrder;
+        use crate::common::pixel_type::PixelType;
+        let first = ImageMetadata {
+            size_x: 12,
+            size_y: 8,
+            ..Default::default()
+        };
+        let second = ImageMetadata {
+            size_x: 4,
+            size_y: 3,
+            size_z: 2,
+            size_c: 3,
+            size_t: 5,
+            pixel_type: PixelType::Uint16,
+            bits_per_pixel: 12,
+            dimension_order: DimensionOrder::XYZTC,
+            is_little_endian: false,
+            ..Default::default()
+        };
+        let mut ome = OmeMetadata::default();
+        ome.populate_pixels(&first, 0).unwrap();
+        ome.populate_pixels(&second, 1).unwrap();
+        let xml = ome.to_ome_xml(&first);
+        let parsed = OmeMetadata::from_ome_xml(&xml);
+        let p0 = parsed.images[0].pixels.as_ref().unwrap();
+        let p1 = parsed.images[1].pixels.as_ref().unwrap();
+        assert_eq!((p0.size_x, p0.size_y), (12, 8));
+        assert_eq!(
+            (p1.size_x, p1.size_y, p1.size_z, p1.size_c, p1.size_t),
+            (4, 3, 2, 3, 5)
+        );
+        assert_eq!(p1.pixel_type, PixelType::Uint16);
+        assert_eq!(p1.dimension_order, DimensionOrder::XYZTC);
+        assert_eq!(p1.bits_per_pixel, 12);
+        assert!(!p1.is_little_endian);
+    }
+
+    #[test]
+    fn ome_optical_component_and_objective_settings_roundtrip() {
+        let input = r#"<OME><Instrument ID="Instrument:0"><Microscope Type="Other"/><Objective ID="Objective:0:0" Iris="true"/><Detector ID="Detector:0:0" Zoom="2" AmplificationGain="3" SerialNumber="det-1" LotNumber="det-lot"/><Laser ID="LightSource:0:0" Type="Other" LaserMedium="Other" SerialNumber="laser-1" LotNumber="laser-lot"/><FilterSet ID="FilterSet:0:0" Model="cube" Manufacturer="maker" SerialNumber="cube-1" LotNumber="cube-lot"><ExcitationFilterRef ID="Filter:0:0"/><DichroicRef ID="Dichroic:0:0"/><EmissionFilterRef ID="Filter:0:1"/></FilterSet></Instrument><Image ID="Image:0"><InstrumentRef ID="Instrument:0"/><ObjectiveSettings ID="Objective:0:0" Medium="Oil" CorrectionCollar="0.17" RefractiveIndex="1.515"/><Pixels ID="Pixels:0" DimensionOrder="XYCZT" Type="uint8" SizeX="2" SizeY="2" SizeC="1" SizeZ="1" SizeT="1"><Channel ID="Channel:0:0" SamplesPerPixel="1"><FilterSetRef ID="FilterSet:0:0"/></Channel></Pixels></Image></OME>"#;
+        let mut metadata = OmeMetadata::from_ome_xml(input);
+        // Assert both parsing and serialization, including reference identity.
+        for iteration in 0..2 {
+            let inst = &metadata.instruments[0];
+            assert_eq!(inst.microscope_type.as_deref(), Some("Other"));
+            assert_eq!(inst.objectives[0].iris, Some(true));
+            assert_eq!(
+                (inst.detectors[0].zoom, inst.detectors[0].amplification_gain),
+                (Some(2.0), Some(3.0))
+            );
+            assert_eq!(inst.detectors[0].serial_number.as_deref(), Some("det-1"));
+            assert_eq!(inst.light_sources[0].laser_medium.as_deref(), Some("Other"));
+            assert_eq!(inst.light_sources[0].laser_type.as_deref(), Some("Other"));
+            let set = &inst.filter_sets[0];
+            assert_eq!(set.serial_number.as_deref(), Some("cube-1"));
+            assert_eq!(set.lot_number.as_deref(), Some("cube-lot"));
+            assert_eq!(set.excitation_filter_ids, ["Filter:0:0"]);
+            assert_eq!(set.dichroic_ref.as_deref(), Some("Dichroic:0:0"));
+            assert_eq!(set.emission_filter_ids, ["Filter:0:1"]);
+            let image = &metadata.images[0];
+            assert_eq!(
+                image.channels[0].filter_set_ref.as_deref(),
+                Some("FilterSet:0:0")
+            );
+            assert_eq!(image.objective_settings_medium.as_deref(), Some("Oil"));
+            assert_eq!(image.objective_settings_correction_collar, Some(0.17));
+            if iteration == 0 {
+                let xml = metadata.to_ome_xml(&crate::common::metadata::ImageMetadata {
+                    size_x: 2,
+                    size_y: 2,
+                    ..Default::default()
+                });
+                metadata = OmeMetadata::from_ome_xml(&xml);
+            }
+        }
+    }
+
+    #[test]
+    fn ome_rich_shape_and_experimenter_fields_roundtrip() {
+        let input = r#"<OME><Experimenter ID="Experimenter:0" UserName="analyst&amp;1"/><Instrument ID="Instrument:0"><Detector ID="Detector:0:0" Voltage="-250" VoltageUnit="mV"/></Instrument><ROI ID="ROI:0"><Union><Rectangle ID="Shape:0:0" X="1" Y="2" Width="3" Height="4" FontSize="12" StrokeWidth="0.5" TheZ="2"><Transform A00="0" A01="-1" A02="10" A10="1" A11="0" A12="20"/></Rectangle></Union></ROI></OME>"#;
+        let ome = OmeMetadata::from_ome_xml(input);
+        assert_eq!(ome.experimenters[0].user_name.as_deref(), Some("analyst&1"));
+        assert_eq!(ome.instruments[0].detectors[0].voltage, Some(-0.25));
+        let xml = ome.to_ome_xml(&crate::common::metadata::ImageMetadata::default());
+        assert!(xml.contains(r#"UserName="analyst&amp;1""#));
+        assert!(xml.contains(r#"Voltage="-0.25" VoltageUnit="V""#));
+        assert!(xml.contains(r#"ID="Shape:0:0""#));
+        let reparsed = OmeMetadata::from_ome_xml(&xml);
+        match &reparsed.rois[0].shapes[0] {
+            OmeShape::Styled {
+                shape,
+                font_size,
+                stroke_width,
+                transform,
+            } => {
+                assert_eq!(*font_size, Some(12.0));
+                assert_eq!(*stroke_width, Some(0.5));
+                assert_eq!(*transform, Some([0.0, -1.0, 10.0, 1.0, 0.0, 20.0]));
+                assert!(matches!(
+                    shape.as_ref(),
+                    OmeShape::Rectangle {
+                        x: 1.0,
+                        the_z: Some(2),
+                        ..
+                    }
+                ));
+            }
+            other => panic!("lost shape style: {other:?}"),
+        }
+    }
 
     #[test]
     fn rgb_metadata_uses_java_effective_channel_count() {
@@ -4170,7 +5105,7 @@ mod tests {
         let ome = OmeMetadata::from_image_metadata(&meta);
         let xml = ome.to_ome_xml(&meta);
 
-        assert!(xml.contains(r#"<Mask X="0" Y="0" Width="8" Height="1" StrokeColor="-16776961" FillColor="-16776961"><BinData Length="1">oA==</BinData></Mask>"#));
+        assert!(xml.contains(r#"<Mask ID="Shape:0:0" X="0" Y="0" Width="8" Height="1" StrokeColor="-16776961" FillColor="-16776961"><BinData Length="1">oA==</BinData></Mask>"#));
         let parsed = OmeMetadata::from_ome_xml(&xml);
         match &parsed.rois[0].shapes[0] {
             OmeShape::Mask {

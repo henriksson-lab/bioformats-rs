@@ -1607,6 +1607,11 @@ impl FormatReader for DeltavisionReader {
                 if log.has_detector() {
                     let d = &log.detector;
                     inst.detectors.push(OmeDetector {
+                        voltage: None,
+                        zoom: None,
+                        amplification_gain: None,
+                        serial_number: None,
+                        lot_number: None,
                         id: None,
                         model: d.model.clone(),
                         manufacturer: None,

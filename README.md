@@ -4,7 +4,9 @@ A pure-Rust translation of [Bio-Formats](https://www.openmicroscopy.org/bio-form
 — a library for reading (and writing) scientific image formats used in microscopy, medical imaging, and astronomy.
 
 The Bio-Formats translation tracks [`ome/bioformats`](https://github.com/ome/bioformats)
-at commit `d87eb853f0f8d1496aec29ace384cdc5b963096a`.
+at commit [`d54bf462e3cbe07715c6002eb614e2ced2278189`](https://github.com/ome/bioformats/commit/d54bf462e3cbe07715c6002eb614e2ced2278189),
+the revision in the local `java-bioformats/` reference checkout.
+See the [upstream update record](audit/upstream-2026-10-26.md) for translated changes and validation.
 
 The internal Metakit table reader used for Volocity is translated from
 `ome.metakit.MetakitReader` in
@@ -12,6 +14,7 @@ The internal Metakit table reader used for Volocity is translated from
 `b8b3a629a6dd9bf422949f6b175b9e310ba6e252`.
 
 
+* 2026-10-26: Updated the Bio-Formats translation to `d54bf462e3`: channel targets, CellSens stacks and pyramid metadata, anatomical orientations, MINC/FDF handling, and Operetta paths.
 * 2026-10-25: resolution translation error corrected
 * 2026-10-02: Tecan spark file format retranslated
 * 2026-08-14: Continued audit for ND2, fixed parity issues. also audit for several other file formats (blocked on test data for remaining ones)
@@ -70,6 +73,13 @@ meta.pixel_type = PixelType::Uint16;
 let planes: Vec<Vec<u8>> = (0..10).map(|_| vec![0u8; 512 * 512 * 2]).collect();
 ImageWriter::save(Path::new("output.tif"), &meta, &planes)?;
 ```
+
+Readers that provide anatomical orientation metadata expose it through
+`FormatReader::axis_orientations()` and `ImageReader::axis_orientations()`.
+The result contains five optional `Orientation` values. The vocabulary and
+`flip()` operation are exported as `AnatomicalOrientation`, `OrientationType`
+and `OrientationTerm`. This metadata does not reorder pixel data; reader-specific
+axis placement follows the translated Java behavior (see the update record).
 
 ## Supported formats
 
@@ -132,19 +142,15 @@ Additional write-capable formats (read support listed elsewhere): OME-XML
 
 ## Translation status (all readers)
 
-A per-reader audit of the Java-to-Rust translation is tracked in
-[`TOAUDIT.md`](https://github.com/henriksson-lab/bioformats-rs/blob/main/TOAUDIT.md).
-Rows marked complete there have passed two clean audits against the corresponding
-Bio-Formats Java reader/writer or are documented Rust-only additions.
+Current implementation work and validation limits are tracked in
+[TOFIX.md](TOFIX.md), with evidence linked from [the audit index](AUDITLIST2.md).
+Historical completed audits are archived rather than mixed into the active backlog.
 
-The table below is a user-facing capability summary. It should not be read as the
-translation audit state; codec gaps, optional features, or Rust-only support may
-still be called out even when the Java translation audit is complete. The notes
-column is intentionally limited to Rust-specific deviations from the upstream
-Bio-Formats documentation.
+The table below describes reader capabilities. A working read path does not
+imply every proprietary variant has a real-file Java comparison; consult the
+format-specific verification records for that scope.
 
-- ✅ **Complete** — tracked audit is clean for translated behavior and the common
-  read path is implemented.
+- ✅ **Implemented** — the common read path is implemented.
 - 🟡 **Partial** — user-visible codec, payload, metadata, or optional-feature gap
   remains.
 - ⛔ **Stub** — detection only; `set_id` returns `UnsupportedFormat` (the format
@@ -563,12 +569,17 @@ let plane = reader.open_bytes(0)?;
 assert_eq!(plane.len(), meta.size_y as usize * row_bytes);
 ```
 
-## Remaining gaps
+## Validation limits and codec availability
 
-- **ND2**: full coverage of modern structured `ImageDataSeq` variants and richer per-plane metadata (raw/zlib/JPEG2000 frames already decode; see status table)
-- **Write support** for LIF, ND2, CZI
-- **OME metadata**: `reader.ome_metadata()` returns baseline OME metadata for all readers and enriches it with structured physical sizes, channel names, channel colors, wavelengths, and plane positions where supported; richer parsing (instrument, experimenter) is partial
-- **Pyramid writing UX**: direct `bioformats::tiff::PyramidOmeTiffWriter` exists; automatic `ImageWriter` dispatch intentionally writes ordinary OME-TIFF for plain `.ome.*` suffixes unless callers use the pyramid writer directly.
+The [current parity ledger](TOFIX.md) distinguishes implementation work from
+real-fixture evidence. ND2 has bounded comparisons across 62 files; native
+SlideBook, LEI and Zeiss MDB variants still have limited real-project coverage.
+Synthetic tests and source comparisons cover the implemented edge cases.
+
+LIF, ND2 and CZI writing are not implemented here and are also absent from the
+reference Bio-Formats writer list. Adding those writers would be new functionality.
+Pyramid OME-TIFF writing is available through `PyramidOmeTiffWriter`; automatic
+`ImageWriter` dispatch intentionally writes ordinary OME-TIFF for `.ome.*` suffixes.
 
 ### Missing external codecs
 
@@ -591,14 +602,16 @@ JPEG-XR (default-on `jpegxr` feature), Cinepak, Apple RLE/Animation, PNG, and
 the standard TIFF compressions.
 
 On the **write** side, **JPEG 2000 writing** (`.jp2`/`.j2k`) is now supported via
-the pure-Rust `openjp2` encoder, behind the default-on `jpeg2000-write` feature
-(disable with `--no-default-features`). The `Jpeg2000Writer` emits lossless JP2
+the pure-Rust `openjp2` encoder. The `Jpeg2000Writer` emits lossless JP2
 (matching Java `JPEG2000Writer`'s `irreversible = 0` semantics) for single 2D
 planes with 1 (grayscale) or 3 (RGB) integer components. The QuickTime writer
 (`.mov`) still writes the uncompressed/RAW codec only; the lossy QuickTime codecs
 (Cinepak/Animation/Motion-JPEG/etc.) need encoders.
 
 ### Performance
+
+The Java parity tests accept `BIOFORMATS_RS_JAVA_PARITY_JAR=/path/to/reference.jar`
+to select a reference build; otherwise they use the bundled `bioformats_package.jar`.
 
 For broad translation audits, use the subset comparison harness. It runs Java
 Bio-Formats and bioformats-rs against the same centered crop from the first N
@@ -756,10 +769,9 @@ DimensionM/DimensionP acquisitions are split into Java-style logical series
 with per-series plane offsets, image names, timestamps, and positions. The
 scan-information OME projection follows Java's acquired-before-non-acquired
 subblock ordering so skipped instrument blocks do not shift channel detector or
-filter references. Remaining rich-parity work is fixture- or model-dependent:
-MDB multi-file series grouping, overlay ROI shape projection, application-tag
-experimenter/SIM metadata, and broader multi-position pixel-order fixtures need
-representative files and, for some fields, additional Rust OME model surface.
+filter references. Current rich metadata implementations and real-fixture limits are recorded in
+[the active ledger](TOFIX.md) and [audit index](AUDITLIST2.md); older completed
+LSM/MDB/ROI items are no longer repeated here as unfinished work.
 
 Pixel parity is evidence by default and becomes a gate with
 `BIOFORMATS_RS_JAVA_PARITY_STRICT=1`. Pixel sampling compares top-left 256x256
@@ -775,6 +787,10 @@ Release/CI strict pixel coverage can run the explicit ignored gate:
 Optional fixture hooks are `BIOFORMATS_RS_QT_EXTERNAL_CODEC_FIXTURE` for a local
 QuickTime H.264/HEVC/ProRes/DV-style sample and `BIOFORMATS_RS_PICOQUANT_FIXTURE`
 for local PTU/PQRes coverage; both skip when unset.
+
+Standalone `OmeMetadata::to_ome_xml` exports metadata-only OME XML with each
+image's own pixel description. TIFF writers supply `TiffData` for the first
+image whose pixels they store; other images retain `MetadataOnly`.
 
 Writer parity is separate: `tests/java_writer_parity_test.rs` synthesizes small
 Rust outputs, asks Java to read them, and fails on unannotated metadata or pixel

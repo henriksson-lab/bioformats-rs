@@ -1426,6 +1426,25 @@ impl Default for InveonReader {
 }
 
 impl FormatReader for InveonReader {
+    fn axis_orientations(&self) -> [Option<crate::common::orientation::Orientation>; 5] {
+        use crate::common::orientation::{AnatomicalOrientation::*, Orientation, OrientationType};
+        let mut axes = [None; 5];
+        if let Some(MetadataValue::String(value)) =
+            self.metadata().series_metadata.get("subject_orientation")
+        {
+            let term = if value.starts_with("Feet first") {
+                Some(InferiorToSuperior)
+            } else if value.starts_with("Head first") {
+                Some(SuperiorToInferior)
+            } else {
+                None
+            };
+            // Match upstream's indexOf("Z") - 2 position for XYZCT.
+            axes[0] = term.map(|t| Orientation::new(OrientationType::Anatomical, t));
+        }
+        axes
+    }
+
     fn is_this_type_by_name(&self, path: &Path) -> bool {
         // Inveon .hdr files can conflict with Analyze; Java keeps suffix
         // detection non-sufficient and checks for the header marker.
@@ -1892,6 +1911,37 @@ impl Default for VarianFdfReader {
 }
 
 impl FormatReader for VarianFdfReader {
+    fn axis_orientations(&self) -> [Option<crate::common::orientation::Orientation>; 5] {
+        use crate::common::orientation::{AnatomicalOrientation::*, Orientation, OrientationType};
+        let meta = self.metadata();
+        let value = |key| match meta.series_metadata.get(key) {
+            Some(MetadataValue::String(v)) => Some(v.trim_matches('"')),
+            _ => None,
+        };
+        let terms = match (value("*position1"), value("*position2")) {
+            (Some(entry), Some(pose))
+                if entry.to_ascii_lowercase().starts_with("head")
+                    && pose.eq_ignore_ascii_case("supine") =>
+            {
+                Some([LeftToRight, PosteriorToAnterior, InferiorToSuperior])
+            }
+            (Some(entry), Some(pose))
+                if !entry.to_ascii_lowercase().starts_with("head")
+                    && pose.eq_ignore_ascii_case("prone") =>
+            {
+                Some([LeftToRight, AnteriorToPosterior, SuperiorToInferior])
+            }
+            _ => None,
+        };
+        let mut axes = [None; 5];
+        if let Some(terms) = terms {
+            for (term, i) in terms.into_iter().zip([0, 1, 3]) {
+                axes[i] = Some(Orientation::new(OrientationType::Anatomical, term));
+            }
+        }
+        axes
+    }
+
     fn is_this_type_by_name(&self, path: &Path) -> bool {
         path.extension()
             .and_then(|e| e.to_str())
@@ -1912,7 +1962,7 @@ impl FormatReader for VarianFdfReader {
                 "FDF missing Varian FDF header".into(),
             ));
         }
-        let header = parse_fdf_header(path)?;
+        let mut header = parse_fdf_header(path)?;
         let mut files = if header.multifile {
             fdf_companion_files(path)?
         } else {
@@ -1920,6 +1970,14 @@ impl FormatReader for VarianFdfReader {
         };
         if files.is_empty() {
             files.push(path.to_path_buf());
+        }
+        if header.multifile && files.len() == 1 {
+            if header.metadata.contains_key("slices") {
+                header.size_z = 1;
+            }
+            if header.metadata.contains_key("echoes") {
+                header.size_t = 1;
+            }
         }
         let mut size_t = header.size_t;
         let mut image_count = header
@@ -2144,6 +2202,40 @@ mod clinical_metadata_tests {
     }
 
     #[test]
+    fn varian_split_dataset_reads_remaining_slice_and_orientation() {
+        use crate::common::orientation::AnatomicalOrientation::*;
+        let dir = tmp_path("split_fdf");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("scan.fdf");
+        let mut bytes = b"#!/usr/local/fdf/startup\nint matrix[] = {2, 2};\nint bits = 8;\nint slices = 5;\nint echoes = 3;\nchar *position1 = \"head first\";\nchar *position2 = \"supine\";\n\x0c".to_vec();
+        bytes.extend_from_slice(&[1, 2, 3, 4]);
+        std::fs::write(&path, bytes).unwrap();
+        let mut reader = VarianFdfReader::new();
+        reader.set_id(&path).unwrap();
+        assert_eq!(
+            (
+                reader.metadata().size_z,
+                reader.metadata().size_t,
+                reader.metadata().image_count
+            ),
+            (1, 1, 1)
+        );
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![3, 4, 1, 2]);
+        assert_eq!(
+            reader.axis_orientations().map(|o| o.map(|v| v.term)),
+            [
+                Some(LeftToRight),
+                Some(PosteriorToAnterior),
+                None,
+                Some(InferiorToSuperior),
+                None
+            ]
+        );
+        reader.close().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn ecat7_rejects_non_java_magic_versions() {
         let reader = Ecat7Reader::new();
         assert!(reader.is_this_type_by_bytes(b"MATRIX72v\0\0\0\0\0"));
@@ -2348,13 +2440,18 @@ mod clinical_metadata_tests {
             b"x_dimension 2\ny_dimension 2\nz_dimension 1\ndata_type 2\n\
               modality_configuration 3600\nbed_control 1\nacquisition_mode 2\n\
               institution Acme Labs\ninvestigator Dr Smith\nstudy My Study\n\
-              model 5000\nmodality 0\nfile_type 5\n",
+              model 5000\nmodality 0\nfile_type 5\nsubject_orientation 2\n",
         )
         .unwrap();
         std::fs::write(&img, [1u8, 0, 2, 0, 3, 0, 4, 0]).unwrap();
 
         let mut reader = InveonReader::new();
         reader.set_id(&hdr).expect("inveon set_id");
+        assert_eq!(
+            reader.axis_orientations()[0].unwrap().term,
+            crate::common::orientation::AnatomicalOrientation::SuperiorToInferior
+        );
+
         let meta = reader.metadata();
 
         assert_eq!(

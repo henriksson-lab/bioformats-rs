@@ -2561,6 +2561,63 @@ pub fn image_metadata_from_xlif(xlif: &XlifDocument) -> Result<ImageMetadata> {
     Ok(meta)
 }
 
+// Adapters for Java MetadataTools.getCorrection/getImmersion, whose enum
+// handlers accept Leica's historical aliases as well as canonical OME values.
+pub(super) fn metadata_correction(value: Option<&str>) -> &'static str {
+    let value = value.unwrap_or("").trim().to_ascii_lowercase();
+    let in_order = |first: &str, second: &str| {
+        value
+            .find(first)
+            .is_some_and(|index| value[index + first.len()..].contains(second))
+    };
+    // Preserve the Java CorrectionEnumHandler Hashtable iteration order.
+    // Its broad Flua pattern precedes the exact Neofluar/PlanNeofluar
+    // patterns, so those names deliberately resolve to Fluar.
+    match value.as_str() {
+        "fl" => "Fl",
+        "superfluor" => "SuperFluor",
+        "achro" => "Achro",
+        _ if in_order("flu", "tar") => "Fluotar",
+        "fluar" => "Fluar",
+        "violetcorrected" => "VioletCorrected",
+        _ if value.contains("flua") => "Fluar",
+        _ if value.starts_with("vio") && in_order("vio", "corr") => "VioletCorrected",
+        "neofluar" => "Neofluar",
+        "planfluor" => "PlanFluor",
+        "fluotar" => "Fluotar",
+        "apo" => "Apo",
+        "planapo" => "PlanApo",
+        _ if value.starts_with("apo") => "Apo",
+        _ if in_order("s", "flu") => "SuperFluor",
+        _ if in_order("neo", "flu") => "Neofluar",
+        _ if in_order("pl", "flu") => "PlanFluor",
+        "fluor" => "Fluor",
+        "planneofluar" => "PlanNeofluar",
+        _ if in_order("pl", "apo") => "PlanApo",
+        "achromat" => "Achromat",
+        "other" => "Other",
+        _ if value.contains("fluo") => "Fluor",
+        "uv" => "UV",
+        _ => "Other",
+    }
+}
+
+pub(super) fn metadata_immersion(value: Option<&str>) -> &'static str {
+    let value = value.unwrap_or("").trim().to_ascii_lowercase();
+    match value.as_str() {
+        "waterdipping" => "WaterDipping",
+        "air" | "dry" => "Air",
+        "multi" => "Multi",
+        "oil" | "oi" => "Oil",
+        "water" | "wl" | "w" => "Water",
+        "glycerol" => "Glycerol",
+        _ if value.contains("oil") || value.contains("oel") => "Oil",
+        _ if value.contains("wasser") => "Water",
+        _ if value.contains("gly") => "Glycerol",
+        _ => "Other",
+    }
+}
+
 /// Project the LMS hardware buffer (microscope / objective / detector / laser /
 /// filter / per-channel) into the `xlef.lms.*` alias keys consumed by XlefReader's
 /// `xlef_lms_ome_metadata`. Mirrors the single-instrument projection that
@@ -2625,12 +2682,20 @@ fn emit_lms_hardware_metadata(extractor: &LmsMetadataExtractor, meta: &mut Image
         // produces a recognised enum; we forward the raw token.
         if let Some(imm) = &buffer.immersion {
             if imm != "Other" {
-                put_str(meta, "xlef.lms.objective.0.immersion", Some(imm));
+                put_str(
+                    meta,
+                    "xlef.lms.objective.0.immersion",
+                    Some(metadata_immersion(Some(imm))),
+                );
             }
         }
         if let Some(corr) = &buffer.correction {
             if corr != "Other" {
-                put_str(meta, "xlef.lms.objective.0.correction", Some(corr));
+                put_str(
+                    meta,
+                    "xlef.lms.objective.0.correction",
+                    Some(metadata_correction(Some(corr))),
+                );
             }
         }
     }
@@ -2638,6 +2703,12 @@ fn emit_lms_hardware_metadata(extractor: &LmsMetadataExtractor, meta: &mut Image
         meta,
         "xlef.lms.objective.0.serial_number",
         buffer.serial_number.as_deref(),
+    );
+
+    put_f64(
+        meta,
+        "xlef.lms.objective_settings.refractive_index",
+        buffer.refractive_index,
     );
 
     // Detector (MetadataStoreInitializer.initDetectorModels): the instrument-level
@@ -2682,15 +2753,6 @@ fn emit_lms_hardware_metadata(extractor: &LmsMetadataExtractor, meta: &mut Image
                         put_f64(meta, &format!("{prefix}.offset"), offset);
                     }
                 }
-                // Gain: not set by initDetectorModels in Java; preserve the
-                // first-channel gain on detector 0 only (consumer compatibility).
-                if d_index == 0 {
-                    put_f64(
-                        meta,
-                        &format!("{prefix}.gain"),
-                        buffer.gains.iter().flatten().next().copied(),
-                    );
-                }
             }
         }
     }
@@ -2708,7 +2770,6 @@ fn emit_lms_hardware_metadata(extractor: &LmsMetadataExtractor, meta: &mut Image
             .collect();
         for (laser, &wavelength) in lasers.iter().enumerate() {
             let prefix = format!("xlef.lms.laser.{laser}");
-            put_str(meta, &format!("{prefix}.name"), Some("Laser"));
             put_f64(meta, &format!("{prefix}.wavelength"), Some(wavelength));
         }
     }
@@ -3340,6 +3401,66 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("bioformats_lms_{name}_{nonce}"))
+    }
+
+    #[test]
+    fn leica_enum_adapter_preserves_java_overlapping_alias_priority() {
+        assert_eq!(metadata_correction(Some("Neofluar")), "Fluar");
+        assert_eq!(metadata_correction(Some("PlanNeofluar")), "Fluar");
+        assert_eq!(metadata_correction(Some("PlApo")), "PlanApo");
+        assert_eq!(metadata_immersion(Some("OI")), "Oil");
+        assert_eq!(metadata_immersion(Some("W")), "Water");
+    }
+
+    #[test]
+    fn lms_hardware_retains_objective_serial_refractive_index_and_detector_zoom() {
+        let mut extractor = LmsMetadataExtractor::new();
+        extractor.core_size_c = 1;
+        extractor.buffer.serial_number = Some("LMS-OBJ-123".into());
+        extractor.buffer.refractive_index = Some(1.515);
+        extractor.buffer.zoom = Some(2.5);
+        extractor.buffer.detector_models.push("PMT 1".into());
+        extractor.buffer.objective_model = Some("Objective".into());
+        extractor.buffer.immersion = Some("OI".into());
+        extractor.buffer.correction = Some("PlApo".into());
+        let mut meta = ImageMetadata::default();
+        emit_lms_hardware_metadata(&extractor, &mut meta);
+        assert!(
+            matches!(meta.series_metadata.get("xlef.lms.objective.0.serial_number"), Some(MetadataValue::String(value)) if value == "LMS-OBJ-123")
+        );
+        assert!(
+            matches!(meta.series_metadata.get("xlef.lms.objective_settings.refractive_index"), Some(MetadataValue::Float(value)) if *value == 1.515)
+        );
+        assert!(
+            matches!(meta.series_metadata.get("xlef.lms.detector.0.zoom"), Some(MetadataValue::Float(value)) if *value == 2.5)
+        );
+        assert!(
+            matches!(meta.series_metadata.get("xlef.lms.objective.0.immersion"), Some(MetadataValue::String(value)) if value == "Oil")
+        );
+        assert!(
+            matches!(meta.series_metadata.get("xlef.lms.objective.0.correction"), Some(MetadataValue::String(value)) if value == "PlanApo")
+        );
+    }
+
+    #[test]
+    fn xlif_memory_storage_is_not_an_upstream_image_reference() {
+        let xlif = temp_path("memory_only.xlif");
+        std::fs::write(&xlif, r#"<XLIF><Element Name="Raw"><Data><Image><Memory Compression="zlib" MemoryBlockID="1"><Storage FileName="pixels.raw"/></Memory></Image></Data></Element></XLIF>"#).unwrap();
+        let doc = XlifDocument::new(&xlif).unwrap();
+        assert!(!doc.is_valid());
+        assert!(doc.image_paths.is_empty());
+        assert_eq!(doc.image_format, ImageFormat::Unknown);
+        // XlifDocument.initImagePaths selects Frame, falling back only to
+        // Block; the Memory attributes do not select a different decoder.
+        let tif = xlif.with_file_name("pixel.tif");
+        std::fs::write(&tif, []).unwrap();
+        std::fs::write(&xlif, r#"<XLIF><Element><Data><Image><Memory Compression="zlib"><Storage FileName="pixels.raw"/></Memory><Frame File="pixel.tif"/></Image></Data></Element></XLIF>"#).unwrap();
+        let doc = XlifDocument::new(&xlif).unwrap();
+        assert!(doc.is_valid());
+        assert_eq!(doc.image_format, ImageFormat::Tif);
+        assert_eq!(doc.image_paths, vec![tif.clone()]);
+        std::fs::remove_file(xlif).unwrap();
+        std::fs::remove_file(tif).unwrap();
     }
 
     #[test]

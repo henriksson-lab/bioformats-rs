@@ -2351,6 +2351,9 @@ impl FormatReader for TrestleReader {
 /// feature (which pulls in `rusqlite`). With the feature **off**, `set_id`
 /// reports `UnsupportedFormat`.
 pub struct TissueFaxsReader {
+    flattened_resolutions: bool,
+    current_public_series: usize,
+    flattened_metadata: Option<ImageMetadata>,
     initialized: bool,
     /// Flattened "core" list, mirroring Java's `core`: one entry per resolution
     /// per pyramid, optionally followed by a correction-image entry.
@@ -2542,6 +2545,9 @@ fn json_get_double(value: &serde_json::Value, key: &str) -> Option<f64> {
 impl TissueFaxsReader {
     pub fn new() -> Self {
         TissueFaxsReader {
+            flattened_resolutions: true,
+            current_public_series: 0,
+            flattened_metadata: None,
             initialized: false,
             core: Vec::new(),
             regions: Vec::new(),
@@ -2599,11 +2605,16 @@ impl FormatReader for TissueFaxsReader {
         self.close()?;
         self.init_file(path)?;
         self.initialized = true;
+        if !self.core.is_empty() {
+            self.set_series(0)?;
+        }
         Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
         self.initialized = false;
+        self.current_public_series = 0;
+        self.flattened_metadata = None;
         self.core.clear();
         self.regions.clear();
         self.pixels_files.clear();
@@ -2616,31 +2627,63 @@ impl FormatReader for TissueFaxsReader {
     }
 
     fn series_count(&self) -> usize {
-        self.series_starts.len()
+        if self.flattened_resolutions {
+            self.core.len()
+        } else {
+            self.series_starts.len()
+        }
     }
 
     fn set_series(&mut self, s: usize) -> Result<()> {
         if !self.initialized {
             return Err(BioFormatsError::NotInitialized);
         }
-        if s >= self.series_starts.len() {
+        if s >= self.series_count() {
             return Err(BioFormatsError::SeriesOutOfRange(s));
         }
+        self.current_public_series = s;
         self.current_series = s;
         self.current_resolution = 0;
+        self.flattened_metadata = None;
+        if self.flattened_resolutions {
+            for (logical, &start) in self.series_starts.iter().enumerate() {
+                if s >= start && s < start + self.series_resolutions[logical] {
+                    self.current_series = logical;
+                    self.current_resolution = s - start;
+                    break;
+                }
+            }
+            let mut meta = self.core[s].clone();
+            meta.resolution_count = 1;
+            self.flattened_metadata = Some(meta);
+        }
         Ok(())
     }
 
     fn series(&self) -> usize {
-        self.current_series
+        self.current_public_series
+    }
+
+    fn has_flattened_resolutions(&self) -> bool {
+        self.flattened_resolutions
+    }
+    fn set_flattened_resolutions(&mut self, flattened: bool) -> Result<()> {
+        if self.initialized {
+            return Err(BioFormatsError::Format(
+                "set_flattened_resolutions must be called before set_id".into(),
+            ));
+        }
+        self.flattened_resolutions = flattened;
+        Ok(())
     }
 
     fn metadata(&self) -> &ImageMetadata {
         if !self.initialized {
             return crate::common::reader::uninitialized_metadata();
         }
-        self.core
-            .get(self.core_index())
+        self.flattened_metadata
+            .as_ref()
+            .or_else(|| self.core.get(self.core_index()))
             .unwrap_or_else(|| crate::common::reader::uninitialized_metadata())
     }
 
@@ -2675,11 +2718,14 @@ impl FormatReader for TissueFaxsReader {
         self.open_bytes_impl(p, x, y, w, h)
     }
 
-    fn open_thumb_bytes(&mut self, _p: u32) -> Result<Vec<u8>> {
-        Err(BioFormatsError::NotInitialized)
+    fn open_thumb_bytes(&mut self, p: u32) -> Result<Vec<u8>> {
+        crate::common::thumbnail::open_thumb_bytes(self, p, None)
     }
 
     fn resolution_count(&self) -> usize {
+        if self.flattened_resolutions {
+            return 1;
+        }
         self.series_resolutions
             .get(self.current_series)
             .copied()
@@ -2691,6 +2737,13 @@ impl FormatReader for TissueFaxsReader {
         if !self.initialized {
             return Err(BioFormatsError::NotInitialized);
         }
+        if self.flattened_resolutions {
+            return if level == 0 {
+                Ok(())
+            } else {
+                Err(BioFormatsError::SeriesOutOfRange(level))
+            };
+        }
         if level >= self.resolution_count() {
             return Err(BioFormatsError::SeriesOutOfRange(level));
         }
@@ -2699,7 +2752,11 @@ impl FormatReader for TissueFaxsReader {
     }
 
     fn resolution(&self) -> usize {
-        self.current_resolution
+        if self.flattened_resolutions {
+            0
+        } else {
+            self.current_resolution
+        }
     }
 
     #[cfg(feature = "tissuefaxs")]
@@ -3123,6 +3180,7 @@ mod tissuefaxs_impl {
             for &core_idx in &self.series_starts {
                 let m = &self.core[core_idx];
                 let mut img = OmeImage::default();
+                img.pixels = Some(m.into());
                 // populatePixels: one channel per (non-RGB) C, samples-per-pixel.
                 let mut tmp = OmeMetadata::default();
                 let _ = tmp.populate_pixels(m, 0);
@@ -3219,6 +3277,30 @@ mod tissuefaxs_impl {
                 }
 
                 objective_index += 1;
+            }
+
+            if self.flattened_resolutions {
+                let logical_images = std::mem::take(&mut ome.images);
+                for (logical, &start) in self.series_starts.iter().enumerate() {
+                    let region = &self.regions[self.series_regions[logical]];
+                    let count = self.series_resolutions[logical];
+                    for resolution in 0..count {
+                        let mut image = logical_images[logical].clone();
+                        image.pixels = Some((&self.core[start + resolution]).into());
+                        if resolution > 0 {
+                            image.name = image.name.map(|v| format!("{v} resolution {resolution}"));
+                            let scale = (region.scale_factor as f64).powi(resolution as i32);
+                            image.physical_size_x = image.physical_size_x.map(|v| v * scale);
+                            image.physical_size_y = image.physical_size_y.map(|v| v * scale);
+                        }
+                        // Baseline channel structure is tied to this resolution's core.
+                        let mut baseline = OmeMetadata::default();
+                        let _ = baseline.populate_pixels(&self.core[start + resolution], 0);
+                        let count = baseline.images.first().map_or(0, |v| v.channels.len());
+                        image.channels.truncate(count);
+                        ome.images.push(image);
+                    }
+                }
             }
 
             ome.instruments.push(inst);
@@ -5860,6 +5942,8 @@ mod operetta {
         if value.starts_with("http") {
             return Some(PathBuf::from(value));
         }
+        let normalized = value.replace(['\\', '/'], std::path::MAIN_SEPARATOR_STR);
+        let value = normalized.as_str();
         let direct = dir.join(value);
         if direct.exists() {
             return Some(direct);
@@ -9307,7 +9391,8 @@ mod tests {
         let images = dir.join("Images");
         std::fs::create_dir_all(&images).unwrap();
 
-        let tiff = images.join("img.tif");
+        let tiff = images.join("subdir").join("img.tif");
+        std::fs::create_dir_all(tiff.parent().unwrap()).unwrap();
         let meta = test_meta(2, 2);
         write_tiff(&tiff, &meta, &[1u8, 2, 3, 4]);
 
@@ -9322,7 +9407,7 @@ mod tests {
     <MainExcitationWavelength>358</MainExcitationWavelength>
   </Entry>
   <Images><Image>
-    <URL>img.tif</URL>
+    <URL>subdir\img.tif</URL>
     <Row>1</Row><Col>1</Col><FieldID>1</FieldID><PlaneID>0</PlaneID>
     <TimepointID>0</TimepointID><ChannelID>0</ChannelID>
   </Image></Images>
@@ -9333,6 +9418,7 @@ mod tests {
         let mut reader = OperettaReader::new();
         reader.set_id(&dir.join("Index.idx.xml")).unwrap();
 
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 3, 4]);
         let ome = reader.ome_metadata().unwrap();
         let channel = &ome.images[0].channels[0];
         assert_eq!(channel.name.as_deref(), Some("DAPI"));
@@ -9818,5 +9904,165 @@ mod tests {
         let ome = reader.ome_metadata().expect("ome");
         assert_eq!(ome.images[0].physical_size_x, Some(1.6125));
         assert_eq!(ome.images[0].physical_size_y, Some(1.6125));
+    }
+}
+
+#[cfg(all(test, feature = "tissuefaxs"))]
+mod tissuefaxs_resolution_update_tests {
+    use super::*;
+
+    #[test]
+    fn tissuefaxs_thumbnails_scale_integer_planes_and_normalize_float_corrections() {
+        let path = std::env::temp_dir().join(format!(
+            "bf_tissuefaxs_thumbnails_{}.tfcyto",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE region(id INTEGER, data TEXT, is_timelapse INTEGER); CREATE TABLE fovs(region_id INTEGER, row INTEGER, column INTEGER, stitch_rectangle_x REAL, stitch_rectangle_y REAL, stitch_rectangle_w REAL, stitch_rectangle_h REAL); CREATE TABLE images(region INTEGER, level INTEGER, channel INTEGER, is_zstack INTEGER, z_position INTEGER, row INTEGER, column INTEGER, data BLOB, compression INTEGER); CREATE TABLE channels(id INTEGER, name TEXT, color INTEGER, save_16bit INTEGER, excitation_wavelength INTEGER, emission_wavelength INTEGER, region_id INTEGER, cor_img_id INTEGER); CREATE TABLE correction_images(id INTEGER, data BLOB, compression INTEGER);").unwrap();
+        conn.execute("INSERT INTO region VALUES(1,?,0)", [r#"{"ImageWidth":256,"ImageHeight":4,"OverlapWidth":0,"OverlapHeight":0,"CacheStep":2,"Name":"Thumbnail region"}"#]).unwrap();
+        conn.execute("INSERT INTO fovs VALUES(1,0,0,0,0,256,4)", [])
+            .unwrap();
+        let mut integer = Vec::new();
+        let mut floats = Vec::new();
+        for i in 0..1024 {
+            integer.extend_from_slice(&(((i * 1003 + 17) % 65536) as u16).to_le_bytes());
+            floats.extend_from_slice(&((((i % 257) as f64 - 12.0) * 0.3) as f32).to_le_bytes());
+        }
+        for channel in 1..=2 {
+            conn.execute(
+                "INSERT INTO channels VALUES(?, 'Channel', 0, 1, 0, 0, 1, ?)",
+                rusqlite::params![channel, channel],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO images VALUES(1,0,?,0,0,0,0,?,0)",
+                rusqlite::params![channel, integer],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO correction_images VALUES(?,?,0)",
+                rusqlite::params![channel, floats],
+            )
+            .unwrap();
+        }
+        let mut reader = TissueFaxsReader::new();
+        assert!(matches!(
+            reader.open_thumb_bytes(0),
+            Err(BioFormatsError::NotInitialized)
+        ));
+        reader.set_id(&path).unwrap();
+        assert_eq!(reader.series_count(), 2);
+        assert_eq!(reader.metadata().pixel_type, PixelType::Uint16);
+        assert_eq!(reader.open_bytes(0).unwrap(), integer);
+        let thumbnail = reader.open_thumb_bytes(0).unwrap();
+        assert_eq!(thumbnail.len(), 128 * 2 * 2);
+        assert_eq!(
+            thumbnail
+                .iter()
+                .fold(0xcbf29ce484222325u64, |v, b| (v ^ u64::from(*b))
+                    .wrapping_mul(0x100000001b3)),
+            0x20850d26cad3d601
+        );
+        assert!(matches!(
+            reader.open_thumb_bytes(2),
+            Err(BioFormatsError::PlaneOutOfRange(2))
+        ));
+        reader.set_series(1).unwrap();
+        assert_eq!(reader.metadata().pixel_type, PixelType::Float32);
+        assert_eq!(reader.open_bytes(0).unwrap(), floats);
+        let thumbnail = reader.open_thumb_bytes(0).unwrap();
+        assert_eq!(thumbnail.len(), 128 * 2 * 4);
+        assert_eq!(
+            thumbnail
+                .iter()
+                .fold(0xcbf29ce484222325u64, |v, b| (v ^ u64::from(*b))
+                    .wrapping_mul(0x100000001b3)),
+            0x1c244cc457356cda
+        );
+        reader.close().unwrap();
+        let bytes: Vec<u8> = (0..1024).map(|i| ((i * 47 + 17) % 256) as u8).collect();
+        conn.execute("UPDATE channels SET save_16bit=0", [])
+            .unwrap();
+        conn.execute("UPDATE images SET data=?", [&bytes]).unwrap();
+        reader.set_id(&path).unwrap();
+        assert_eq!(reader.metadata().pixel_type, PixelType::Uint8);
+        let thumbnail = reader.open_thumb_bytes(0).unwrap();
+        assert_eq!(
+            thumbnail
+                .iter()
+                .fold(0xcbf29ce484222325u64, |v, b| (v ^ u64::from(*b))
+                    .wrapping_mul(0x100000001b3)),
+            0x3201897c80ffe77d
+        );
+        reader.close().unwrap();
+        drop(conn);
+        std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn tissuefaxs_flattened_and_nested_views_route_pixels_and_calibration() {
+        let path = std::env::temp_dir().join(format!(
+            "bf_tissuefaxs_pyramid_{}.tfcyto",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE region(id INTEGER, data TEXT, is_timelapse INTEGER); CREATE TABLE fovs(region_id INTEGER, row INTEGER, column INTEGER, stitch_rectangle_x REAL, stitch_rectangle_y REAL, stitch_rectangle_w REAL, stitch_rectangle_h REAL); CREATE TABLE images(region INTEGER, level INTEGER, channel INTEGER, is_zstack INTEGER, z_position INTEGER, row INTEGER, column INTEGER, data BLOB, compression INTEGER); CREATE TABLE channels(id INTEGER, name TEXT, color INTEGER, save_16bit INTEGER, excitation_wavelength INTEGER, emission_wavelength INTEGER);").unwrap();
+        let settings = r#"{"ImageWidth":4,"ImageHeight":4,"OverlapWidth":0,"OverlapHeight":0,"CacheStep":2,"Name":"Region A","PhysicalSizeX":0.25,"PhysicalSizeY":0.5,"ObjectiveName":"Objective A","ObjectiveLensNA":0.75,"ObjectiveNominalMagnification":20,"ObjectiveImmersion":"Air","AcquisitionMode":"WideField"}"#;
+        conn.execute("INSERT INTO region VALUES(1,?,0)", [settings])
+            .unwrap();
+        conn.execute("INSERT INTO fovs VALUES(1,0,0,0,0,4,4)", [])
+            .unwrap();
+        for channel in 1..=2 {
+            conn.execute(
+                "INSERT INTO channels VALUES(?, ?, 16711935, 0, 488, 525)",
+                rusqlite::params![channel, format!("Channel {channel}")],
+            )
+            .unwrap();
+            for level in 0..=1 {
+                let bytes = vec![(10 * level + channel) as u8; 16];
+                conn.execute(
+                    "INSERT INTO images VALUES(1,?,?,0,0,0,0,?,0)",
+                    rusqlite::params![level, channel, bytes],
+                )
+                .unwrap();
+            }
+        }
+        drop(conn);
+        let mut reader = TissueFaxsReader::new();
+        reader.set_id(&path).unwrap();
+        assert_eq!(reader.series_count(), 2);
+        assert_eq!(reader.resolution_count(), 1);
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![1; 16]);
+        reader.set_series(1).unwrap();
+        assert_eq!((reader.metadata().size_x, reader.metadata().size_y), (2, 2));
+        assert_eq!(reader.metadata().resolution_count, 1);
+        assert_eq!(reader.open_bytes(1).unwrap(), vec![12; 4]);
+        assert!(reader.set_resolution(1).is_err());
+        reader.set_resolution(0).unwrap();
+        assert_eq!(reader.metadata().size_x, 2);
+        let ome = reader.ome_metadata().unwrap();
+        assert_eq!(ome.images.len(), 2);
+        assert_eq!(ome.images[1].name.as_deref(), Some("Region A resolution 1"));
+        assert_eq!(
+            (ome.images[1].physical_size_x, ome.images[1].physical_size_y),
+            (Some(0.5), Some(1.0))
+        );
+        assert_eq!(ome.images[1].channels[1].name.as_deref(), Some("Channel 2"));
+        assert_eq!(ome.images[1].objective_ref, ome.images[0].objective_ref);
+        reader.close().unwrap();
+        reader.set_flattened_resolutions(false).unwrap();
+        reader.set_id(&path).unwrap();
+        assert_eq!(reader.series_count(), 1);
+        assert_eq!(reader.resolution_count(), 2);
+        reader.set_resolution(1).unwrap();
+        assert_eq!(reader.open_bytes(1).unwrap(), vec![12; 4]);
+        assert_eq!(reader.ome_metadata().unwrap().images.len(), 1);
+        assert_eq!(
+            reader.ome_metadata().unwrap().images[0].physical_size_x,
+            Some(0.25)
+        );
+        reader.close().unwrap();
+        std::fs::remove_file(path).unwrap();
     }
 }

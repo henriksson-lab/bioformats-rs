@@ -45,6 +45,8 @@ const TOKEN_SEPARATOR: char = '&';
 const BOX_SIZE: u32 = 10;
 
 pub struct FakeReader {
+    flattened_resolutions: bool,
+    current_public_series: usize,
     path: Option<PathBuf>,
     /// One [`ImageMetadata`] per series (each carrying its own resolution
     /// count); mirrors Java's `core` list of `CoreMetadata`.
@@ -52,16 +54,24 @@ pub struct FakeReader {
     current_series: usize,
     current_resolution: usize,
     resolution_meta: Option<ImageMetadata>,
+    index_to_value: Vec<Vec<u16>>,
+    value_to_index: Vec<Vec<u16>>,
+    lut_length: usize,
 }
 
 impl FakeReader {
     pub fn new() -> Self {
         FakeReader {
+            flattened_resolutions: true,
+            current_public_series: 0,
             path: None,
             series: Vec::new(),
             current_series: 0,
             current_resolution: 0,
             resolution_meta: None,
+            index_to_value: Vec::new(),
+            value_to_index: Vec::new(),
+            lut_length: 3,
         }
     }
 }
@@ -167,6 +177,7 @@ fn parse_length_value(s: &str) -> Option<f64> {
 /// here so they end up in `series_metadata` rather than being silently
 /// dropped.
 struct FakeParams {
+    orientation_tokens: HashMap<usize, HashMap<String, String>>,
     name: Option<String>,
 
     size_x: u32,
@@ -246,6 +257,7 @@ impl FakeParams {
     /// Initialize with the same defaults as Java's `initFile` locals.
     fn with_defaults() -> Self {
         FakeParams {
+            orientation_tokens: HashMap::new(),
             name: None,
             size_x: DEFAULT_SIZE_X,
             size_y: DEFAULT_SIZE_Y,
@@ -497,6 +509,13 @@ fn apply_fake_ini_series_tables(
 ) -> Result<()> {
     for (series, table) in tables {
         for (key, value) in table {
+            if key.starts_with("AxisOrientationType_") || key.starts_with("AxisOrientationTerm_") {
+                p.orientation_tokens
+                    .entry(series)
+                    .or_default()
+                    .insert(key, value);
+                continue;
+            }
             if let Some(index) = key.strip_prefix("ChannelName_") {
                 if let Ok(channel) = index.parse::<usize>() {
                     let names = p.series_channel_names.entry(series).or_default();
@@ -670,6 +689,7 @@ fn fake_plane_region(
     meta: &ImageMetadata,
     series_index: usize,
     plane_index: u32,
+    value_to_index: &[Vec<u16>],
     x: u32,
     y: u32,
     w: u32,
@@ -722,6 +742,11 @@ fn fake_plane_region(
                     };
                 }
 
+                // Java uses the selected logical channel's inverse shuffled
+                // palette before applying scaleFactor, including special pixels.
+                if let Some(inverse) = value_to_index.get(c_index as usize) {
+                    pixel = i64::from(inverse[pixel as usize % inverse.len()]);
+                }
                 if !special_pixel {
                     pixel = (scale * pixel as f64) as i64;
                 }
@@ -919,6 +944,11 @@ fn build_metadata(mut p: FakeParams) -> Result<Vec<ImageMetadata>> {
         };
         sm.insert("Image name".to_string(), MetadataValue::String(image_name));
         let series_index = s as usize;
+        if let Some(tokens) = p.orientation_tokens.get(&series_index) {
+            for (key, value) in tokens {
+                sm.insert(key.clone(), MetadataValue::String(value.clone()));
+            }
+        }
         if let Some(names) = p.series_channel_names.get(&series_index) {
             for (i, name) in names.iter().enumerate() {
                 if let Some(name) = name {
@@ -1002,6 +1032,7 @@ fn build_original_metadata(p: &FakeParams, dim_order_str: &str) -> HashMap<Strin
         }
     };
 
+    put_int(&mut m, "lutLength", p.lut_length);
     put_int(&mut m, "thumbSizeX", p.thumb_size_x);
     put_int(&mut m, "thumbSizeY", p.thumb_size_y);
     put_int(&mut m, "bitsPerPixel", p.bits_per_pixel);
@@ -1678,6 +1709,29 @@ fn fake_populate_annotations(
 }
 
 impl FormatReader for FakeReader {
+    fn axis_orientations(&self) -> [Option<crate::common::orientation::Orientation>; 5] {
+        use crate::common::orientation::{AnatomicalOrientation, Orientation, OrientationType};
+        let meta = self.metadata();
+        std::array::from_fn(|axis| {
+            let MetadataValue::String(kind) = meta
+                .series_metadata
+                .get(&format!("AxisOrientationType_{axis}"))?
+            else {
+                return None;
+            };
+            let MetadataValue::String(term) = meta
+                .series_metadata
+                .get(&format!("AxisOrientationTerm_{axis}"))?
+            else {
+                return None;
+            };
+            Some(Orientation::new(
+                OrientationType::from_string(kind)?,
+                AnatomicalOrientation::from_string(term)?,
+            ))
+        })
+    }
+
     fn is_this_type_by_name(&self, path: &Path) -> bool {
         let name = path
             .file_name()
@@ -1693,15 +1747,83 @@ impl FormatReader for FakeReader {
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.series = init_file(path)?;
+        self.index_to_value.clear();
+        self.value_to_index.clear();
+        let base = &self.series[0];
+        self.lut_length = match base.series_metadata.get("lutLength") {
+            Some(MetadataValue::Int(value)) => *value as usize,
+            _ => 3,
+        };
+        let entries: usize = if base.is_indexed {
+            match base.pixel_type {
+                PixelType::Uint8 => 256,
+                PixelType::Uint16 => 65536,
+                _ => 0,
+            }
+        } else {
+            0
+        };
+        if entries > 0 {
+            for channel in 0..base.size_c {
+                let mut values: Vec<u16> = (0..entries).map(|value| value as u16).collect();
+                // Adapter for java.util.Random(SEED + c).nextInt(bound), used
+                // by the source Fisher-Yates shuffle. Its unsuffixed hex SEED
+                // 0xcafebabe is a negative int widened to long in Java.
+                let mut state = (((i64::from(0xcafebabeu32 as i32) + i64::from(channel)) as u64)
+                    ^ 0x5deece66d)
+                    & ((1u64 << 48) - 1);
+                for bound in (2..=entries).rev() {
+                    let index = loop {
+                        state =
+                            state.wrapping_mul(0x5deece66d).wrapping_add(11) & ((1u64 << 48) - 1);
+                        let bits = (state >> 17) as u32;
+                        if bound.is_power_of_two() {
+                            break ((bound as u64 * u64::from(bits)) >> 31) as usize;
+                        }
+                        let value = bits % bound as u32;
+                        if bits.wrapping_sub(value).wrapping_add(bound as u32 - 1) as i32 >= 0 {
+                            break value as usize;
+                        }
+                    };
+                    values.swap(index, bound - 1);
+                }
+                let mut inverse = vec![0u16; entries];
+                for (index, value) in values.iter().enumerate() {
+                    inverse[*value as usize] = index as u16;
+                }
+                self.index_to_value.push(values);
+                self.value_to_index.push(inverse);
+            }
+            let values = &self.index_to_value[0];
+            let lookup = crate::common::metadata::LookupTable {
+                red: values.clone(),
+                green: if self.lut_length > 1 {
+                    values.clone()
+                } else {
+                    vec![0; entries]
+                },
+                blue: if self.lut_length > 2 {
+                    values.clone()
+                } else {
+                    vec![0; entries]
+                },
+            };
+            for meta in &mut self.series {
+                meta.lookup_table = Some(lookup.clone());
+            }
+        }
         self.current_series = 0;
         self.current_resolution = 0;
         self.resolution_meta = None;
         self.path = Some(path.to_path_buf());
-        Ok(())
+        self.set_series(0)
     }
 
     fn close(&mut self) -> Result<()> {
         self.path = None;
+        self.index_to_value.clear();
+        self.value_to_index.clear();
+        self.current_public_series = 0;
         self.series = Vec::new();
         self.current_series = 0;
         self.current_resolution = 0;
@@ -1710,22 +1832,59 @@ impl FormatReader for FakeReader {
     }
 
     fn series_count(&self) -> usize {
-        self.series.len().max(1)
-    }
-
-    fn set_series(&mut self, s: usize) -> Result<()> {
-        if s >= self.series.len() {
-            Err(BioFormatsError::SeriesOutOfRange(s))
+        if self.flattened_resolutions {
+            self.series
+                .iter()
+                .map(|m| m.resolution_count.max(1) as usize)
+                .sum::<usize>()
+                .max(1)
         } else {
-            self.current_series = s;
-            self.current_resolution = 0;
-            self.resolution_meta = None;
-            Ok(())
+            self.series.len().max(1)
         }
     }
 
+    fn set_series(&mut self, s: usize) -> Result<()> {
+        if self.series.is_empty() || s >= self.series_count() {
+            return Err(BioFormatsError::SeriesOutOfRange(s));
+        }
+        self.current_public_series = s;
+        self.current_series = s;
+        self.current_resolution = 0;
+        self.resolution_meta = None;
+        if self.flattened_resolutions {
+            let mut offset = s;
+            for (logical, base) in self.series.iter().enumerate() {
+                let count = base.resolution_count.max(1) as usize;
+                if offset < count {
+                    self.current_series = logical;
+                    self.current_resolution = offset;
+                    let mut meta = fake_resolution_metadata(base, offset);
+                    meta.resolution_count = 1;
+                    self.resolution_meta = Some(meta);
+                    break;
+                }
+                offset -= count;
+            }
+        }
+        Ok(())
+    }
+
     fn series(&self) -> usize {
-        self.current_series
+        self.current_public_series
+    }
+
+    fn has_flattened_resolutions(&self) -> bool {
+        self.flattened_resolutions
+    }
+
+    fn set_flattened_resolutions(&mut self, flattened: bool) -> Result<()> {
+        if self.path.is_some() {
+            return Err(BioFormatsError::Format(
+                "set_flattened_resolutions must be called before set_id".into(),
+            ));
+        }
+        self.flattened_resolutions = flattened;
+        Ok(())
     }
 
     fn metadata(&self) -> &ImageMetadata {
@@ -1737,6 +1896,9 @@ impl FormatReader for FakeReader {
     }
 
     fn resolution_count(&self) -> usize {
+        if self.flattened_resolutions {
+            return 1;
+        }
         self.series
             .get(self.current_series)
             .map(|meta| meta.resolution_count.max(1) as usize)
@@ -1744,6 +1906,13 @@ impl FormatReader for FakeReader {
     }
 
     fn set_resolution(&mut self, level: usize) -> Result<()> {
+        if self.flattened_resolutions {
+            return if level == 0 {
+                Ok(())
+            } else {
+                Err(BioFormatsError::PlaneOutOfRange(level as u32))
+            };
+        }
         let base = self
             .series
             .get(self.current_series)
@@ -1757,7 +1926,11 @@ impl FormatReader for FakeReader {
     }
 
     fn resolution(&self) -> usize {
-        self.current_resolution
+        if self.flattened_resolutions {
+            0
+        } else {
+            self.current_resolution
+        }
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -1767,8 +1940,9 @@ impl FormatReader for FakeReader {
         let meta = self.metadata();
         fake_plane_region(
             meta,
-            self.current_series,
+            self.series(),
             plane_index,
+            &self.value_to_index,
             0,
             0,
             meta.size_x,
@@ -1788,7 +1962,53 @@ impl FormatReader for FakeReader {
             return Err(BioFormatsError::NotInitialized);
         }
         let meta = self.metadata();
-        fake_plane_region(meta, self.current_series, plane_index, x, y, w, h)
+        fake_plane_region(
+            meta,
+            self.series(),
+            plane_index,
+            &self.value_to_index,
+            x,
+            y,
+            w,
+            h,
+        )
+    }
+
+    fn lookup_table(
+        &mut self,
+        plane_index: u32,
+    ) -> Result<Option<crate::common::metadata::LookupTable>> {
+        if self.series.is_empty() {
+            return Err(BioFormatsError::NotInitialized);
+        }
+        let meta = self.metadata();
+        if plane_index >= meta.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        let rgb = rgb_channel_count(meta);
+        let (_, channel, _) = decompose_plane(
+            plane_index,
+            meta.size_z,
+            (meta.size_c / rgb).max(1),
+            meta.size_t,
+            meta.dimension_order,
+        );
+        let Some(values) = self.index_to_value.get(channel as usize) else {
+            return Ok(None);
+        };
+        Ok(Some(crate::common::metadata::LookupTable {
+            red: values.clone(),
+            green: if self.lut_length > 1 {
+                values.clone()
+            } else {
+                vec![0; values.len()]
+            },
+            blue: if self.lut_length > 2 {
+                values.clone()
+            } else {
+                vec![0; values.len()]
+            },
+        }))
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -1796,11 +2016,18 @@ impl FormatReader for FakeReader {
             return Err(BioFormatsError::NotInitialized);
         }
         let meta = self.metadata();
-        let tw = meta.size_x.min(256);
-        let th = meta.size_y.min(256);
-        let tx = (meta.size_x - tw) / 2;
-        let ty = (meta.size_y - th) / 2;
-        self.open_bytes_region(plane_index, tx, ty, tw, th)
+        let (mut width, mut height) = crate::common::thumbnail::thumbnail_dimensions(meta);
+        if let Some(MetadataValue::Int(value)) = meta.series_metadata.get("thumbSizeX") {
+            if *value > 0 {
+                width = *value as u32;
+            }
+        }
+        if let Some(MetadataValue::Int(value)) = meta.series_metadata.get("thumbSizeY") {
+            if *value > 0 {
+                height = *value as u32;
+            }
+        }
+        crate::common::thumbnail::open_thumb_bytes(self, plane_index, Some((width, height)))
     }
 
     fn ome_metadata(&self) -> Option<crate::common::ome_metadata::OmeMetadata> {
@@ -1809,12 +2036,29 @@ impl FormatReader for FakeReader {
         }
 
         let mut ome = crate::common::ome_metadata::OmeMetadata::default();
-        ome.images = self
-            .series
-            .iter()
-            .enumerate()
-            .map(|(image_index, meta)| fake_ome_image(meta, image_index))
-            .collect();
+        for base in &self.series {
+            let count = if self.flattened_resolutions {
+                base.resolution_count.max(1) as usize
+            } else {
+                1
+            };
+            for resolution in 0..count {
+                let mut meta = fake_resolution_metadata(base, resolution);
+                if self.flattened_resolutions {
+                    meta.resolution_count = 1;
+                }
+                let image_index = ome.images.len();
+                let mut image = fake_ome_image(&meta, image_index);
+                if self.flattened_resolutions {
+                    let scale = (resolution_scale(base) as f64).powi(resolution as i32);
+                    image.physical_size_x = image.physical_size_x.map(|v| v * scale);
+                    image.physical_size_y = image.physical_size_y.map(|v| v * scale);
+                    image.physical_size_z = image.physical_size_z.map(|v| v * scale);
+                }
+                ome.images.push(image);
+                let _ = ome.add_original_metadata_annotations(&meta, image_index);
+            }
+        }
 
         let first = &self.series[0];
         if fake_meta_bool(first, "withInstrument")
@@ -1827,10 +2071,6 @@ impl FormatReader for FakeReader {
         fake_populate_rois(&mut ome, first);
         fake_populate_annotations(&mut ome, first);
 
-        for (image_index, meta) in self.series.iter().enumerate() {
-            let _ = ome.add_original_metadata_annotations(meta, image_index);
-        }
-
         Some(ome)
     }
 }
@@ -1841,6 +2081,68 @@ mod tests {
 
     fn meta_for(name: &str) -> Vec<ImageMetadata> {
         init_file(Path::new(name)).unwrap()
+    }
+
+    #[test]
+    fn fake_pyramid_defaults_flattened_and_scales_all_physical_axes() {
+        let mut reader = FakeReader::new();
+        reader.set_id(Path::new("pyramid&sizeX=9&sizeY=7&series=2&resolutions=3&physicalSizeX=0.5&physicalSizeY=0.75&physicalSizeZ=2.fake")).unwrap();
+        assert!(reader.has_flattened_resolutions());
+        assert_eq!(reader.series_count(), 6);
+        reader.set_series(2).unwrap();
+        assert_eq!((reader.metadata().size_x, reader.metadata().size_y), (2, 1));
+        assert_eq!(reader.resolution_count(), 1);
+        assert_eq!(reader.metadata().resolution_count, 1);
+        assert!(reader.set_resolution(1).is_err());
+        let pixels = reader.open_bytes(0).unwrap();
+        assert_eq!(pixels.len(), 2);
+        reader.set_resolution(0).unwrap();
+        assert_eq!((reader.metadata().size_x, reader.metadata().size_y), (2, 1));
+        reader.set_series(3).unwrap();
+        assert_eq!((reader.metadata().size_x, reader.metadata().size_y), (9, 7));
+        let ome = reader.ome_metadata().unwrap();
+        assert_eq!(ome.images.len(), 6);
+        assert_eq!(
+            (
+                ome.images[2].physical_size_x,
+                ome.images[2].physical_size_y,
+                ome.images[2].physical_size_z
+            ),
+            (Some(2.0), Some(3.0), Some(8.0))
+        );
+        assert_eq!(ome.images[3].physical_size_x, Some(0.5));
+        assert!(reader.set_flattened_resolutions(false).is_err());
+        reader.close().unwrap();
+        reader.set_flattened_resolutions(false).unwrap();
+        reader
+            .set_id(Path::new("pyramid&resolutions=3&physicalSizeX=0.5.fake"))
+            .unwrap();
+        assert_eq!(reader.series_count(), 1);
+        assert_eq!(reader.resolution_count(), 3);
+        reader.set_resolution(2).unwrap();
+        assert_eq!(
+            reader.ome_metadata().unwrap().images[0].physical_size_x,
+            Some(0.5)
+        );
+    }
+
+    #[test]
+    fn fake_axis_orientations_parse_known_terms_and_leave_unknown_axes_empty() {
+        use crate::common::orientation::AnatomicalOrientation::LeftToRight;
+        let mut reader = FakeReader::new();
+        let path = std::env::temp_dir().join(format!(
+            "bf_fake_orientation_{}.fake.ini",
+            std::process::id()
+        ));
+        std::fs::write(&path, "sizeX=2\nsizeY=2\n[series_0]\nAxisOrientationType_0=anatomical\nAxisOrientationTerm_0=left-to-right\nAxisOrientationType_1=anatomical\nAxisOrientationTerm_1=unknown\n").unwrap();
+        reader.set_id(&path).unwrap();
+        assert_eq!(
+            reader.axis_orientations().map(|o| o.map(|v| v.term)),
+            [Some(LeftToRight), None, None, None, None]
+        );
+        reader.close().unwrap();
+        assert_eq!(reader.axis_orientations(), [None; 5]);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -1901,10 +2203,87 @@ mod tests {
     }
 
     #[test]
+    fn indexed_pixels_and_channel_palettes_match_java_random_shuffle() {
+        for (pixel_type, first, second, lut_first, lut_second) in [
+            (
+                "uint8",
+                vec![214, 162, 70, 225, 183, 172, 207, 1],
+                vec![66, 170, 224, 73, 100, 103, 57, 10],
+                vec![75, 7, 65, 57, 85, 139, 188, 161],
+                vec![249, 36, 198, 26, 152, 172, 21, 142],
+            ),
+            (
+                "uint16",
+                vec![
+                    131, 26, 53, 86, 153, 190, 214, 214, 17, 104, 190, 185, 83, 64, 211, 208,
+                ],
+                vec![
+                    185, 239, 37, 251, 17, 152, 95, 2, 83, 172, 39, 44, 195, 77, 244, 157,
+                ],
+                vec![8857, 28721, 6958, 7769, 22302, 14876, 8599, 30593],
+                vec![43580, 25802, 44952, 61477, 61061, 10901, 21400, 57592],
+            ),
+        ] {
+            let mut reader = FakeReader::new();
+            reader.set_id(Path::new(&format!("case&sizeX=8&sizeY=12&sizeC=2&pixelType={pixel_type}&indexed=true&lutLength=2.fake"))).unwrap();
+            assert_eq!(reader.open_bytes_region(0, 0, 10, 8, 1).unwrap(), first);
+            assert_eq!(reader.open_bytes_region(1, 0, 10, 8, 1).unwrap(), second);
+            let first = reader.lookup_table(0).unwrap().unwrap();
+            let second = reader.lookup_table(1).unwrap().unwrap();
+            assert_eq!(&first.red[..8], &lut_first);
+            assert_eq!(&second.red[..8], &lut_second);
+            assert_eq!(first.red, first.green);
+            assert!(first.blue.iter().all(|value| *value == 0));
+        }
+    }
+
+    #[test]
     fn indexed_and_bits_per_pixel() {
         let m = &meta_for("img&indexed=true&bitsPerPixel=12&pixelType=uint16.fake")[0];
         assert!(m.is_indexed);
         assert_eq!(m.bits_per_pixel, 12);
+    }
+
+    #[test]
+    fn fake_thumbnails_resample_and_preserve_active_core() {
+        let mut reader = FakeReader::new();
+        reader
+            .set_id(Path::new(
+                "thumbnail&sizeX=64&sizeY=32&thumbSizeX=4&thumbSizeY=2.fake",
+            ))
+            .unwrap();
+        // Captured from Java FakeReader.openThumbBytes via the upstream jar.
+        assert_eq!(
+            reader.open_thumb_bytes(0).unwrap(),
+            vec![16, 32, 41, 119, 44, 85, 110, 128]
+        );
+        assert_eq!(
+            (reader.metadata().size_x, reader.metadata().size_y),
+            (64, 32)
+        );
+        reader.close().unwrap();
+        reader
+            .set_id(Path::new(
+                "thumbnail&sizeX=256&sizeY=64&resolutions=2&resolutionScale=2.fake",
+            ))
+            .unwrap();
+        assert_eq!(reader.open_thumb_bytes(0).unwrap().len(), 128 * 32);
+        reader.set_series(1).unwrap();
+        assert_eq!(reader.open_thumb_bytes(0).unwrap().len(), 128 * 32);
+        assert_eq!(
+            (
+                reader.series(),
+                reader.metadata().size_x,
+                reader.metadata().size_y
+            ),
+            (1, 128, 32)
+        );
+        reader.close().unwrap();
+        reader
+            .set_id(Path::new("thumbnail&sizeX=3&sizeY=2&thumbSizeX=5.fake"))
+            .unwrap();
+        assert_eq!(reader.open_thumb_bytes(0).unwrap().len(), 5 * 2);
+        assert_eq!((reader.metadata().size_x, reader.metadata().size_y), (3, 2));
     }
 
     #[test]
@@ -1943,6 +2322,7 @@ mod tests {
     #[test]
     fn set_resolution_scales_fake_geometry_like_java() {
         let mut reader = FakeReader::new();
+        reader.set_flattened_resolutions(false).unwrap();
         reader
             .set_id(Path::new(
                 "pyr&sizeX=1000&sizeY=800&resolutions=4&resolutionScale=2.fake",

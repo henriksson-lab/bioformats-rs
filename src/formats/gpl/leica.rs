@@ -180,6 +180,7 @@ struct LeiInstrumentMetadata {
     channel_detector_refs: Vec<Option<usize>>,
     channel_filter_refs: Vec<Option<usize>>,
     pinhole_um: Option<f64>,
+    physical_sizes: [Option<f64>; 3],
     exposure_time: Option<f64>,
     stage_position_x: Option<f64>,
     stage_position_y: Option<f64>,
@@ -243,6 +244,7 @@ fn parse_leica_instrument_metadata(
     let mut detectors: Vec<LeiDetector> = Vec::new();
     let mut active_channel_indices: Vec<i32> = Vec::new();
     let mut block_num = 1usize;
+    let mut next_channel = 0usize;
 
     for key in keys {
         if !is_leica_instrument_block(key) {
@@ -265,45 +267,31 @@ fn parse_leica_instrument_metadata(
             block_num,
         );
         block_num += 1;
-    }
-
-    let mut active_detectors = Vec::new();
-    let mut next_channel = 0usize;
-    for detector in detectors.iter().filter(|detector| detector.active) {
-        if next_channel >= effective_size_c {
-            break;
-        }
-        if instrument.channel_names.len() <= next_channel {
-            instrument.channel_names.resize(next_channel + 1, None);
-        }
-        let replace = instrument.channel_names[next_channel]
-            .as_deref()
-            .map(|name| name.trim().is_empty() || name == "None")
-            .unwrap_or(true);
-        if replace {
-            instrument.channel_names[next_channel] = Some(detector.name.clone());
-        }
-
-        active_detectors.push(detector.clone());
-        let detector_index = active_detectors.len() - 1;
-        if detector_index == 0 {
-            instrument.channel_detector_refs.fill(Some(detector_index));
-        }
-        instrument.channel_detector_refs[next_channel] = Some(detector_index);
-        next_channel += 1;
-    }
-    instrument.detectors = active_detectors;
-
-    for filter_index in 0..instrument.filters.len() {
-        let source_channel = instrument.filters[filter_index].channel as i32;
-        if let Some(logical_channel) = active_channel_indices
-            .iter()
-            .position(|&channel| channel == source_channel)
-        {
-            if logical_channel < effective_size_c {
-                instrument.channel_filter_refs[logical_channel] = Some(filter_index);
+        instrument.pinhole_um.get_or_insert(0.0);
+        // Java emits every active detector, even when there are fewer logical
+        // channels, and initially links all channels to the first detector.
+        for detector in detectors.iter().filter(|detector| detector.active) {
+            instrument.detectors.push(detector.clone());
+            let detector_index = instrument.detectors.len() - 1;
+            if detector_index == 0 {
+                instrument.channel_detector_refs.fill(Some(detector_index));
+            }
+            if next_channel < effective_size_c {
+                if instrument.channel_names.len() <= next_channel {
+                    instrument.channel_names.resize(next_channel + 1, None);
+                }
+                let replace = instrument.channel_names[next_channel]
+                    .as_deref()
+                    .map(|name| name.trim().is_empty() || name == "None")
+                    .unwrap_or(true);
+                if replace {
+                    instrument.channel_names[next_channel] = Some(detector.name.clone());
+                }
+                instrument.channel_detector_refs[next_channel] = Some(detector_index);
+                next_channel += 1;
             }
         }
+        detectors.clear();
     }
 
     instrument
@@ -369,11 +357,20 @@ fn parse_leica_instrument_block(
             .original_metadata
             .push((format!("Block {block_num} {content_id}"), value.to_string()));
 
+        if let Some(index) = ["dblVoxelX", "dblVoxelY", "dblStepSize"]
+            .iter()
+            .position(|&name| name == content_id)
+        {
+            if let Ok(value) = value.parse::<f64>() {
+                if index < 2 || value > 0.0 {
+                    instrument.physical_sizes[index] = Some(value);
+                }
+            }
+            continue;
+        }
         if content_id == "dblPinhole" {
             if let Ok(pinhole_m) = value.parse::<f64>() {
-                if pinhole_m > 0.0 {
-                    instrument.pinhole_um = Some(pinhole_m * 1_000_000.0);
-                }
+                instrument.pinhole_um = Some(pinhole_m * 1_000_000.0);
             }
             continue;
         }
@@ -398,20 +395,19 @@ fn parse_leica_instrument_block(
                 continue;
             }
             let id = tokens[3].parse::<i32>().unwrap_or(0);
-            let detector_index = detectors
-                .iter()
-                .position(|detector| detector.id == id)
-                .unwrap_or_else(|| {
-                    detectors.push(LeiDetector {
-                        id,
-                        name: tokens[1].to_string(),
-                        active: false,
-                        index: -1,
-                        offset: None,
-                        voltage: None,
-                    });
-                    detectors.len() - 1
+            let detector_index = if detectors.last().is_some_and(|detector| detector.id == id) {
+                detectors.len() - 1
+            } else {
+                detectors.push(LeiDetector {
+                    id,
+                    name: tokens[1].to_string(),
+                    active: false,
+                    index: -1,
+                    offset: Some(0.0),
+                    voltage: Some(0.0),
                 });
+                detectors.len() - 1
+            };
             let detector = &mut detectors[detector_index];
             detector.id = id;
             detector.name = tokens[1].to_string();
@@ -427,10 +423,7 @@ fn parse_leica_instrument_block(
                     .and_then(|index| index.parse::<i32>().ok())
                     .map(|index| index - 1)
                     .unwrap_or(-1);
-                if detector.active
-                    && detector.index >= 0
-                    && !active_channel_indices.contains(&detector.index)
-                {
+                if detector.active && detector.index >= 0 {
                     active_channel_indices.push(detector.index);
                 }
             }
@@ -478,11 +471,20 @@ fn parse_leica_instrument_block(
                 });
             let filter = &mut instrument.filters[filter_slot];
             filter.model = tokens[1].to_string();
-            if let Ok(wavelength) = value.parse::<f64>() {
-                if tokens.get(3) == Some(&"0") && filter.cut_in.is_none() {
-                    filter.cut_in = Some(wavelength);
-                } else if tokens.get(3) == Some(&"1") && filter.cut_out.is_none() {
-                    filter.cut_out = Some(wavelength);
+            if let Some(logical_channel) = active_channel_indices
+                .iter()
+                .position(|&index| index == channel as i32)
+                .filter(|&index| index < effective_size_c)
+            {
+                instrument.channel_filter_refs[logical_channel].get_or_insert(filter_slot);
+                if let Ok(wavelength) = value.parse::<f64>() {
+                    if wavelength > 0.0 {
+                        if tokens.get(3) == Some(&"0") && filter.cut_in.is_none() {
+                            filter.cut_in = Some(wavelength);
+                        } else if tokens.get(3) == Some(&"1") && filter.cut_out.is_none() {
+                            filter.cut_out = Some(wavelength);
+                        }
+                    }
                 }
             }
         } else if tokens[0].starts_with("CSpectrophotometerUnit") && tokens[2] == "Stain" {
@@ -558,8 +560,19 @@ fn parse_leica_objective(value: &str, objective: &mut LeiObjective) {
     if lens_na.is_some() {
         objective.lens_na = lens_na;
     }
-    objective.correction = correction;
-    objective.immersion = immersion;
+    use super::leica_lms::{
+        metadata_correction as get_correction, metadata_immersion as get_immersion,
+    };
+
+    if (get_correction(immersion.as_deref()) != "Other"
+        && get_correction(correction.as_deref()) == "Other")
+        || (get_immersion(correction.as_deref()) != "Other"
+            && get_immersion(immersion.as_deref()) == "Other")
+    {
+        std::mem::swap(&mut correction, &mut immersion);
+    }
+    objective.correction = Some(get_correction(correction.as_deref()).into());
+    objective.immersion = Some(get_immersion(immersion.as_deref()).into());
 }
 
 fn parse_leica_lut(data: &[u8], little: bool, offset: usize) -> Vec<Option<i32>> {
@@ -718,7 +731,10 @@ fn insert_leica_instrument_metadata(
         if let Some(Some(filter_index)) = instrument.channel_filter_refs.get(channel) {
             meta_map.insert(
                 format!("channel.{channel}.emission_filter_ref"),
-                MetadataValue::String(format!("Filter:0:{filter_index}")),
+                MetadataValue::String(format!(
+                    "Filter:0:{}",
+                    instrument.filters[*filter_index].channel
+                )),
             );
         }
     }
@@ -746,7 +762,7 @@ fn insert_leica_instrument_metadata(
         let prefix = format!("instrument.filter.{index}");
         meta_map.insert(
             format!("{prefix}.id"),
-            MetadataValue::String(format!("Filter:0:{index}")),
+            MetadataValue::String(format!("Filter:0:{}", filter.channel)),
         );
         insert_string_metadata(meta_map, format!("{prefix}.model"), &filter.model);
         if let Some(cut_in) = filter.cut_in {
@@ -809,7 +825,10 @@ fn insert_leica_plane_metadata(
     image_count: u32,
 ) {
     for plane in 0..image_count {
-        if let Some(exposure_time) = instrument.exposure_time {
+        if let Some(exposure_time) = instrument
+            .exposure_time
+            .filter(|_| meta_map.contains_key(&format!("plane.{plane}.delta_t")))
+        {
             insert_float_metadata(
                 meta_map,
                 format!("plane.{plane}.exposure_time"),
@@ -1341,6 +1360,11 @@ fn parse_lei(lei_path: &Path) -> Result<Vec<LeiSeries>> {
             size_c.max(1)
         } as usize;
         let instrument = parse_leica_instrument_metadata(&data, little, ifd, effective_size_c);
+        for (index, value) in instrument.physical_sizes.iter().enumerate() {
+            if let Some(value) = value {
+                physical_sizes[index] = *value;
+            }
+        }
         let channel_colors = ifd
             .get(&LUTDESC)
             .map(|&offset| parse_leica_lut(&data, little, offset))
@@ -1610,140 +1634,182 @@ impl FormatReader for LeicaReader {
             OmeDetector, OmeFilter, OmeInstrument, OmeLightPath, OmeObjective,
         };
 
-        let meta = self.metadata();
-        if std::ptr::eq(meta, crate::common::reader::uninitialized_metadata()) {
+        if self.series_list.is_empty() {
             return None;
         }
-
-        let mut ome = crate::common::ome_metadata::OmeMetadata::from_image_metadata(meta);
-        let _ = ome.add_original_metadata_annotations(meta, 0);
-        let image = ome.images.get_mut(0)?;
-        image.name = metadata_string(meta, "image.name");
-        image.description = metadata_string(meta, "image.description");
-        image.acquisition_date = metadata_string(meta, "acquisition_date");
-        image.physical_size_x = metadata_float(meta, "physicalSizeX");
-        image.physical_size_y = metadata_float(meta, "physicalSizeY");
-        image.physical_size_z = metadata_float(meta, "physicalSizeZ");
-        image.time_increment = metadata_float(meta, "timeIncrement");
-        // LeicaReader.java:1495/1506/1515/1526: plane X/Y and stage label Z are
-        // new Length(number, UNITS.REFERENCEFRAME)
-        for plane in &mut image.planes {
-            plane.position_x_unit = plane.position_x.map(|_| "reference frame".to_string());
-            plane.position_y_unit = plane.position_y.map(|_| "reference frame".to_string());
-        }
-        if let Some(stage_label) = &mut image.stage_label {
-            stage_label.z_unit = stage_label.z.map(|_| "reference frame".to_string());
-        }
-        for (channel_index, channel) in image.channels.iter_mut().enumerate() {
-            if let Some(name) = metadata_string(meta, &format!("channel.{channel_index}.name")) {
-                channel.name = Some(name);
+        let mut ome = crate::common::ome_metadata::OmeMetadata::default();
+        for (series_index, series) in self.series_list.iter().enumerate() {
+            let meta = &series.meta;
+            let mut part = crate::common::ome_metadata::OmeMetadata::from_image_metadata(meta);
+            let image = part.images.get_mut(0)?;
+            image.name = metadata_string(meta, "image.name");
+            image.description = metadata_string(meta, "image.description");
+            image.acquisition_date = metadata_string(meta, "acquisition_date");
+            image.physical_size_x = metadata_float(meta, "physicalSizeX").filter(|v| *v > 0.0);
+            image.physical_size_y = metadata_float(meta, "physicalSizeY").filter(|v| *v > 0.0);
+            image.physical_size_z = metadata_float(meta, "physicalSizeZ").filter(|v| *v > 0.0);
+            image.time_increment = metadata_float(meta, "timeIncrement").filter(|v| *v as i32 > 0);
+            // LeicaReader.java:1495/1506/1515/1526: plane X/Y and stage label Z are
+            // new Length(number, UNITS.REFERENCEFRAME)
+            for plane in &mut image.planes {
+                plane.position_x_unit = plane.position_x.map(|_| "reference frame".to_string());
+                plane.position_y_unit = plane.position_y.map(|_| "reference frame".to_string());
             }
-            channel.emission_wavelength = metadata_float(
-                meta,
-                &format!("channel.{channel_index}.emission_wavelength"),
-            );
-            channel.excitation_wavelength = metadata_float(
-                meta,
-                &format!("channel.{channel_index}.excitation_wavelength"),
-            );
-            channel.pinhole_size =
-                metadata_float(meta, &format!("channel.{channel_index}.pinhole_size"));
-            channel.color = metadata_int(meta, &format!("channel.{channel_index}.color"));
-            channel.detector_ref =
-                metadata_string(meta, &format!("channel.{channel_index}.detector_ref"));
-            channel.detector_settings_offset = metadata_float(
-                meta,
-                &format!("channel.{channel_index}.detector_settings_offset"),
-            );
-            channel.detector_settings_voltage = metadata_float(
-                meta,
-                &format!("channel.{channel_index}.detector_settings_voltage"),
-            );
-        }
-
-        if has_leica_instrument_metadata(meta) {
-            let mut instrument = OmeInstrument {
-                id: Some("Instrument:0".into()),
-                ..Default::default()
-            };
-
-            for index in 0..64 {
-                let prefix = format!("instrument.objective.{index}");
-                if metadata_string(meta, &format!("{prefix}.id")).is_none() {
-                    continue;
+            if let Some(stage_label) = &mut image.stage_label {
+                stage_label.z_unit = stage_label.z.map(|_| "reference frame".to_string());
+            }
+            for (channel_index, channel) in image.channels.iter_mut().enumerate() {
+                if let Some(name) = metadata_string(meta, &format!("channel.{channel_index}.name"))
+                {
+                    channel.name = Some(name);
                 }
-                instrument.objectives.push(OmeObjective {
-                    id: metadata_string(meta, &format!("{prefix}.id")),
-                    model: metadata_string(meta, &format!("{prefix}.model")),
-                    serial_number: metadata_string(meta, &format!("{prefix}.serial_number")),
-                    nominal_magnification: metadata_float(
-                        meta,
-                        &format!("{prefix}.nominal_magnification"),
-                    ),
-                    lens_na: metadata_float(meta, &format!("{prefix}.lens_na")),
-                    immersion: metadata_string(meta, &format!("{prefix}.immersion")),
-                    correction: metadata_string(meta, &format!("{prefix}.correction")),
-                    ..Default::default()
-                });
-            }
-
-            for index in 0..64 {
-                let prefix = format!("instrument.detector.{index}");
-                if metadata_string(meta, &format!("{prefix}.id")).is_none() {
-                    continue;
-                }
-                instrument.detectors.push(OmeDetector {
-                    id: metadata_string(meta, &format!("{prefix}.id")),
-                    model: metadata_string(meta, &format!("{prefix}.model")),
-                    detector_type: metadata_string(meta, &format!("{prefix}.type")),
-                    offset: metadata_float(meta, &format!("{prefix}.offset")),
-                    ..Default::default()
-                });
-            }
-
-            for index in 0..64 {
-                let prefix = format!("instrument.filter.{index}");
-                if metadata_string(meta, &format!("{prefix}.id")).is_none() {
-                    continue;
-                }
-                instrument.filters.push(OmeFilter {
-                    id: metadata_string(meta, &format!("{prefix}.id")),
-                    model: metadata_string(meta, &format!("{prefix}.model")),
-                    cut_in: metadata_float(meta, &format!("{prefix}.cut_in")),
-                    cut_out: metadata_float(meta, &format!("{prefix}.cut_out")),
-                    ..Default::default()
-                });
-            }
-
-            image.instrument_ref = Some(0);
-            if !instrument.objectives.is_empty()
-                && meta
-                    .series_metadata
-                    .contains_key("instrument.objective.0.id")
-            {
-                image.objective_ref = Some(0);
-                image.objective_settings_refractive_index =
-                    metadata_float(meta, "instrument.objective.0.refractive_index");
-            }
-            image
-                .light_paths
-                .resize(image.channels.len(), OmeLightPath::default());
-            for channel_index in 0..image.channels.len() {
-                if let Some(filter_id) = metadata_string(
+                channel.emission_wavelength = metadata_float(
                     meta,
-                    &format!("channel.{channel_index}.emission_filter_ref"),
-                ) {
-                    if !image.light_paths[channel_index]
-                        .emission_filter_ids
-                        .contains(&filter_id)
-                    {
-                        image.light_paths[channel_index]
+                    &format!("channel.{channel_index}.emission_wavelength"),
+                )
+                .filter(|v| *v > 0.0);
+                channel.excitation_wavelength = metadata_float(
+                    meta,
+                    &format!("channel.{channel_index}.excitation_wavelength"),
+                )
+                .filter(|v| *v > 0.0);
+                channel.pinhole_size =
+                    metadata_float(meta, &format!("channel.{channel_index}.pinhole_size"));
+                channel.color = metadata_int(meta, &format!("channel.{channel_index}.color"));
+                channel.detector_ref =
+                    metadata_string(meta, &format!("channel.{channel_index}.detector_ref"))
+                        .map(|id| id.replacen(":0:", &format!(":{series_index}:"), 1));
+                channel.detector_settings_offset = None;
+                channel.detector_settings_voltage = None;
+            }
+
+            {
+                let mut instrument = OmeInstrument {
+                    id: Some(format!("Instrument:{series_index}")),
+                    ..Default::default()
+                };
+
+                let mut indices: Vec<usize> = meta
+                    .series_metadata
+                    .keys()
+                    .filter_map(|key| {
+                        key.strip_prefix("instrument.objective.")?
+                            .strip_suffix(".id")?
+                            .parse()
+                            .ok()
+                    })
+                    .collect();
+                indices.sort_unstable();
+                indices.dedup();
+                for index in indices {
+                    let prefix = format!("instrument.objective.{index}");
+                    if metadata_string(meta, &format!("{prefix}.id")).is_none() {
+                        continue;
+                    }
+                    instrument.objectives.push(OmeObjective {
+                        id: metadata_string(meta, &format!("{prefix}.id"))
+                            .map(|id| id.replacen(":0:", &format!(":{series_index}:"), 1)),
+                        model: metadata_string(meta, &format!("{prefix}.model")),
+                        serial_number: metadata_string(meta, &format!("{prefix}.serial_number")),
+                        nominal_magnification: metadata_float(
+                            meta,
+                            &format!("{prefix}.nominal_magnification"),
+                        ),
+                        lens_na: metadata_float(meta, &format!("{prefix}.lens_na")),
+                        immersion: metadata_string(meta, &format!("{prefix}.immersion")),
+                        correction: metadata_string(meta, &format!("{prefix}.correction")),
+                        ..Default::default()
+                    });
+                }
+
+                let mut indices: Vec<usize> = meta
+                    .series_metadata
+                    .keys()
+                    .filter_map(|key| {
+                        key.strip_prefix("instrument.detector.")?
+                            .strip_suffix(".id")?
+                            .parse()
+                            .ok()
+                    })
+                    .collect();
+                indices.sort_unstable();
+                indices.dedup();
+                for index in indices {
+                    let prefix = format!("instrument.detector.{index}");
+                    if metadata_string(meta, &format!("{prefix}.id")).is_none() {
+                        continue;
+                    }
+                    instrument.detectors.push(OmeDetector {
+                        id: metadata_string(meta, &format!("{prefix}.id"))
+                            .map(|id| id.replacen(":0:", &format!(":{series_index}:"), 1)),
+                        detector_type: metadata_string(meta, &format!("{prefix}.type")),
+                        offset: metadata_float(meta, &format!("{prefix}.offset")),
+                        voltage: metadata_float(meta, &format!("{prefix}.voltage")),
+                        ..Default::default()
+                    });
+                }
+
+                let mut indices: Vec<usize> = meta
+                    .series_metadata
+                    .keys()
+                    .filter_map(|key| {
+                        key.strip_prefix("instrument.filter.")?
+                            .strip_suffix(".id")?
+                            .parse()
+                            .ok()
+                    })
+                    .collect();
+                indices.sort_unstable();
+                indices.dedup();
+                for index in indices {
+                    let prefix = format!("instrument.filter.{index}");
+                    if metadata_string(meta, &format!("{prefix}.id")).is_none() {
+                        continue;
+                    }
+                    instrument.filters.push(OmeFilter {
+                        id: metadata_string(meta, &format!("{prefix}.id"))
+                            .map(|id| id.replacen(":0:", &format!(":{series_index}:"), 1)),
+                        model: metadata_string(meta, &format!("{prefix}.model")),
+                        cut_in: metadata_float(meta, &format!("{prefix}.cut_in")),
+                        cut_out: metadata_float(meta, &format!("{prefix}.cut_out")),
+                        ..Default::default()
+                    });
+                }
+
+                image.instrument_ref = Some(series_index);
+                if !instrument.objectives.is_empty()
+                    && meta
+                        .series_metadata
+                        .contains_key("instrument.objective.0.id")
+                {
+                    image.objective_ref = Some(0);
+                    image.objective_settings_refractive_index =
+                        metadata_float(meta, "instrument.objective.0.refractive_index");
+                }
+                image.light_paths.clear();
+                image
+                    .light_paths
+                    .resize(image.channels.len(), OmeLightPath::default());
+                for channel_index in 0..image.channels.len() {
+                    if let Some(filter_id) = metadata_string(
+                        meta,
+                        &format!("channel.{channel_index}.emission_filter_ref"),
+                    ) {
+                        let filter_id = filter_id.replacen(":0:", &format!(":{series_index}:"), 1);
+                        if !image.light_paths[channel_index]
                             .emission_filter_ids
-                            .push(filter_id);
+                            .contains(&filter_id)
+                        {
+                            image.light_paths[channel_index]
+                                .emission_filter_ids
+                                .push(filter_id);
+                        }
                     }
                 }
+                ome.instruments.push(instrument);
             }
-            ome.instruments.push(instrument);
+            ome.images.append(&mut part.images);
+            let _ = ome.add_original_metadata_annotations(meta, series_index);
         }
         Some(ome)
     }
@@ -1758,7 +1824,7 @@ fn is_raw_companion(path: &Path) -> bool {
 
 fn metadata_float(meta: &ImageMetadata, key: &str) -> Option<f64> {
     match meta.series_metadata.get(key) {
-        Some(MetadataValue::Float(value)) if value.is_finite() && *value > 0.0 => Some(*value),
+        Some(MetadataValue::Float(value)) if value.is_finite() => Some(*value),
         _ => None,
     }
 }
@@ -1775,12 +1841,6 @@ fn metadata_int(meta: &ImageMetadata, key: &str) -> Option<i32> {
         Some(MetadataValue::Int(value)) => i32::try_from(*value).ok(),
         _ => None,
     }
-}
-
-fn has_leica_instrument_metadata(meta: &ImageMetadata) -> bool {
-    meta.series_metadata
-        .keys()
-        .any(|key| key.starts_with("instrument."))
 }
 
 fn read_raw_plane(path: &Path, meta: &ImageMetadata, plane_index: u32) -> Result<Vec<u8>> {
@@ -2034,6 +2094,150 @@ mod tests {
         put_i32(&mut data, tag_base + 16, 0);
         put_i32(&mut data, tag_base + 20, 0);
         data
+    }
+
+    #[test]
+    fn lei_ome_includes_all_series_with_distinct_instrument_ids_and_signed_offsets() {
+        let mut reader = LeicaReader::new();
+        for index in 0..2 {
+            let mut meta = ImageMetadata {
+                size_x: 2,
+                size_y: 1,
+                size_z: 1,
+                size_c: 1,
+                size_t: 1,
+                image_count: 1,
+                ..Default::default()
+            };
+            for (key, value) in [
+                ("image.name", format!("Series {index}")),
+                ("channel.0.detector_ref", "Detector:0:70".into()),
+                ("channel.0.emission_filter_ref", "Filter:0:70".into()),
+                ("instrument.detector.70.id", "Detector:0:70".into()),
+                ("instrument.detector.70.type", "PMT".into()),
+                ("instrument.filter.70.id", "Filter:0:70".into()),
+                ("instrument.objective.0.id", "Objective:0:0".into()),
+            ] {
+                meta.series_metadata
+                    .insert(key.into(), MetadataValue::String(value));
+            }
+            meta.series_metadata.insert(
+                "instrument.detector.70.offset".into(),
+                MetadataValue::Float(if index == 0 { 0.0 } else { -12.5 }),
+            );
+            meta.series_metadata.insert(
+                "instrument.detector.70.voltage".into(),
+                MetadataValue::Float(650.0),
+            );
+            reader.series_list.push(LeiSeries {
+                meta,
+                files: vec![],
+            });
+        }
+        reader.series = 1;
+        let ome = reader.ome_metadata().unwrap();
+        assert_eq!(reader.series(), 1);
+        assert_eq!(ome.images.len(), 2);
+        assert_eq!(ome.instruments.len(), 2);
+        for index in 0..2 {
+            assert_eq!(ome.images[index].instrument_ref, Some(index));
+            assert_eq!(
+                ome.instruments[index].id,
+                Some(format!("Instrument:{index}"))
+            );
+            assert_eq!(
+                ome.images[index].channels[0].detector_ref,
+                Some(format!("Detector:{index}:70"))
+            );
+            assert_eq!(
+                ome.instruments[index].detectors[0].id,
+                Some(format!("Detector:{index}:70"))
+            );
+            assert_eq!(
+                ome.images[index].light_paths[0].emission_filter_ids,
+                vec![format!("Filter:{index}:70")]
+            );
+            assert_eq!(ome.instruments[index].detectors[0].voltage, Some(650.0));
+        }
+        assert_eq!(ome.instruments[0].detectors[0].offset, Some(0.0));
+        assert_eq!(ome.instruments[1].detectors[0].offset, Some(-12.5));
+        let xml = ome.to_ome_xml(&reader.series_list[0].meta);
+        assert!(xml.contains("Detector:1:70"));
+        assert!(xml.contains("Voltage=\"650\""));
+        assert!(xml.contains("Offset=\"-12.5\""));
+    }
+
+    #[test]
+    fn lei_objective_swaps_immersion_and_correction_and_normalizes_enums() {
+        for value in [
+            "HC PL APO 40x1.30 Oil PlanApo",
+            "HC PL APO 40x1.30 PlanApo Oil",
+        ] {
+            let mut objective = LeiObjective::default();
+            parse_leica_objective(value, &mut objective);
+            assert_eq!(objective.model.as_deref(), Some("HC PL APO"));
+            assert_eq!(objective.magnification, Some(40.0));
+            assert_eq!(objective.lens_na, Some(1.3));
+            assert_eq!(objective.immersion.as_deref(), Some("Oil"));
+            assert_eq!(objective.correction.as_deref(), Some("PlanApo"));
+        }
+        let mut objective = LeiObjective::default();
+        parse_leica_objective("Lens 20x0.5 unknown nonsense", &mut objective);
+        assert_eq!(objective.immersion.as_deref(), Some("Other"));
+        assert_eq!(objective.correction.as_deref(), Some("Other"));
+    }
+
+    #[test]
+    fn lei_instrument_blocks_preserve_extra_detectors_and_voxel_overrides() {
+        let mut data = Vec::new();
+        let mut ifd = HeaderIfd::new();
+        for (block, records) in [
+            (
+                FILTERSET,
+                vec![
+                    ("CDetectionUnit|PMT 1|State|1", "Active"),
+                    ("dblVoxelX", "0.75"),
+                    ("dblVoxelY", "0.5"),
+                    ("dblStepSize", "2.0"),
+                ],
+            ),
+            (
+                SCANNERSET,
+                vec![
+                    ("CDetectionUnit|PMT 2|State|2", "Active"),
+                    ("CDetectionUnit|PMT 2|VideoOffset|2", "-5"),
+                ],
+            ),
+        ] {
+            ifd.insert(block, data.len());
+            push_i32(&mut data, 0);
+            push_i32(&mut data, 264);
+            data.extend_from_slice(&[0; 8]);
+            push_i32(&mut data, records.len() as i32);
+            push_i32(&mut data, 0);
+            for (key, value) in records {
+                push_leica_instrument_record(&mut data, key, value, 0);
+            }
+        }
+        let instrument = parse_leica_instrument_metadata(&data, true, &ifd, 1);
+        assert_eq!(instrument.detectors.len(), 2);
+        assert_eq!(instrument.channel_detector_refs, vec![Some(0)]);
+        assert_eq!(instrument.detectors[1].offset, Some(-5.0));
+        assert_eq!(
+            instrument.physical_sizes,
+            [Some(0.75), Some(0.5), Some(2.0)]
+        );
+        let mut map = HashMap::new();
+        let exposure = LeiInstrumentMetadata {
+            exposure_time: Some(0.5),
+            ..Default::default()
+        };
+        insert_leica_plane_metadata(&mut map, &exposure, 2);
+        assert!(!map.contains_key("plane.0.exposure_time"));
+        map.insert("plane.1.delta_t".into(), MetadataValue::Float(1.0));
+        insert_leica_plane_metadata(&mut map, &exposure, 2);
+        assert!(!map.contains_key("plane.0.exposure_time"));
+        assert_metadata_float(&map, "plane.1.exposure_time", 0.5);
     }
 
     #[test]
@@ -2526,8 +2730,8 @@ mod tests {
         assert_eq!(channel.pinhole_size, Some(70.0));
         assert_eq!(channel.color, Some(0x00ff00ff));
         assert_eq!(channel.detector_ref.as_deref(), Some("Detector:0:0"));
-        assert_eq!(channel.detector_settings_offset, Some(12.5));
-        assert_eq!(channel.detector_settings_voltage, Some(650.0));
+        assert_eq!(channel.detector_settings_offset, None);
+        assert_eq!(channel.detector_settings_voltage, None);
         assert_eq!(image.instrument_ref, Some(0));
         assert_eq!(image.objective_ref, Some(0));
         assert_eq!(
@@ -2539,7 +2743,7 @@ mod tests {
             instrument.detectors[0].detector_type.as_deref(),
             Some("PMT")
         );
-        assert_eq!(instrument.detectors[0].model.as_deref(), Some("PMT 1"));
+        assert_eq!(instrument.detectors[0].model, None);
         assert_eq!(instrument.detectors[0].offset, Some(12.5));
         assert_eq!(instrument.filters[0].cut_in, Some(500.0));
         assert_eq!(instrument.filters[0].cut_out, Some(550.0));
@@ -2555,9 +2759,7 @@ mod tests {
         assert!(xml.contains(r#"<InstrumentRef ID="Instrument:0"/>"#));
         assert!(xml.contains(r#"SerialNumber="OBJ-123""#));
         assert!(xml.contains(r#"<ObjectiveSettings ID="Objective:0:0" RefractiveIndex="1.515"/>"#));
-        assert!(
-            xml.contains(r#"<DetectorSettings ID="Detector:0:0" Offset="12.5" Voltage="650"/>"#)
-        );
+        assert!(xml.contains(r#"<DetectorSettings ID="Detector:0:0"/>"#));
         assert!(xml.contains(
             r#"<Plane TheZ="0" TheC="0" TheT="0" DeltaT="0" ExposureTime="0.25" PositionX="123.25" PositionXUnit="reference frame" PositionY="-45.5" PositionYUnit="reference frame"/>"#
         ));

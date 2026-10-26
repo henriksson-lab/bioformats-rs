@@ -11684,6 +11684,7 @@ struct YokogawaPlane {
 #[derive(Clone, Default)]
 #[cfg(feature = "gpl")]
 struct YokogawaChannel {
+    target: Option<String>,
     index: i32,
     action_index: i32,
     timeline_index: i32,
@@ -11902,6 +11903,7 @@ fn yk_parse_mrf(xml: &str) -> Vec<YokogawaChannel> {
             Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
                 if e.name().as_ref() == b"bts:MeasurementChannel" {
                     channels.push(YokogawaChannel {
+                        target: yk_attr(e, reader.decoder(), "bts:Target"),
                         index: (yk_attr_int(e, reader.decoder(), "bts:Ch").unwrap_or(1) - 1) as i32,
                         action_index: 0,
                         timeline_index: 0,
@@ -11956,6 +11958,7 @@ impl YokogawaReader {
         use std::collections::{HashMap, HashSet};
         let mut unique_wells: HashSet<u32> = HashSet::new();
         let mut unique_channels: HashSet<i32> = HashSet::new();
+        let mut unique_targets = HashSet::new();
         let mut fields = 0usize;
         // per-well min/max Z and T
         let mut zmin: HashMap<u32, i32> = HashMap::new();
@@ -11990,6 +11993,7 @@ impl YokogawaReader {
             }
             unique_wells.insert(well_number);
             unique_channels.insert(p.channel);
+            unique_targets.insert(yk_lookup_channel(p, &channels).and_then(|ch| ch.target.clone()));
             if (p.field as usize) + 1 > fields {
                 fields = p.field as usize + 1;
             }
@@ -12020,6 +12024,7 @@ impl YokogawaReader {
         // Sorted unique wells and channels.
         let mut wells: Vec<u32> = unique_wells.into_iter().collect();
         wells.sort_unstable();
+        let use_target_channel_names = unique_targets.len() == unique_channels.len();
         let mut channel_indexes: Vec<i32> = unique_channels.into_iter().collect();
         channel_indexes.sort_unstable();
         let n_channels = channel_indexes.len().max(1) as u32;
@@ -12029,7 +12034,16 @@ impl YokogawaReader {
                 .iter()
                 .find(|p| yk_channel_index(p, &channels) == *channel_index);
             let name = plane
-                .and_then(|p| yk_lookup_channel(p, &channels).map(|ch| yk_channel_name(p, ch)))
+                .and_then(|p| {
+                    yk_lookup_channel(p, &channels).map(|ch| {
+                        if use_target_channel_names {
+                            if let Some(target) = &ch.target {
+                                return target.clone();
+                            }
+                        }
+                        yk_channel_name(p, ch)
+                    })
+                })
                 .unwrap_or_else(|| format!("Channel #{}", channel_index + 1));
             channel_names.push(name);
         }
@@ -12415,6 +12429,56 @@ fn yk_row_name(row: u32) -> String {
 #[cfg(test)]
 mod yokogawa_tests {
     use super::*;
+
+    #[test]
+    fn cv8000_distinct_targets_name_channels_but_duplicates_use_indexes() {
+        let dir = std::env::temp_dir().join(format!("bf_cv8000_targets_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let wpi = dir.join("plate.wpi");
+        std::fs::write(&wpi, r#"<bts:WellPlate bts:Rows="1" bts:Columns="1"/>"#).unwrap();
+        let meta = ImageMetadata {
+            size_x: 2,
+            size_y: 2,
+            size_z: 1,
+            size_c: 1,
+            size_t: 1,
+            image_count: 1,
+            pixel_type: PixelType::Uint8,
+            bits_per_pixel: 8,
+            ..Default::default()
+        };
+        crate::ImageWriter::save(&dir.join("plane.tif"), &meta, &[vec![1, 2, 3, 4]]).unwrap();
+        let records: String = (1..=2).map(|ch| format!(r#"<bts:MeasurementRecord bts:Type="IMG" bts:Row="1" bts:Column="1" bts:FieldIndex="1" bts:ZIndex="1" bts:Ch="{ch}" bts:TimePoint="1" bts:ActionIndex="1" bts:TimelineIndex="1">plane.tif</bts:MeasurementRecord>"#)).collect();
+        std::fs::write(
+            dir.join("MeasurementData.mlf"),
+            format!("<root>{records}</root>"),
+        )
+        .unwrap();
+        for (second, expected) in [
+            ("FITC", vec!["DAPI", "FITC"]),
+            (
+                "DAPI",
+                vec![
+                    "Action #1, Channel #1, Camera #2",
+                    "Action #1, Channel #2, Camera #2",
+                ],
+            ),
+        ] {
+            std::fs::write(dir.join("MeasurementDetail.mrf"), format!(r#"<root><bts:MeasurementChannel bts:Ch="1" bts:CameraNumber="2" bts:Target="DAPI"/><bts:MeasurementChannel bts:Ch="2" bts:CameraNumber="2" bts:Target="{second}"/></root>"#)).unwrap();
+            let mut reader = YokogawaReader::new();
+            reader.set_id(&wpi).unwrap();
+            let ome = reader.ome_metadata().unwrap();
+            let names: Vec<_> = ome.images[0]
+                .channels
+                .iter()
+                .map(|ch| ch.name.as_deref().unwrap())
+                .collect();
+            assert_eq!(names, expected);
+            assert_eq!(reader.open_bytes(1).unwrap(), vec![1, 2, 3, 4]);
+            reader.close().unwrap();
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn cv7000_ome_metadata_projects_channel_names_like_java() {
@@ -13310,6 +13374,11 @@ fn lof_insert_structured_metadata(
             let prefix = format!("lof.detector.{idx}");
             lof_insert_node_scalar_attrs(metadata, &prefix, node);
             let detector = OmeDetector {
+                voltage: None,
+                zoom: None,
+                amplification_gain: None,
+                serial_number: None,
+                lot_number: None,
                 id: Some(create_lsid("Detector", &[0, idx])),
                 model: lof_first_attr(node, &["Model", "Name", "DetectorName"]),
                 manufacturer: lof_first_attr(node, &["Manufacturer", "Vendor"]),
@@ -13771,6 +13840,11 @@ fn lof_ome_instruments_from_metadata(meta: &ImageMetadata) -> Vec<OmeInstrument>
     loop {
         let base = format!("lof.detector.{detector_index}");
         let detector = OmeDetector {
+            voltage: None,
+            zoom: None,
+            amplification_gain: None,
+            serial_number: None,
+            lot_number: None,
             id: Some(create_lsid("Detector", &[0, detector_index])),
             model: metadata_string(meta, &format!("{base}.model"))
                 .or_else(|| metadata_string(meta, &format!("{base}.name")))
