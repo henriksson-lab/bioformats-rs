@@ -53,7 +53,7 @@ byteorder    = "1"
 image        = { version = "0.25", default-features = false, features = ["png", "bmp", "jpeg", "gif", "tga", "webp", "pnm", "hdr", "exr", "dds", "ff"] }
 openjp2      = { package = "openjpeg2-pure-rs", version = "0.1.1" }
 serde         = { version = "1", features = ["derive"] }
-bincode       = "1"
+postcard      = { version = "1.2", default-features = false, features = ["alloc"] }
 jpegxr = { package = "jpegxr-pure-rs", version = "0.1", optional = true }
 openslide-pure-rs = { git = "https://github.com/henriksson-lab/openslide-pure-rs", optional = true }
 mdbtools      = { package = "mdbtools-pure-rs", version = "0.1" }
