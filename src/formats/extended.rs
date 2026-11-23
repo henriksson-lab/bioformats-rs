@@ -2695,7 +2695,7 @@ fn imspector_parse_description(description: &str) -> Vec<(String, String)> {
                 break;
             }
             Ok(Event::Start(ref e)) => {
-                let local = String::from_utf8_lossy(e.local_name().as_ref()).into_owned();
+                let local = e.local_name().as_ref().to_owned();
                 name_stack.push(local);
                 text.clear();
             }
@@ -11723,35 +11723,23 @@ impl Default for YokogawaReader {
 /// Read every `name="value"` style attribute from the start tag and return the
 /// requested one. `bts:` prefixes are preserved by quick_xml.
 #[cfg(feature = "gpl")]
-fn yk_attr(
-    e: &quick_xml::events::BytesStart,
-    decoder: quick_xml::encoding::Decoder,
-    name: &str,
-) -> Option<String> {
+fn yk_attr(e: &quick_xml::events::BytesStart, name: &str) -> Option<String> {
     for a in e.attributes().flatten() {
-        if a.key.as_ref() == name.as_bytes() {
-            return crate::common::xml::decode_xml_attr(a, decoder);
+        if a.key.as_ref() == name {
+            return crate::common::xml::decode_xml_attr(a);
         }
     }
     None
 }
 
 #[cfg(feature = "gpl")]
-fn yk_attr_int(
-    e: &quick_xml::events::BytesStart,
-    decoder: quick_xml::encoding::Decoder,
-    name: &str,
-) -> Option<i64> {
-    yk_attr(e, decoder, name).and_then(|s| s.trim().parse::<i64>().ok())
+fn yk_attr_int(e: &quick_xml::events::BytesStart, name: &str) -> Option<i64> {
+    yk_attr(e, name).and_then(|s| s.trim().parse::<i64>().ok())
 }
 
 #[cfg(feature = "gpl")]
-fn yk_attr_positive_i64(
-    e: &quick_xml::events::BytesStart,
-    decoder: quick_xml::encoding::Decoder,
-    name: &str,
-) -> Result<i64> {
-    let value = yk_attr_int(e, decoder, name).unwrap_or(1);
+fn yk_attr_positive_i64(e: &quick_xml::events::BytesStart, name: &str) -> Result<i64> {
+    let value = yk_attr_int(e, name).unwrap_or(1);
     if value <= 0 {
         return Err(BioFormatsError::Format(format!(
             "Yokogawa CV7000 attribute {name} must be positive, got {value}"
@@ -11761,12 +11749,8 @@ fn yk_attr_positive_i64(
 }
 
 #[cfg(feature = "gpl")]
-fn yk_attr_f64(
-    e: &quick_xml::events::BytesStart,
-    decoder: quick_xml::encoding::Decoder,
-    name: &str,
-) -> Option<f64> {
-    yk_attr(e, decoder, name).and_then(|s| s.trim().parse::<f64>().ok())
+fn yk_attr_f64(e: &quick_xml::events::BytesStart, name: &str) -> Option<f64> {
+    yk_attr(e, name).and_then(|s| s.trim().parse::<f64>().ok())
 }
 
 /// Read a file and strip a stray trailing '>' (mirrors readSanitizedXML).
@@ -11792,11 +11776,10 @@ fn yk_parse_wpi(xml: &str) -> YokogawaPlate {
         match reader.read_event() {
             Ok(Event::Eof) | Err(_) => break,
             Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
-                if e.name().as_ref() == b"bts:WellPlate" {
-                    plate.name = yk_attr(e, reader.decoder(), "bts:Name");
-                    plate.rows = yk_attr_int(e, reader.decoder(), "bts:Rows").unwrap_or(0) as u32;
-                    plate.columns =
-                        yk_attr_int(e, reader.decoder(), "bts:Columns").unwrap_or(0) as u32;
+                if e.name().as_ref() == "bts:WellPlate" {
+                    plate.name = yk_attr(e, "bts:Name");
+                    plate.rows = yk_attr_int(e, "bts:Rows").unwrap_or(0) as u32;
+                    plate.columns = yk_attr_int(e, "bts:Columns").unwrap_or(0) as u32;
                 }
             }
             _ => {}
@@ -11822,34 +11805,22 @@ fn yk_parse_mlf(xml: &str, parent: &Path) -> Result<Vec<YokogawaPlane>> {
                 )));
             }
             Ok(Event::Start(ref e)) => {
-                if e.name().as_ref() == b"bts:MeasurementRecord" {
+                if e.name().as_ref() == "bts:MeasurementRecord" {
                     current_text.clear();
-                    let bts_type = yk_attr(e, reader.decoder(), "bts:Type").unwrap_or_default();
+                    let bts_type = yk_attr(e, "bts:Type").unwrap_or_default();
                     if bts_type == "IMG" {
                         in_img_record = true;
                         // attributes are 1-based in the file; convert to 0-based.
                         let p = YokogawaPlane {
-                            row: (yk_attr_positive_i64(e, reader.decoder(), "bts:Row")? - 1) as u32,
-                            column: (yk_attr_positive_i64(e, reader.decoder(), "bts:Column")? - 1)
-                                as u32,
-                            field: (yk_attr_positive_i64(e, reader.decoder(), "bts:FieldIndex")?
-                                - 1) as u32,
-                            z: (yk_attr_positive_i64(e, reader.decoder(), "bts:ZIndex")? - 1)
+                            row: (yk_attr_positive_i64(e, "bts:Row")? - 1) as u32,
+                            column: (yk_attr_positive_i64(e, "bts:Column")? - 1) as u32,
+                            field: (yk_attr_positive_i64(e, "bts:FieldIndex")? - 1) as u32,
+                            z: (yk_attr_positive_i64(e, "bts:ZIndex")? - 1) as i32,
+                            channel: (yk_attr_positive_i64(e, "bts:Ch")? - 1) as i32,
+                            timepoint: (yk_attr_positive_i64(e, "bts:TimePoint")? - 1) as i32,
+                            action_index: (yk_attr_positive_i64(e, "bts:ActionIndex")? - 1) as i32,
+                            timeline_index: (yk_attr_positive_i64(e, "bts:TimelineIndex")? - 1)
                                 as i32,
-                            channel: (yk_attr_positive_i64(e, reader.decoder(), "bts:Ch")? - 1)
-                                as i32,
-                            timepoint: (yk_attr_positive_i64(e, reader.decoder(), "bts:TimePoint")?
-                                - 1) as i32,
-                            action_index: (yk_attr_positive_i64(
-                                e,
-                                reader.decoder(),
-                                "bts:ActionIndex",
-                            )? - 1) as i32,
-                            timeline_index: (yk_attr_positive_i64(
-                                e,
-                                reader.decoder(),
-                                "bts:TimelineIndex",
-                            )? - 1) as i32,
                             file: None,
                         };
                         planes.push(p);
@@ -11871,7 +11842,7 @@ fn yk_parse_mlf(xml: &str, parent: &Path) -> Result<Vec<YokogawaPlane>> {
                 }
             }
             Ok(Event::End(ref e)) => {
-                if e.name().as_ref() == b"bts:MeasurementRecord" && in_img_record {
+                if e.name().as_ref() == "bts:MeasurementRecord" && in_img_record {
                     let value = current_text.trim();
                     if !value.is_empty() {
                         let img = parent.join(value);
@@ -11901,16 +11872,15 @@ fn yk_parse_mrf(xml: &str) -> Vec<YokogawaChannel> {
         match reader.read_event() {
             Ok(Event::Eof) | Err(_) => break,
             Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
-                if e.name().as_ref() == b"bts:MeasurementChannel" {
+                if e.name().as_ref() == "bts:MeasurementChannel" {
                     channels.push(YokogawaChannel {
-                        target: yk_attr(e, reader.decoder(), "bts:Target"),
-                        index: (yk_attr_int(e, reader.decoder(), "bts:Ch").unwrap_or(1) - 1) as i32,
+                        target: yk_attr(e, "bts:Target"),
+                        index: (yk_attr_int(e, "bts:Ch").unwrap_or(1) - 1) as i32,
                         action_index: 0,
                         timeline_index: 0,
-                        camera_number: yk_attr_int(e, reader.decoder(), "bts:CameraNumber")
-                            .unwrap_or(0) as i32,
-                        x_size: yk_attr_f64(e, reader.decoder(), "bts:HorizontalPixelDimension"),
-                        y_size: yk_attr_f64(e, reader.decoder(), "bts:VerticalPixelDimension"),
+                        camera_number: yk_attr_int(e, "bts:CameraNumber").unwrap_or(0) as i32,
+                        x_size: yk_attr_f64(e, "bts:HorizontalPixelDimension"),
+                        y_size: yk_attr_f64(e, "bts:VerticalPixelDimension"),
                     });
                 }
             }
@@ -13127,13 +13097,13 @@ fn lof_translate_metadata(xml: &str) -> Result<LofImageInfo> {
     loop {
         match reader.read_event() {
             Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
-                let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                let name = e.name().as_ref().to_owned();
                 if name == "Image" {
                     has_image = true;
                 }
                 let mut attrs = HashMap::new();
                 for a in e.attributes().flatten() {
-                    let key = String::from_utf8_lossy(a.key.as_ref()).to_string();
+                    let key = a.key.as_ref().to_owned();
                     let val = a
                         .normalized_value(quick_xml::XmlVersion::Implicit1_0)
                         .map(|v| v.to_string())

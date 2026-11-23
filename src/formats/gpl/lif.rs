@@ -1610,10 +1610,10 @@ impl Dom {
 
         let push_node =
             |nodes: &mut Vec<Node>, stack: &[usize], e: &quick_xml::events::BytesStart| -> usize {
-                let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                let name = e.name().as_ref().to_owned();
                 let mut attrs = BTreeMap::new();
                 for a in e.attributes().flatten() {
-                    let key = String::from_utf8_lossy(a.key.as_ref()).to_string();
+                    let key = a.key.as_ref().to_owned();
                     let val = a
                         .normalized_value(quick_xml::XmlVersion::Implicit1_0)
                         .map(|v| v.to_string())
@@ -1665,7 +1665,7 @@ impl Dom {
                     if let Some(&top) = stack.last() {
                         nodes[top]
                             .text
-                            .push_str(&String::from_utf8_lossy(t.as_ref()));
+                            .push_str(&t.xml_content(quick_xml::XmlVersion::Implicit1_0));
                     }
                 }
                 Ok(Event::Eof) => break,

@@ -79,7 +79,10 @@ impl ZipReader {
         first_entry: &mut Option<String>,
         primary_entry: &mut Option<String>,
     ) -> Result<()> {
-        let name = entry.name().to_string();
+        let name = entry
+            .name()
+            .map_err(|e| BioFormatsError::Format(e.to_string()))?
+            .into_owned();
         if first_entry.is_none() {
             *first_entry = Some(name.clone());
         }

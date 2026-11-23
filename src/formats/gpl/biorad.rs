@@ -529,25 +529,23 @@ fn apply_biorad_lse_xml(
     use quick_xml::events::Event;
     let mut reader = quick_xml::Reader::from_str(&xml);
     reader.config_mut().trim_text(false);
-    let decoder = reader.decoder();
-
     loop {
         match reader.read_event() {
             Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
                 let name = e.local_name();
-                if name.as_ref() == b"Pixels" {
+                if name.as_ref() == "Pixels" {
                     let mut z = 1u32;
                     let mut c = 1u32;
                     let mut t = 1u32;
                     for attr in e.attributes().flatten() {
-                        let key = attr.key.as_ref().to_vec();
-                        let Some(value) = crate::common::xml::decode_xml_attr(attr, decoder) else {
+                        let key = attr.key.as_ref().to_string();
+                        let Some(value) = crate::common::xml::decode_xml_attr(attr) else {
                             continue;
                         };
-                        match key.as_slice() {
-                            b"SizeZ" => z = value.parse().unwrap_or(1),
-                            b"SizeC" => c = value.parse().unwrap_or(1),
-                            b"SizeT" => t = value.parse().unwrap_or(1),
+                        match key.as_str() {
+                            "SizeZ" => z = value.parse().unwrap_or(1),
+                            "SizeC" => c = value.parse().unwrap_or(1),
+                            "SizeT" => t = value.parse().unwrap_or(1),
                             _ => {}
                         }
                     }
@@ -558,11 +556,10 @@ fn apply_biorad_lse_xml(
                     if count < image_count && count > 0 {
                         result.size_c = Some(image_count / count);
                     }
-                } else if matches!(name.as_ref(), b"Z" | b"C" | b"T") {
+                } else if matches!(name.as_ref(), "Z" | "C" | "T") {
                     for attr in e.attributes().flatten() {
-                        if attr.key.as_ref() == b"TimeCompleted" {
-                            if let Some(value) = crate::common::xml::decode_xml_attr(attr, decoder)
-                            {
+                        if attr.key.as_ref() == "TimeCompleted" {
+                            if let Some(value) = crate::common::xml::decode_xml_attr(attr) {
                                 push_global_meta_list(&mut result.global_meta, "Timestamp", value);
                             }
                         }

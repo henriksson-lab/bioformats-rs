@@ -1,8 +1,7 @@
-use quick_xml::encoding::Decoder;
 use quick_xml::events::{attributes::Attribute, BytesRef, BytesText};
 
 pub fn decode_xml_text(text: &BytesText<'_>) -> Option<String> {
-    let decoded = text.xml_content(quick_xml::XmlVersion::Implicit1_0).ok()?;
+    let decoded = text.xml_content(quick_xml::XmlVersion::Implicit1_0);
     Some(
         quick_xml::escape::unescape(decoded.as_ref())
             .map(|value| value.into_owned())
@@ -11,9 +10,7 @@ pub fn decode_xml_text(text: &BytesText<'_>) -> Option<String> {
 }
 
 pub fn decode_xml_ref(reference: &BytesRef<'_>) -> Option<String> {
-    let name = reference
-        .xml_content(quick_xml::XmlVersion::Implicit1_0)
-        .ok()?;
+    let name = reference.xml_content(quick_xml::XmlVersion::Implicit1_0);
     let decoded = match name.as_ref() {
         "amp" => "&".into(),
         "lt" => "<".into(),
@@ -34,8 +31,8 @@ pub fn decode_xml_ref(reference: &BytesRef<'_>) -> Option<String> {
     Some(decoded)
 }
 
-pub fn decode_xml_attr(attr: Attribute<'_>, decoder: Decoder) -> Option<String> {
-    attr.decoded_and_normalized_value(quick_xml::XmlVersion::Implicit1_0, decoder)
+pub fn decode_xml_attr(attr: Attribute<'_>) -> Option<String> {
+    attr.normalized_value(quick_xml::XmlVersion::Implicit1_0)
         .ok()
         .map(|value| value.into_owned())
 }
@@ -77,13 +74,12 @@ mod tests {
     fn attributes_are_decoded_and_normalized() {
         let mut reader =
             quick_xml::Reader::from_str(r#"<x filename="Ada &amp; Co.tif" unit="&#181;m"/>"#);
-        let decoder = reader.decoder();
         match reader.read_event() {
             Ok(Event::Empty(e)) => {
                 let attrs: Vec<_> = e
                     .attributes()
                     .flatten()
-                    .filter_map(|attr| super::decode_xml_attr(attr, decoder))
+                    .filter_map(super::decode_xml_attr)
                     .collect();
                 assert_eq!(attrs, ["Ada & Co.tif", "\u{b5}m"]);
             }

@@ -4563,7 +4563,10 @@ impl SlideBook7Reader {
                         "SlideBook 7 compressed .sldyz archive entry error: {e}"
                     ))
                 })?;
-                let name = entry.name().to_string();
+                let name = entry
+                    .name()
+                    .map_err(|e| BioFormatsError::Format(e.to_string()))?
+                    .into_owned();
                 let rel_path = slidebook7_safe_archive_entry(&name).ok_or_else(|| {
                     BioFormatsError::UnsupportedFormat(format!(
                         "SlideBook 7 compressed .sldyz archive has unsafe entry path: {name}"
@@ -6819,9 +6822,8 @@ fn ivision_parse_acquisition_metadata(xml: &str) -> IvisionAcquisitionMetadata {
                     .push_str(&crate::common::xml::decode_xml_ref(&reference).unwrap_or_default());
             }
             Ok(quick_xml::events::Event::CData(cdata)) => {
-                if let Ok(value) = cdata.xml_content(quick_xml::XmlVersion::Implicit1_0) {
-                    current_text.push_str(&value);
-                }
+                let value = cdata.xml_content(quick_xml::XmlVersion::Implicit1_0);
+                current_text.push_str(&value);
             }
             Ok(quick_xml::events::Event::End(_)) => {
                 let value = current_text.trim();
@@ -7055,7 +7057,6 @@ fn ivision_flatten_xml_metadata(xml: &str, meta: &mut ImageMetadata) -> usize {
                 );
                 stack.push(ivision_xml_component_name(element.name().as_ref()));
                 inserted += ivision_flatten_xml_attrs(
-                    &reader,
                     &stack,
                     element.attributes(),
                     meta,
@@ -7074,7 +7075,6 @@ fn ivision_flatten_xml_metadata(xml: &str, meta: &mut ImageMetadata) -> usize {
                 );
                 stack.push(ivision_xml_component_name(element.name().as_ref()));
                 inserted += ivision_flatten_xml_attrs(
-                    &reader,
                     &stack,
                     element.attributes(),
                     meta,
@@ -7094,9 +7094,8 @@ fn ivision_flatten_xml_metadata(xml: &str, meta: &mut ImageMetadata) -> usize {
                 }
             }
             Ok(quick_xml::events::Event::CData(cdata)) => {
-                if let Ok(value) = cdata.xml_content(quick_xml::XmlVersion::Implicit1_0) {
-                    current_text.push_str(&value);
-                }
+                let value = cdata.xml_content(quick_xml::XmlVersion::Implicit1_0);
+                current_text.push_str(&value);
             }
             Ok(quick_xml::events::Event::End(_)) => {
                 ivision_flush_xml_text(
@@ -7155,7 +7154,6 @@ fn ivision_flush_xml_text(
 
 #[cfg(feature = "gpl")]
 fn ivision_flatten_xml_attrs<'a>(
-    reader: &quick_xml::Reader<&[u8]>,
     stack: &[String],
     attrs: quick_xml::events::attributes::Attributes<'a>,
     meta: &mut ImageMetadata,
@@ -7171,9 +7169,7 @@ fn ivision_flatten_xml_attrs<'a>(
         if name.is_empty() {
             continue;
         }
-        let Ok(value) =
-            attr.decoded_and_normalized_value(quick_xml::XmlVersion::Implicit1_0, reader.decoder())
-        else {
+        let Ok(value) = attr.normalized_value(quick_xml::XmlVersion::Implicit1_0) else {
             continue;
         };
         let value = value.trim();
@@ -7188,9 +7184,10 @@ fn ivision_flatten_xml_attrs<'a>(
 }
 
 #[cfg(feature = "gpl")]
-fn ivision_xml_component_name(name: &[u8]) -> String {
-    let local = name.split(|byte| *byte == b':').next_back().unwrap_or(name);
-    String::from_utf8_lossy(local)
+fn ivision_xml_component_name(name: &str) -> String {
+    name.rsplit_once(':')
+        .map(|(_, local)| local)
+        .unwrap_or(name)
         .chars()
         .filter(|ch| ch.is_ascii_alphanumeric())
         .collect()
@@ -12390,9 +12387,8 @@ fn oir_xml_text(xml: &str, local: &str) -> Option<String> {
                 }
             }
             Ok(Event::CData(c)) if capture && depth_match > 0 => {
-                if let Ok(s) = c.xml_content(quick_xml::XmlVersion::Implicit1_0) {
-                    text.push_str(&s);
-                }
+                let s = c.xml_content(quick_xml::XmlVersion::Implicit1_0);
+                text.push_str(&s);
             }
             Ok(Event::End(e)) => {
                 if local_name_matches(e.name().as_ref(), local) && capture {
@@ -12408,13 +12404,12 @@ fn oir_xml_text(xml: &str, local: &str) -> Option<String> {
 }
 
 #[cfg(feature = "gpl")]
-fn local_name_matches(qname: &[u8], local: &str) -> bool {
-    let after_colon = qname
-        .iter()
-        .rposition(|&b| b == b':')
-        .map(|i| &qname[i + 1..])
-        .unwrap_or(qname);
-    after_colon == local.as_bytes()
+fn local_name_matches(qname: &str, local: &str) -> bool {
+    qname
+        .rsplit_once(':')
+        .map(|(_, value)| value)
+        .unwrap_or(qname)
+        == local
 }
 
 /// Parse a native `OLYMPUSRAWFORMAT` OIR file (and any companion files) into
@@ -12788,61 +12783,61 @@ fn oir_collect_instrument_xml(
                 let qname = e.name();
                 let name = qname.as_ref();
                 match name {
-                    b"commonimage:laser" => {
+                    "commonimage:laser" => {
                         current_laser = Some(OirLaser::default());
                         active_text_for = None;
                         active_text.clear();
                     }
-                    b"lsmparam:pmt" => {
+                    "lsmparam:pmt" => {
                         current_detector = Some(OirDetector {
-                            id: oir_xml_attr_value(&e, b"detectorId"),
+                            id: oir_xml_attr_value(&e, "detectorId"),
                             ..Default::default()
                         });
                         active_text_for = None;
                         active_text.clear();
                     }
-                    b"commonimage:objectiveLens" => {
+                    "commonimage:objectiveLens" => {
                         current_objective = Some(OirObjective::default());
                         active_text_for = None;
                         active_text.clear();
                     }
-                    b"commonimage:id" if current_laser.is_some() => {
+                    "commonimage:id" if current_laser.is_some() => {
                         active_text_for = Some("laser_id");
                         active_text.clear();
                     }
-                    b"commonimage:name" if current_laser.is_some() => {
+                    "commonimage:name" if current_laser.is_some() => {
                         active_text_for = Some("laser_name");
                         active_text.clear();
                     }
-                    b"lsmparam:voltage" if current_detector.is_some() => {
+                    "lsmparam:voltage" if current_detector.is_some() => {
                         active_text_for = Some("detector_voltage");
                         active_text.clear();
                     }
-                    b"lsmparam:offset" if current_detector.is_some() => {
+                    "lsmparam:offset" if current_detector.is_some() => {
                         active_text_for = Some("detector_offset");
                         active_text.clear();
                     }
-                    b"lsmparam:gain" if current_detector.is_some() => {
+                    "lsmparam:gain" if current_detector.is_some() => {
                         active_text_for = Some("detector_gain");
                         active_text.clear();
                     }
-                    b"opticalelement:displayName" if current_objective.is_some() => {
+                    "opticalelement:displayName" if current_objective.is_some() => {
                         active_text_for = Some("objective_name");
                         active_text.clear();
                     }
-                    b"opticalelement:magnification" if current_objective.is_some() => {
+                    "opticalelement:magnification" if current_objective.is_some() => {
                         active_text_for = Some("objective_magnification");
                         active_text.clear();
                     }
-                    b"opticalelement:naValue" if current_objective.is_some() => {
+                    "opticalelement:naValue" if current_objective.is_some() => {
                         active_text_for = Some("objective_na");
                         active_text.clear();
                     }
-                    b"opticalelement:wdValue" if current_objective.is_some() => {
+                    "opticalelement:wdValue" if current_objective.is_some() => {
                         active_text_for = Some("objective_wd");
                         active_text.clear();
                     }
-                    b"opticalelement:immersion" if current_objective.is_some() => {
+                    "opticalelement:immersion" if current_objective.is_some() => {
                         active_text_for = Some("objective_immersion");
                         active_text.clear();
                     }
@@ -12853,11 +12848,11 @@ fn oir_collect_instrument_xml(
                 }
             }
             Ok(Event::Empty(e)) => {
-                if e.name().as_ref() == b"lsmparam:pmt" {
+                if e.name().as_ref() == "lsmparam:pmt" {
                     oir_push_unique_detector(
                         detectors,
                         OirDetector {
-                            id: oir_xml_attr_value(&e, b"detectorId"),
+                            id: oir_xml_attr_value(&e, "detectorId"),
                             ..Default::default()
                         },
                     );
@@ -12879,60 +12874,59 @@ fn oir_collect_instrument_xml(
             }
             Ok(Event::CData(t)) => {
                 if active_text_for.is_some() {
-                    if let Ok(s) = t.xml_content(quick_xml::XmlVersion::Implicit1_0) {
-                        active_text.push_str(&s);
-                    }
+                    let s = t.xml_content(quick_xml::XmlVersion::Implicit1_0);
+                    active_text.push_str(&s);
                 }
             }
             Ok(Event::End(e)) => {
                 let text = active_text.trim();
                 match (e.name().as_ref(), active_text_for) {
-                    (b"commonimage:id", Some("laser_id")) => {
+                    ("commonimage:id", Some("laser_id")) => {
                         if let Some(laser) = current_laser.as_mut() {
                             laser.id = (!text.is_empty()).then(|| text.to_string());
                         }
                     }
-                    (b"commonimage:name", Some("laser_name")) => {
+                    ("commonimage:name", Some("laser_name")) => {
                         if let Some(laser) = current_laser.as_mut() {
                             laser.name = (!text.is_empty()).then(|| text.to_string());
                         }
                     }
-                    (b"lsmparam:voltage", Some("detector_voltage")) => {
+                    ("lsmparam:voltage", Some("detector_voltage")) => {
                         if let Some(detector) = current_detector.as_mut() {
                             detector.voltage = text.parse::<f64>().ok();
                         }
                     }
-                    (b"lsmparam:offset", Some("detector_offset")) => {
+                    ("lsmparam:offset", Some("detector_offset")) => {
                         if let Some(detector) = current_detector.as_mut() {
                             detector.offset = text.parse::<f64>().ok();
                         }
                     }
-                    (b"lsmparam:gain", Some("detector_gain")) => {
+                    ("lsmparam:gain", Some("detector_gain")) => {
                         if let Some(detector) = current_detector.as_mut() {
                             detector.gain = text.parse::<f64>().ok();
                         }
                     }
-                    (b"opticalelement:displayName", Some("objective_name")) => {
+                    ("opticalelement:displayName", Some("objective_name")) => {
                         if let Some(objective) = current_objective.as_mut() {
                             objective.name = (!text.is_empty()).then(|| text.to_string());
                         }
                     }
-                    (b"opticalelement:magnification", Some("objective_magnification")) => {
+                    ("opticalelement:magnification", Some("objective_magnification")) => {
                         if let Some(objective) = current_objective.as_mut() {
                             objective.magnification = text.parse::<f64>().ok();
                         }
                     }
-                    (b"opticalelement:naValue", Some("objective_na")) => {
+                    ("opticalelement:naValue", Some("objective_na")) => {
                         if let Some(objective) = current_objective.as_mut() {
                             objective.na = text.parse::<f64>().ok();
                         }
                     }
-                    (b"opticalelement:wdValue", Some("objective_wd")) => {
+                    ("opticalelement:wdValue", Some("objective_wd")) => {
                         if let Some(objective) = current_objective.as_mut() {
                             objective.wd = text.parse::<f64>().ok();
                         }
                     }
-                    (b"opticalelement:immersion", Some("objective_immersion")) => {
+                    ("opticalelement:immersion", Some("objective_immersion")) => {
                         if let Some(objective) = current_objective.as_mut() {
                             objective.immersion = (!text.is_empty()).then(|| text.to_string());
                         }
@@ -12941,17 +12935,17 @@ fn oir_collect_instrument_xml(
                 }
 
                 match e.name().as_ref() {
-                    b"commonimage:laser" => {
+                    "commonimage:laser" => {
                         if let Some(laser) = current_laser.take() {
                             oir_push_unique_laser(lasers, laser);
                         }
                     }
-                    b"lsmparam:pmt" => {
+                    "lsmparam:pmt" => {
                         if let Some(detector) = current_detector.take() {
                             oir_push_unique_detector(detectors, detector);
                         }
                     }
-                    b"commonimage:objectiveLens" => {
+                    "commonimage:objectiveLens" => {
                         if let Some(objective) = current_objective.take() {
                             oir_push_unique_objective(objectives, objective);
                         }
@@ -13167,9 +13161,8 @@ fn oir_apply_axes(xml: &str, meta: &mut ImageMetadata) {
             }
             Ok(Event::CData(t)) => {
                 if active_text_for.is_some() {
-                    if let Ok(s) = t.xml_content(quick_xml::XmlVersion::Implicit1_0) {
-                        active_text.push_str(&s);
-                    }
+                    let s = t.xml_content(quick_xml::XmlVersion::Implicit1_0);
+                    active_text.push_str(&s);
                 }
             }
             Ok(Event::End(e)) => {
@@ -13248,13 +13241,11 @@ fn oir_dimension_order(
 }
 
 #[cfg(feature = "gpl")]
-fn local_of(qname: &[u8]) -> &str {
-    let after = qname
-        .iter()
-        .rposition(|&b| b == b':')
-        .map(|i| &qname[i + 1..])
-        .unwrap_or(qname);
-    std::str::from_utf8(after).unwrap_or("")
+fn local_of(qname: &str) -> &str {
+    qname
+        .rsplit_once(':')
+        .map(|(_, local)| local)
+        .unwrap_or(qname)
 }
 
 #[cfg(feature = "gpl")]
@@ -13265,7 +13256,7 @@ struct OirPendingChannel {
 }
 
 #[cfg(feature = "gpl")]
-fn oir_xml_attr_value(e: &quick_xml::events::BytesStart<'_>, name: &[u8]) -> Option<String> {
+fn oir_xml_attr_value(e: &quick_xml::events::BytesStart<'_>, name: &str) -> Option<String> {
     e.attributes().flatten().find_map(|a| {
         if a.key.as_ref() == name {
             a.normalized_value(quick_xml::XmlVersion::Implicit1_0)
@@ -13279,7 +13270,7 @@ fn oir_xml_attr_value(e: &quick_xml::events::BytesStart<'_>, name: &[u8]) -> Opt
 
 #[cfg(feature = "gpl")]
 fn oir_xml_order_attr(e: &quick_xml::events::BytesStart<'_>) -> Option<usize> {
-    oir_xml_attr_value(e, b"order").and_then(|v| v.parse::<usize>().ok()?.checked_sub(1))
+    oir_xml_attr_value(e, "order").and_then(|v| v.parse::<usize>().ok()?.checked_sub(1))
 }
 
 #[cfg(feature = "gpl")]
@@ -13319,7 +13310,7 @@ fn oir_apply_channels(xml: &str, channel_ids: &mut Vec<String>) {
                 let local = local_of(name.as_ref());
                 if local == "channel" {
                     pending.push(OirPendingChannel {
-                        id: oir_xml_attr_value(e, b"id").unwrap_or_default(),
+                        id: oir_xml_attr_value(e, "id").unwrap_or_default(),
                         index: oir_xml_order_attr(e),
                         has_element_channels: false,
                     });
@@ -13330,10 +13321,10 @@ fn oir_apply_channels(xml: &str, channel_ids: &mut Vec<String>) {
                         let index = parent
                             .index
                             .and_then(|parent_index| component_index.map(|c| parent_index * 3 + c));
-                        if let Some(id) = oir_xml_attr_value(e, b"id") {
+                        if let Some(id) = oir_xml_attr_value(e, "id") {
                             oir_insert_channel_id(&mut slots, index, id);
                         }
-                    } else if let Some(id) = oir_xml_attr_value(e, b"id") {
+                    } else if let Some(id) = oir_xml_attr_value(e, "id") {
                         oir_insert_channel_id(&mut slots, oir_xml_order_attr(e), id);
                     }
                 }
@@ -13342,7 +13333,7 @@ fn oir_apply_channels(xml: &str, channel_ids: &mut Vec<String>) {
                 let name = e.name();
                 let local = local_of(name.as_ref());
                 if local == "channel" {
-                    if let Some(id) = oir_xml_attr_value(e, b"id") {
+                    if let Some(id) = oir_xml_attr_value(e, "id") {
                         oir_insert_channel_id(&mut slots, oir_xml_order_attr(e), id);
                     }
                 } else if local == "elementChannel" {
@@ -13352,10 +13343,10 @@ fn oir_apply_channels(xml: &str, channel_ids: &mut Vec<String>) {
                         let index = parent
                             .index
                             .and_then(|parent_index| component_index.map(|c| parent_index * 3 + c));
-                        if let Some(id) = oir_xml_attr_value(e, b"id") {
+                        if let Some(id) = oir_xml_attr_value(e, "id") {
                             oir_insert_channel_id(&mut slots, index, id);
                         }
-                    } else if let Some(id) = oir_xml_attr_value(e, b"id") {
+                    } else if let Some(id) = oir_xml_attr_value(e, "id") {
                         oir_insert_channel_id(&mut slots, oir_xml_order_attr(e), id);
                     }
                 }

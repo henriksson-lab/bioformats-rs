@@ -1093,7 +1093,7 @@ mod imp {
                 let mut z = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
                 for i in 0..z.len() {
                     let mut ze = z.by_index(i).map_err(|e| e.to_string())?;
-                    let name = ze.name().to_string();
+                    let name = ze.name().map_err(|e| e.to_string())?.into_owned();
                     if name == "xl/sharedStrings.xml" || name == "xl/worksheets/sheet1.xml" {
                         let mut b = Vec::new();
                         std::io::Read::read_to_end(&mut ze, &mut b).map_err(|e| e.to_string())?;

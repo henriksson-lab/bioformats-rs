@@ -706,9 +706,8 @@ fn decode_psd_icc_profile(
     }
 }
 
-fn psd_xmp_name(name: &[u8]) -> String {
-    String::from_utf8_lossy(name)
-        .chars()
+fn psd_xmp_name(name: &str) -> String {
+    name.chars()
         .map(|ch| {
             if ch.is_ascii_alphanumeric() {
                 ch
@@ -828,10 +827,8 @@ fn decode_psd_xmp_metadata(
                     {
                         continue;
                     }
-                    let Ok(value) = attr.decoded_and_normalized_value(
-                        quick_xml::XmlVersion::Implicit1_0,
-                        reader.decoder(),
-                    ) else {
+                    let Ok(value) = attr.normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                    else {
                         continue;
                     };
                     psd_xmp_insert_scalar(metadata, &key, value.as_ref(), &mut inserted);
@@ -855,10 +852,8 @@ fn decode_psd_xmp_metadata(
                     {
                         continue;
                     }
-                    let Ok(value) = attr.decoded_and_normalized_value(
-                        quick_xml::XmlVersion::Implicit1_0,
-                        reader.decoder(),
-                    ) else {
+                    let Ok(value) = attr.normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                    else {
                         continue;
                     };
                     psd_xmp_insert_scalar(metadata, &key, value.as_ref(), &mut inserted);
