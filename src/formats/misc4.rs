@@ -6079,22 +6079,21 @@ fn obf_apply_description_metadata(
                     let value = t.xml_content(quick_xml::XmlVersion::Implicit1_0);
                     let value = value.trim();
                     if !value.is_empty() {
-                            let parent = if matches!(
-                                stack.get(stack.len().saturating_sub(2)).map(String::as_str),
-                                Some("doc") | Some("hwr")
-                            ) && stack.len() >= 4
-                            {
-                                &stack[stack.len() - 3]
-                            } else {
-                                &stack[stack.len() - 2]
-                            };
-                            let leaf = &stack[stack.len() - 1];
-                            if leaf != "doc" && leaf != "hwr" {
-                                metadata.insert(
-                                    format!("{parent} {leaf}"),
-                                    MetadataValue::String(value.to_string()),
-                                );
-                            }
+                        let parent = if matches!(
+                            stack.get(stack.len().saturating_sub(2)).map(String::as_str),
+                            Some("doc") | Some("hwr")
+                        ) && stack.len() >= 4
+                        {
+                            &stack[stack.len() - 3]
+                        } else {
+                            &stack[stack.len() - 2]
+                        };
+                        let leaf = &stack[stack.len() - 1];
+                        if leaf != "doc" && leaf != "hwr" {
+                            metadata.insert(
+                                format!("{parent} {leaf}"),
+                                MetadataValue::String(value.to_string()),
+                            );
                         }
                     }
                 }
