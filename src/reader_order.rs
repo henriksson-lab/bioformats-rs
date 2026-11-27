@@ -1572,4 +1572,12 @@ fn append_rust_extra_readers(readers: &mut Vec<Box<dyn FormatReader>>) {
     readers.push(Box::new(
         crate::formats::gpl::bruker::MicroCtVffReader::new(),
     ));
+    #[cfg(feature = "gpl")]
+    readers.push(Box::new(
+        crate::formats::gpl::camera2::PcoB16Reader::new(),
+    ));
+    #[cfg(feature = "gpl")]
+    readers.push(Box::new(
+        crate::formats::gpl::norpix::NorpixReader::new(),
+    ));
 }

@@ -73,8 +73,9 @@ impl FormatReader for InrReader {
         let mut size_z: u32 = 1;
         let mut size_t: u32 = 1;
         let mut bpp: Option<u32> = None;
-        // Java: isSigned = TYPE.toLowerCase().startsWith("signed")
         let mut is_signed = false;
+        let mut is_float = false;
+        let mut is_little_endian = false;
         let mut physical_size_x: Option<f64> = None;
         let mut physical_size_y: Option<f64> = None;
         let mut physical_size_z: Option<f64> = None;
@@ -115,9 +116,13 @@ impl FormatReader for InrReader {
                         }
                     }
                     "TYPE" => {
-                        // Java INRReader.java:127-129:
-                        //   isSigned = value.toLowerCase().startsWith("signed")
-                        is_signed = val.to_ascii_lowercase().starts_with("signed");
+                        let lower = val.to_ascii_lowercase();
+                        is_signed = lower.starts_with("signed");
+                        is_float = lower.starts_with("float");
+                    }
+                    "CPU" => {
+                        let lower = val.to_ascii_lowercase();
+                        is_little_endian = matches!(lower.as_str(), "decm" | "pc" | "alpha");
                     }
                     "VX" => {
                         physical_size_x = val.parse::<f64>().ok();
@@ -142,17 +147,13 @@ impl FormatReader for InrReader {
         let bpp = bpp.ok_or_else(|| {
             BioFormatsError::UnsupportedFormat("INR header missing PIXSIZE".into())
         })?;
-        // Java INRReader.java:158-159:
-        //   pixelType = FormatTools.pixelTypeFromBytes(nBits / 8, isSigned, false)
-        // Map purely by byte width; signed-ness chosen by `is_signed`. There is
-        // no floating-point branch in Java for INR (fp is always false), so an
-        // 8-byte sample maps to DOUBLE (Float64).
         let bytes = bpp / 8;
         let pixel_type = match bytes {
             1 if is_signed => PixelType::Int8,
             1 => PixelType::Uint8,
             2 if is_signed => PixelType::Int16,
             2 => PixelType::Uint16,
+            4 if is_float => PixelType::Float32,
             4 if is_signed => PixelType::Int32,
             4 => PixelType::Uint32,
             8 => PixelType::Float64,
@@ -215,7 +216,7 @@ impl FormatReader for InrReader {
             is_rgb: false,
             is_interleaved: false,
             is_indexed: false,
-            is_little_endian: false,
+            is_little_endian,
             resolution_count: 1,
             thumbnail: false,
             series_metadata,
@@ -2658,21 +2659,43 @@ impl<'a> ImodCursor<'a> {
     }
 }
 
+/// One parsed IMOD contour (`CONT` chunk).
+struct ImodContour {
+    closed: bool,
+    scattered: bool,
+    points: Vec<[f32; 3]>,
+}
+
+/// One parsed IMOD mesh (`MESH` chunk).
+struct ImodMesh {
+    vertices: Vec<[f32; 3]>,
+    indices: Vec<i32>,
+}
+
+/// One parsed IMOD object (`OBJT` chunk) with its RGB colour, contours, and meshes.
+struct ImodObject {
+    color: [u8; 3],
+    contours: Vec<ImodContour>,
+    meshes: Vec<ImodMesh>,
+}
+
 /// Reader for IMOD binary model files (`.mod`).
 ///
 /// Faithful port of Java Bio-Formats' `IMODReader`. It parses the IMOD binary
 /// model header (magic `IMODV1.2`, big-endian) and walks the object / contour /
-/// mesh structure to validate the file and collect global metadata. As in the
-/// Java reader, the contour rasterization in `openBytes` is disabled, so the
-/// produced RGB planes are blank (zero-filled): IMOD stores a vector model, not
-/// a raster image.
+/// mesh structure to validate the file, collect global metadata, and rasterize
+/// contour/mesh segments onto the corresponding Z slices in `open_bytes`.
 pub struct ImodReader {
     meta: Option<ImageMetadata>,
+    objects: Vec<ImodObject>,
 }
 
 impl ImodReader {
     pub fn new() -> Self {
-        ImodReader { meta: None }
+        ImodReader {
+            meta: None,
+            objects: Vec::new(),
+        }
     }
 }
 
@@ -2682,9 +2705,226 @@ impl Default for ImodReader {
     }
 }
 
+fn imod_put_pixel(buf: &mut [u8], width: u32, height: u32, x: i64, y: i64, color: [u8; 3]) {
+    if x >= 0 && x < i64::from(width) && y >= 0 && y < i64::from(height) {
+        let off = (y as usize * width as usize + x as usize) * 3;
+        buf[off..off + 3].copy_from_slice(&color);
+    }
+}
+
+fn imod_draw_line(
+    buf: &mut [u8],
+    width: u32,
+    height: u32,
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    color: [u8; 3],
+) {
+    if !x0.is_finite() || !y0.is_finite() || !x1.is_finite() || !y1.is_finite() {
+        return;
+    }
+    let min_x = x0.min(x1);
+    let max_x = x0.max(x1);
+    let min_y = y0.min(y1);
+    let max_y = y0.max(y1);
+    if max_x < -0.5 || min_x >= width as f32 + 0.5 || max_y < -0.5 || min_y >= height as f32 + 0.5 {
+        return;
+    }
+    let x0_i = x0.round().clamp(-1.0, width as f32) as i64;
+    let y0_i = y0.round().clamp(-1.0, height as f32) as i64;
+    let x1_i = x1.round().clamp(-1.0, width as f32) as i64;
+    let y1_i = y1.round().clamp(-1.0, height as f32) as i64;
+
+    let dx = (x1_i - x0_i).abs();
+    let sx = if x0_i < x1_i { 1 } else { -1 };
+    let dy = -(y1_i - y0_i).abs();
+    let sy = if y0_i < y1_i { 1 } else { -1 };
+    let mut err = dx + dy;
+    let mut cx = x0_i;
+    let mut cy = y0_i;
+    let max_steps = (dx - dy + 1) as usize;
+    for _ in 0..max_steps {
+        imod_put_pixel(buf, width, height, cx, cy, color);
+        if cx == x1_i && cy == y1_i {
+            break;
+        }
+        let e2 = 2 * err;
+        if e2 >= dy {
+            err += dy;
+            cx += sx;
+        }
+        if e2 <= dx {
+            err += dx;
+            cy += sy;
+        }
+    }
+}
+
+fn imod_draw_segment_at_z(
+    buf: &mut [u8],
+    width: u32,
+    height: u32,
+    p0: [f32; 3],
+    p1: [f32; 3],
+    target_z: i64,
+    z_f: f32,
+    color: [u8; 3],
+) {
+    if !p0.iter().all(|v| v.is_finite()) || !p1.iter().all(|v| v.is_finite()) {
+        return;
+    }
+    let z0 = p0[2].round() as i64;
+    let z1 = p1[2].round() as i64;
+    if z0 == target_z && z1 == target_z {
+        imod_draw_line(buf, width, height, p0[0], p0[1], p1[0], p1[1], color);
+    } else if (p0[2] - z_f) * (p1[2] - z_f) <= 0.0 && (p1[2] - p0[2]).abs() > 1e-6 {
+        let t = (z_f - p0[2]) / (p1[2] - p0[2]);
+        let ix = p0[0] + t * (p1[0] - p0[0]);
+        let iy = p0[1] + t * (p1[1] - p0[1]);
+        imod_put_pixel(buf, width, height, ix.round() as i64, iy.round() as i64, color);
+    }
+}
+
+fn imod_slice_triangle_at_z(
+    buf: &mut [u8],
+    width: u32,
+    height: u32,
+    a: [f32; 3],
+    b: [f32; 3],
+    c: [f32; 3],
+    target_z: i64,
+    z_f: f32,
+    color: [u8; 3],
+) {
+    if !a.iter().chain(b.iter()).chain(c.iter()).all(|v| v.is_finite()) {
+        return;
+    }
+    if a[2].round() as i64 == target_z
+        && b[2].round() as i64 == target_z
+        && c[2].round() as i64 == target_z
+    {
+        imod_draw_line(buf, width, height, a[0], a[1], b[0], b[1], color);
+        imod_draw_line(buf, width, height, b[0], b[1], c[0], c[1], color);
+        imod_draw_line(buf, width, height, c[0], c[1], a[0], a[1], color);
+        return;
+    }
+    let mut hits = [[0.0f32; 2]; 3];
+    let mut count = 0usize;
+    for (u, v) in [(a, b), (b, c), (c, a)] {
+        let du = u[2] - z_f;
+        let dv = v[2] - z_f;
+        if (du <= 0.0 && dv >= 0.0) || (du >= 0.0 && dv <= 0.0) {
+            let dz = v[2] - u[2];
+            if dz.abs() > 1e-6 {
+                let t = (z_f - u[2]) / dz;
+                hits[count] = [u[0] + t * (v[0] - u[0]), u[1] + t * (v[1] - u[1])];
+                count += 1;
+            }
+        }
+    }
+    if count >= 2 {
+        imod_draw_line(
+            buf,
+            width,
+            height,
+            hits[0][0],
+            hits[0][1],
+            hits[1][0],
+            hits[1][1],
+            color,
+        );
+    }
+}
+
+fn imod_rasterize_mesh_at_z(
+    buf: &mut [u8],
+    width: u32,
+    height: u32,
+    mesh: &ImodMesh,
+    target_z: i64,
+    z_f: f32,
+    color: [u8; 3],
+) {
+    const IMOD_MESH_BGNBIGPOLY: i32 = -21;
+    const IMOD_MESH_ENDPOLY: i32 = -22;
+    const IMOD_MESH_NORMAL: i32 = -23;
+    const IMOD_MESH_BGNPOLY: i32 = -25;
+    const IMOD_MESH_END: i32 = -1;
+
+    let mut i = 0usize;
+    while i < mesh.indices.len() {
+        let op = mesh.indices[i];
+        i += 1;
+        match op {
+            IMOD_MESH_BGNPOLY => {
+                let mut tri = Vec::with_capacity(3);
+                while i < mesh.indices.len() {
+                    let v = mesh.indices[i];
+                    if v < 0 {
+                        if v == IMOD_MESH_NORMAL {
+                            i += 2;
+                            continue;
+                        }
+                        if v == IMOD_MESH_ENDPOLY {
+                            i += 1;
+                        }
+                        break;
+                    }
+                    i += 1;
+                    tri.push(v as usize);
+                    if tri.len() == 3 {
+                        if let (Some(&a), Some(&b), Some(&c)) = (
+                            mesh.vertices.get(tri[0]),
+                            mesh.vertices.get(tri[1]),
+                            mesh.vertices.get(tri[2]),
+                        ) {
+                            imod_slice_triangle_at_z(buf, width, height, a, b, c, target_z, z_f, color);
+                        }
+                        tri.clear();
+                    }
+                }
+            }
+            IMOD_MESH_BGNBIGPOLY => {
+                let mut tri = Vec::with_capacity(3);
+                while i < mesh.indices.len() {
+                    let v = mesh.indices[i];
+                    if v < 0 {
+                        if v == IMOD_MESH_ENDPOLY {
+                            i += 1;
+                        }
+                        break;
+                    }
+                    // Each vertex in BGNBIGPOLY is preceded by its normal index.
+                    if i + 1 >= mesh.indices.len() || mesh.indices[i + 1] < 0 {
+                        i += 1;
+                        break;
+                    }
+                    let vert_idx = mesh.indices[i + 1] as usize;
+                    i += 2;
+                    tri.push(vert_idx);
+                    if tri.len() == 3 {
+                        if let (Some(&a), Some(&b), Some(&c)) = (
+                            mesh.vertices.get(tri[0]),
+                            mesh.vertices.get(tri[1]),
+                            mesh.vertices.get(tri[2]),
+                        ) {
+                            imod_slice_triangle_at_z(buf, width, height, a, b, c, target_z, z_f, color);
+                        }
+                        tri.clear();
+                    }
+                }
+            }
+            IMOD_MESH_END => break,
+            _ => {}
+        }
+    }
+}
+
 /// Parses the IMOD model header and walks objects/contours/meshes, mirroring
-/// `IMODReader.initFile`. Returns the populated [`ImageMetadata`].
-fn parse_imod(data: &[u8]) -> Result<ImageMetadata> {
+/// `IMODReader.initFile`. Returns the populated [`ImageMetadata`] and parsed objects.
+fn parse_imod(data: &[u8]) -> Result<(ImageMetadata, Vec<ImodObject>)> {
     let mut c = ImodCursor::new(data);
 
     let check = c.read_string(8);
@@ -2762,8 +3002,7 @@ fn parse_imod(data: &[u8]) -> Result<ImageMetadata> {
     put_f("Beta", beta as f64);
     put_f("Gamma", gamma as f64);
 
-    // Per-object colours, used by the (disabled) rasterizer in Java.
-    let mut colors: Vec<[u8; 3]> = Vec::with_capacity(n_objects as usize);
+    let mut objects: Vec<ImodObject> = Vec::with_capacity(n_objects as usize);
 
     'objects: for _obj in 0..n_objects {
         // Skip any inter-object chunks (e.g. IMAT) until the next OBJT.
@@ -2790,18 +3029,20 @@ fn parse_imod(data: &[u8]) -> Result<ImageMetadata> {
         c.skip(64)?; // unused
 
         let n_contours = c.read_i32()?;
-        let _obj_flags = c.read_i32()?;
+        let obj_flags = c.read_i32()?;
         let _axis = c.read_i32()?;
         let _obj_draw_mode = c.read_i32()?;
 
         let red = c.read_f32()?;
         let green = c.read_f32()?;
         let blue = c.read_f32()?;
-        colors.push([
-            (red * 255.0) as i32 as u8,
-            (green * 255.0) as i32 as u8,
-            (blue * 255.0) as i32 as u8,
-        ]);
+        let color = [
+            (red.clamp(0.0, 1.0) * 255.0).round() as u8,
+            (green.clamp(0.0, 1.0) * 255.0).round() as u8,
+            (blue.clamp(0.0, 1.0) * 255.0).round() as u8,
+        ];
+        let obj_open = (obj_flags & (1 << 3)) != 0;
+        let obj_scattered = (obj_flags & (1 << 4)) != 0;
 
         let _pixel_radius = c.read_i32()?;
         let _pixel_symbol = c.read_u8()?;
@@ -2822,11 +3063,12 @@ fn parse_imod(data: &[u8]) -> Result<ImageMetadata> {
             ));
         }
 
+        let mut contours = Vec::with_capacity(n_contours as usize);
         for _contour in 0..n_contours {
             c.skip(4)?; // CONT
 
             let mut n_points = c.read_i32()?;
-            let _contour_flags = c.read_i32()?;
+            let mut contour_flags = c.read_i32()?;
             let _time_index = c.read_i32()?;
             let _surface = c.read_i32()?;
 
@@ -2852,7 +3094,7 @@ fn parse_imod(data: &[u8]) -> Result<ImageMetadata> {
                     }
                 }
                 n_points = c.read_i32()?;
-                let _contour_flags = c.read_i32()?;
+                contour_flags = c.read_i32()?;
                 let _time_index = c.read_i32()?;
                 let _surface = c.read_i32()?;
             }
@@ -2866,7 +3108,22 @@ fn parse_imod(data: &[u8]) -> Result<ImageMetadata> {
             let bytes = (n_points as usize)
                 .checked_mul(12)
                 .ok_or_else(|| BioFormatsError::Format("IMOD contour size overflows".into()))?;
-            c.skip(bytes)?;
+            if c.pos() + bytes > c.len() {
+                return Err(ImodCursor::eof());
+            }
+            let mut points = Vec::with_capacity(n_points as usize);
+            for _ in 0..n_points {
+                let x = c.read_f32()?;
+                let y = c.read_f32()?;
+                let z = c.read_f32()?;
+                points.push([x, y, z]);
+            }
+            let contour_open = (contour_flags & (1 << 3)) != 0;
+            contours.push(ImodContour {
+                closed: !obj_open && !obj_scattered && !contour_open && n_points > 2,
+                scattered: obj_scattered,
+                points,
+            });
         }
 
         if n_meshes < 0 {
@@ -2874,6 +3131,7 @@ fn parse_imod(data: &[u8]) -> Result<ImageMetadata> {
                 "IMOD object declares a negative mesh count".into(),
             ));
         }
+        let mut meshes = Vec::with_capacity(n_meshes as usize);
         for _mesh in 0..n_meshes {
             c.skip(4)?; // MESH
             let vsize = c.read_i32()?;
@@ -2886,12 +3144,32 @@ fn parse_imod(data: &[u8]) -> Result<ImageMetadata> {
                     "IMOD mesh declares a negative size".into(),
                 ));
             }
-            let skip = (vsize as usize)
+            let needed = (vsize as usize)
                 .checked_mul(12)
                 .and_then(|v| v.checked_add((lsize as usize).checked_mul(4)?))
                 .ok_or_else(|| BioFormatsError::Format("IMOD mesh size overflows".into()))?;
-            c.skip(skip)?;
+            if c.pos() + needed > c.len() {
+                return Err(ImodCursor::eof());
+            }
+            let mut vertices = Vec::with_capacity(vsize as usize);
+            for _ in 0..vsize {
+                let x = c.read_f32()?;
+                let y = c.read_f32()?;
+                let z = c.read_f32()?;
+                vertices.push([x, y, z]);
+            }
+            let mut indices = Vec::with_capacity(lsize as usize);
+            for _ in 0..lsize {
+                indices.push(c.read_i32()?);
+            }
+            meshes.push(ImodMesh { vertices, indices });
         }
+
+        objects.push(ImodObject {
+            color,
+            contours,
+            meshes,
+        });
     }
 
     // Trailing chunks: pick up the physical pixel sizes from MINX.
@@ -2981,7 +3259,7 @@ fn parse_imod(data: &[u8]) -> Result<ImageMetadata> {
         ..ImageMetadata::default()
     };
 
-    Ok(meta)
+    Ok((meta, objects))
 }
 
 impl FormatReader for ImodReader {
@@ -3000,13 +3278,15 @@ impl FormatReader for ImodReader {
     fn set_id(&mut self, path: &Path) -> Result<()> {
         self.close()?;
         let data = std::fs::read(path).map_err(BioFormatsError::Io)?;
-        let meta = parse_imod(&data)?;
+        let (meta, objects) = parse_imod(&data)?;
         self.meta = Some(meta);
+        self.objects = objects;
         Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
         self.meta = None;
+        self.objects.clear();
         Ok(())
     }
 
@@ -3040,14 +3320,76 @@ impl FormatReader for ImodReader {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
 
-        // The Java reader's contour rasterization is commented out, so the
-        // returned RGB-interleaved plane is left blank (zero-filled).
         let n_bytes = (meta.size_x as usize)
             .checked_mul(meta.size_y as usize)
             .and_then(|n| n.checked_mul(meta.size_c as usize))
             .and_then(|n| n.checked_mul(meta.pixel_type.bytes_per_sample()))
             .ok_or_else(|| BioFormatsError::Format("IMOD plane size overflows".into()))?;
-        Ok(vec![0u8; n_bytes])
+        let mut buf = vec![0u8; n_bytes];
+        if meta.size_x == 0 || meta.size_y == 0 || self.objects.is_empty() {
+            return Ok(buf);
+        }
+
+        let target_z = i64::from(plane_index);
+        let z_f = plane_index as f32;
+        for obj in &self.objects {
+            for contour in &obj.contours {
+                if contour.points.is_empty() {
+                    continue;
+                }
+                if contour.scattered || contour.points.len() == 1 {
+                    for p in &contour.points {
+                        if p.iter().all(|v| v.is_finite()) && p[2].round() as i64 == target_z {
+                            imod_put_pixel(
+                                &mut buf,
+                                meta.size_x,
+                                meta.size_y,
+                                p[0].round() as i64,
+                                p[1].round() as i64,
+                                obj.color,
+                            );
+                        }
+                    }
+                } else {
+                    for w in contour.points.windows(2) {
+                        imod_draw_segment_at_z(
+                            &mut buf,
+                            meta.size_x,
+                            meta.size_y,
+                            w[0],
+                            w[1],
+                            target_z,
+                            z_f,
+                            obj.color,
+                        );
+                    }
+                    if contour.closed {
+                        imod_draw_segment_at_z(
+                            &mut buf,
+                            meta.size_x,
+                            meta.size_y,
+                            *contour.points.last().unwrap(),
+                            contour.points[0],
+                            target_z,
+                            z_f,
+                            obj.color,
+                        );
+                    }
+                }
+            }
+            for mesh in &obj.meshes {
+                imod_rasterize_mesh_at_z(
+                    &mut buf,
+                    meta.size_x,
+                    meta.size_y,
+                    mesh,
+                    target_z,
+                    z_f,
+                    obj.color,
+                );
+            }
+        }
+        Ok(buf)
     }
 
     fn open_bytes_region(
@@ -3146,22 +3488,26 @@ mod inr_tests {
     }
 
     #[test]
-    fn inr_cpu_header_does_not_change_java_core_endianness() {
+    fn inr_cpu_header_sets_endianness() {
         let tmp = std::env::temp_dir();
-        let body = "XDIM=1\nYDIM=1\nPIXSIZE=16 bits\nTYPE=unsigned fixed\nCPU=pc\n";
-        let path = write_inr(&tmp, "inr_cpu_endian_test.inr", body, &[0, 1]);
+        for (cpu, expected_le) in [("decm", true), ("pc", true), ("alpha", true), ("sun", false)] {
+            let body = format!("XDIM=1\nYDIM=1\nPIXSIZE=16 bits\nTYPE=unsigned fixed\nCPU={cpu}\n");
+            let name = format!("inr_cpu_endian_{cpu}.inr");
+            let path = write_inr(&tmp, &name, &body, &[0, 1]);
 
-        let mut r = InrReader::new();
-        r.set_id(&path).unwrap();
-        assert!(
-            !r.metadata().is_little_endian,
-            "Java INRReader leaves CoreMetadata.littleEndian at its default false value"
-        );
-        let _ = std::fs::remove_file(&path);
+            let mut r = InrReader::new();
+            r.set_id(&path).unwrap();
+            assert_eq!(
+                r.metadata().is_little_endian,
+                expected_le,
+                "CPU={cpu} should set is_little_endian={expected_le}"
+            );
+            let _ = std::fs::remove_file(&path);
+        }
     }
 
-    /// Pixel type derives from byte width + signed flag (Java line 158-159);
-    /// 8 bytes maps to Float64/DOUBLE, never a 32-bit Float branch.
+    /// Pixel type derives from TYPE + byte width: float 32-bit -> Float32,
+    /// float/8-byte -> Float64, fixed -> signed/unsigned Int/Uint.
     #[test]
     fn pixel_type_by_byte_width() {
         let tmp = std::env::temp_dir();
@@ -3173,8 +3519,7 @@ mod inr_tests {
             ("signed fixed", 32, PixelType::Int32),
             ("unsigned fixed", 32, PixelType::Uint32),
             ("float", 64, PixelType::Float64),
-            // 32-bit float has no Java-specific branch; width 4 unsigned -> Uint32
-            ("float", 32, PixelType::Uint32),
+            ("float", 32, PixelType::Float32),
         ];
         for (i, (ty, bits, expected)) in cases.iter().enumerate() {
             let body = format!("XDIM=1\nYDIM=1\nPIXSIZE={} bits\nTYPE={}\n", bits, ty);
@@ -3306,6 +3651,103 @@ mod inr_tests {
             !metadata.contains_key("Gain"),
             "LEO metadata without Java whitespace separator must be ignored"
         );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn imod_rasterizes_contours_and_meshes_into_rgb_slices() {
+        let mut out = Vec::new();
+        let put_i32 = |buf: &mut Vec<u8>, v: i32| buf.extend_from_slice(&v.to_be_bytes());
+        let put_f32 = |buf: &mut Vec<u8>, v: f32| buf.extend_from_slice(&v.to_be_bytes());
+
+        out.extend_from_slice(b"IMODV1.2");
+        out.extend_from_slice(&[0u8; 128]); // filename
+        put_i32(&mut out, 6); // sizeX
+        put_i32(&mut out, 6); // sizeY
+        put_i32(&mut out, 3); // sizeZ
+        put_i32(&mut out, 1); // nObjects
+        for _ in 0..5 {
+            put_i32(&mut out, 0);
+        }
+        for _ in 0..3 {
+            put_f32(&mut out, 0.0);
+        }
+        for _ in 0..3 {
+            put_f32(&mut out, 1.0);
+        }
+        for _ in 0..6 {
+            put_i32(&mut out, 0);
+        }
+        put_f32(&mut out, 1.0);
+        put_i32(&mut out, -6);
+        for _ in 0..4 {
+            put_i32(&mut out, 0);
+        }
+
+        // OBJT
+        out.extend_from_slice(b"OBJT");
+        out.extend_from_slice(&[0u8; 128]);
+        put_i32(&mut out, 1); // nContours
+        put_i32(&mut out, 0); // objFlags (closed)
+        put_i32(&mut out, 0);
+        put_i32(&mut out, 0);
+        put_f32(&mut out, 1.0);
+        put_f32(&mut out, 0.5);
+        put_f32(&mut out, 0.0);
+        put_i32(&mut out, 0);
+        out.extend_from_slice(&[0u8; 8]);
+        put_i32(&mut out, 1); // nMeshes
+        put_i32(&mut out, 0);
+
+        out.extend_from_slice(b"CONT");
+        put_i32(&mut out, 3);
+        put_i32(&mut out, 0);
+        put_i32(&mut out, 0);
+        put_i32(&mut out, 0);
+        for (x, y, z) in [(1.0f32, 1.0f32, 0.0f32), (4.0, 1.0, 0.0), (1.0, 4.0, 0.0)] {
+            put_f32(&mut out, x);
+            put_f32(&mut out, y);
+            put_f32(&mut out, z);
+        }
+
+        out.extend_from_slice(b"MESH");
+        put_i32(&mut out, 3);
+        put_i32(&mut out, 5);
+        put_i32(&mut out, 0);
+        out.extend_from_slice(&0i32.to_be_bytes());
+        for (x, y, z) in [(2.0f32, 3.0f32, 0.5f32), (4.0, 3.0, 0.5), (3.0, 3.0, 1.5)] {
+            put_f32(&mut out, x);
+            put_f32(&mut out, y);
+            put_f32(&mut out, z);
+        }
+        for idx in [-25i32, 0, 1, 2, -22] {
+            put_i32(&mut out, idx);
+        }
+
+        let path = std::env::temp_dir().join(format!(
+            "bioformats_imod_raster_{}.mod",
+            std::process::id()
+        ));
+        std::fs::write(&path, out).unwrap();
+
+        let mut reader = ImodReader::new();
+        reader.set_id(&path).unwrap();
+        let px = |buf: &[u8], x: usize, y: usize| -> [u8; 3] {
+            let o = (y * 6 + x) * 3;
+            [buf[o], buf[o + 1], buf[o + 2]]
+        };
+        let z0 = reader.open_bytes(0).unwrap();
+        assert_eq!(px(&z0, 1, 1), [255, 128, 0]);
+        assert_eq!(px(&z0, 3, 1), [255, 128, 0]);
+        assert_eq!(px(&z0, 1, 3), [255, 128, 0]);
+        assert_eq!(px(&z0, 0, 0), [0, 0, 0]);
+
+        let z1 = reader.open_bytes(1).unwrap();
+        assert_eq!(px(&z1, 3, 3), [255, 128, 0]);
+
+        let z2 = reader.open_bytes(2).unwrap();
+        assert!(z2.iter().all(|&b| b == 0));
 
         let _ = std::fs::remove_file(&path);
     }

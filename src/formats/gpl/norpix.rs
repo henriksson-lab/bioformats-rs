@@ -200,9 +200,13 @@ impl FormatReader for NorpixReader {
         if header.len() < 24 {
             return false;
         }
-        // Check description starts with "Norpix seq"
+        // Check ASCII description ("Norpix seq") or real StreamPix 0xFEED + UTF-16LE "Norpix seq"
         let desc = std::str::from_utf8(&header[..24]).unwrap_or("");
-        desc.starts_with("Norpix seq") || desc.starts_with("Norpix SEQ")
+        if desc.starts_with("Norpix seq") || desc.starts_with("Norpix SEQ") {
+            return true;
+        }
+        header.starts_with(&[0xed, 0xfe, 0x00, 0x00])
+            && header[4..24] == *b"N\0o\0r\0p\0i\0x\0 \0s\0e\0q\0"
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {

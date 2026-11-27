@@ -196,3 +196,79 @@ fn imod_rejects_truncated_header() {
     let err = reader.set_id(&path).unwrap_err();
     assert!(matches!(err, BioFormatsError::Format(_)), "{err:?}");
 }
+
+#[test]
+fn imod_rasterizes_contours_and_meshes_per_z_slice() {
+    let mut obj = Vec::new();
+    obj.extend_from_slice(b"OBJT");
+    obj.extend_from_slice(&[0u8; 64]); // object name
+    obj.extend_from_slice(&[0u8; 64]); // unused
+    put_i32(&mut obj, 1); // nContours
+    put_i32(&mut obj, 0); // objFlags (closed contour)
+    put_i32(&mut obj, 0); // axis
+    put_i32(&mut obj, 0); // objDrawMode
+    put_f32(&mut obj, 1.0); // red
+    put_f32(&mut obj, 0.5); // green
+    put_f32(&mut obj, 0.0); // blue
+    put_i32(&mut obj, 0); // pixelRadius
+    obj.extend_from_slice(&[0u8; 8]); // 8 single-byte fields
+    put_i32(&mut obj, 1); // nMeshes
+    put_i32(&mut obj, 0); // nSurfaces
+
+    // CONT on z = 0: triangle from (1,1) -> (4,1) -> (1,4)
+    obj.extend_from_slice(b"CONT");
+    put_i32(&mut obj, 3); // nPoints
+    put_i32(&mut obj, 0); // contourFlags
+    put_i32(&mut obj, 0); // timeIndex
+    put_i32(&mut obj, 0); // surface
+    for (x, y, z) in [(1.0f32, 1.0f32, 0.0f32), (4.0, 1.0, 0.0), (1.0, 4.0, 0.0)] {
+        put_f32(&mut obj, x);
+        put_f32(&mut obj, y);
+        put_f32(&mut obj, z);
+    }
+
+    // MESH sliced at z = 1: triangle spanning z=0.5..1.5 from x=2..4 at y=3
+    obj.extend_from_slice(b"MESH");
+    put_i32(&mut obj, 3); // vsize
+    put_i32(&mut obj, 5); // lsize: BGNPOLY (-25), 0, 1, 2, ENDPOLY (-22)
+    put_i32(&mut obj, 0); // meshFlags
+    obj.extend_from_slice(&0i16.to_be_bytes());
+    obj.extend_from_slice(&0i16.to_be_bytes());
+    for (x, y, z) in [(2.0f32, 3.0f32, 0.5f32), (4.0, 3.0, 0.5), (3.0, 3.0, 1.5)] {
+        put_f32(&mut obj, x);
+        put_f32(&mut obj, y);
+        put_f32(&mut obj, z);
+    }
+    for idx in [-25i32, 0, 1, 2, -22] {
+        put_i32(&mut obj, idx);
+    }
+
+    let data = imod_header(6, 6, 3, 1, &obj);
+    let path = tmp("rasterize.mod");
+    std::fs::write(&path, &data).unwrap();
+
+    let mut reader = ImodReader::new();
+    reader.set_id(&path).unwrap();
+
+    // Z = 0 has the contour in RGB [255, 128, 0]
+    let z0 = reader.open_bytes(0).unwrap();
+    let px = |buf: &[u8], x: usize, y: usize| -> [u8; 3] {
+        let o = (y * 6 + x) * 3;
+        [buf[o], buf[o + 1], buf[o + 2]]
+    };
+    assert_eq!(px(&z0, 1, 1), [255, 128, 0]);
+    assert_eq!(px(&z0, 3, 1), [255, 128, 0]);
+    assert_eq!(px(&z0, 1, 3), [255, 128, 0]);
+    assert_eq!(px(&z0, 0, 0), [0, 0, 0]);
+
+    // Z = 1 has the mesh cross-section at y = 3, x = 2.5..3.5 (pixels 3,3)
+    let z1 = reader.open_bytes(1).unwrap();
+    assert_eq!(px(&z1, 3, 3), [255, 128, 0]);
+    assert_eq!(px(&z1, 1, 1), [0, 0, 0]);
+
+    // Z = 2 has neither contour nor mesh intersection
+    let z2 = reader.open_bytes(2).unwrap();
+    assert!(z2.iter().all(|&b| b == 0));
+
+    let _ = std::fs::remove_file(&path);
+}

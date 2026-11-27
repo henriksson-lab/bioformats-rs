@@ -427,6 +427,11 @@ impl FormatReader for MrcReader {
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
+        // Never steal Leica LOF files, whose 0x70 / chunk-length / 0x2a prefix
+        // looks like small positive nx/ny/nz values.
+        if crate::formats::extended::LofReader::new().is_this_type_by_bytes(header) {
+            return false;
+        }
         // MRC2014: bytes 208-211 = "MAP " (with space)
         if header.len() >= 212 && &header[208..212] == b"MAP " {
             return true;

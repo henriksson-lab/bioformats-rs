@@ -15,7 +15,6 @@ use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
 use crate::common::region::crop_full_plane;
 
-const IMAGE_DATA: &str = "/ImageData/";
 const IMAGE_INFO: &str = "/ImageInfo/";
 const RECON_SETTINGS: &str = "/ReconSettings/";
 const AUTORECON: &str = "/AutoRecon/";
@@ -50,8 +49,7 @@ impl FormatReader for ZeissXrmReader {
             .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
-        // Java ZeissXRMReader registers only "txm" and "txrm".
-        matches!(ext.as_deref(), Some("txrm") | Some("txm"))
+        matches!(ext.as_deref(), Some("xrm") | Some("txrm") | Some("txm"))
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
@@ -182,7 +180,7 @@ fn parse_xrm(path: &Path) -> Result<(ImageMetadata, Vec<Option<String>>)> {
         .and_then(|e| e.to_str())
         .map(|e| e.to_ascii_lowercase());
     let is_txm = suffix.as_deref() == Some("txm");
-    let is_txrm = suffix.as_deref() == Some("txrm");
+    let is_txrm = matches!(suffix.as_deref(), Some("txrm") | Some("xrm"));
     // Java initFile: paramsPrefix = isTXM ? GENERAL_PARAMS : PROJECTION.
     let params_prefix = if is_txm {
         "General Parameters: "
@@ -211,7 +209,7 @@ fn parse_xrm(path: &Path) -> Result<(ImageMetadata, Vec<Option<String>>)> {
         .collect();
 
     for path in paths {
-        if path.starts_with(IMAGE_DATA) {
+        if is_xrm_image_data_stream(&path) {
             let index = xrm_image_index(&path).ok_or_else(|| {
                 BioFormatsError::Format(format!("Zeiss XRM/TXRM invalid image stream path: {path}"))
             })?;
@@ -1118,6 +1116,22 @@ fn xrm_pixel_type(data_type: i32) -> Result<(PixelType, &'static str)> {
     }
 }
 
+fn is_xrm_image_data_stream(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix('/') else {
+        return false;
+    };
+    let Some((dir, file)) = rest.split_once('/') else {
+        return false;
+    };
+    if file.is_empty() || file.contains('/') {
+        return false;
+    }
+    let Some(suffix) = dir.strip_prefix("ImageData") else {
+        return false;
+    };
+    suffix.is_empty() || suffix.bytes().all(|b| b.is_ascii_digit())
+}
+
 fn xrm_image_index(path: &str) -> Option<u32> {
     let tail = path.rsplit('/').next()?;
     let digits = tail.strip_prefix("Image")?;
@@ -1214,12 +1228,35 @@ mod tests {
     }
 
     #[test]
-    fn xrm_name_detection_matches_java_suffixes() {
+    fn xrm_name_detection_accepts_xrm_txm_and_txrm() {
         let reader = ZeissXrmReader::new();
         assert!(reader.is_this_type_by_name(Path::new("sample.txm")));
         assert!(reader.is_this_type_by_name(Path::new("sample.txrm")));
         assert!(reader.is_this_type_by_name(Path::new("sample.TXRM")));
-        assert!(!reader.is_this_type_by_name(Path::new("sample.xrm")));
+        assert!(reader.is_this_type_by_name(Path::new("sample.xrm")));
+        assert!(reader.is_this_type_by_name(Path::new("sample.XRM")));
+    }
+
+    #[test]
+    fn xrm_reads_numbered_imagedata_streams_and_xrm_extension() {
+        let path = temp_path("numbered_streams.xrm");
+        {
+            let mut comp = cfb::create(&path).unwrap();
+            write_i32_stream(&mut comp, "/ImageInfo/ImageWidth", 2);
+            write_i32_stream(&mut comp, "/ImageInfo/ImageHeight", 2);
+            write_i32_stream(&mut comp, "/ImageInfo/DataType", 3);
+            write_stream(&mut comp, "/ImageData1/Image1", &[1, 2, 3, 4]);
+            write_stream(&mut comp, "/ImageData2/Image2", &[5, 6, 7, 8]);
+        }
+
+        let mut reader = crate::ImageReader::open(&path).unwrap();
+        assert_eq!(reader.metadata().size_x, 2);
+        assert_eq!(reader.metadata().size_y, 2);
+        assert_eq!(reader.metadata().image_count, 2);
+        assert_eq!(reader.open_bytes(0).unwrap(), vec![3, 4, 1, 2]);
+        assert_eq!(reader.open_bytes(1).unwrap(), vec![7, 8, 5, 6]);
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

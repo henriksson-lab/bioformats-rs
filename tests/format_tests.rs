@@ -415,11 +415,12 @@ fn append_fei_ser_2d_element(
 }
 
 fn synthetic_fei_ser_u8(width: u32, height: u32, frames: &[Vec<u8>]) -> Vec<u8> {
-    let offset_array_offset = 28u32;
+    let offset_array_offset = 30u32;
     let first_element_offset = offset_array_offset as usize + frames.len() * 4;
     let element_stride = 50 + (width * height) as usize;
     let mut data = Vec::new();
-    data.extend_from_slice(&0x0197u16.to_le_bytes());
+    data.extend_from_slice(&0x4949u16.to_le_bytes()); // ByteOrder "II"
+    data.extend_from_slice(&0x0197u16.to_le_bytes()); // SeriesID
     data.extend_from_slice(&0x0210u16.to_le_bytes());
     data.extend_from_slice(&0x4122u32.to_le_bytes());
     data.extend_from_slice(&0x4152u32.to_le_bytes());
@@ -6169,8 +6170,8 @@ fn mias_placeholder_readers_reject_or_require_real_payloads() {
     std::fs::write(
         &ser,
         [
-            0x97, 0x01, 0, 0, 2, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0,
-            0, 1, 0, 0, 0,
+            0x49, 0x49, 0x97, 0x01, 0, 0, 2, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 1, 0, 0, 0, 1, 0, 0, 0,
         ],
     )
     .unwrap();
@@ -6387,6 +6388,46 @@ fn alicona_reads_java_texture_byte_planes_and_padded_rows() {
     assert_eq!(reader.metadata().pixel_type, PixelType::Uint8);
     assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 3, 4, 5, 6, 7]);
     let _ = std::fs::remove_file(padded);
+
+    // Real-file quirks: "AliconaImaging\0\r\n" magic, odd-width Float32 depth 8-byte row
+    // alignment (align8(3 * 4) = 16 -> 4 padding bytes), and InvalidPixelValue filtering.
+    let real_quirks = tmp("alicona_real_quirks.al3d");
+    let offset = 17 + 52 * 5;
+    let mut raw = Vec::new();
+    raw.extend_from_slice(b"AliconaImaging\0\r\n");
+    raw.extend_from_slice(&al3d_tag("TagCount", "3"));
+    raw.extend_from_slice(&al3d_tag("Rows", "2"));
+    raw.extend_from_slice(&al3d_tag("Cols", "3"));
+    raw.extend_from_slice(&al3d_tag("DepthImageOffset", &offset.to_string()));
+    raw.extend_from_slice(&al3d_tag("InvalidPixelValue", "3e15"));
+    assert_eq!(raw.len(), offset);
+    // Row 0: 3 floats + 4 pad bytes
+    for v in [1.0f32, 3e15, 2.0] {
+        raw.extend_from_slice(&v.to_le_bytes());
+    }
+    raw.extend_from_slice(&[0u8; 4]);
+    // Row 1: 3 floats + 4 pad bytes
+    for v in [3.0f32, 4.0, 3e15] {
+        raw.extend_from_slice(&v.to_le_bytes());
+    }
+    raw.extend_from_slice(&[0u8; 4]);
+    std::fs::write(&real_quirks, raw).unwrap();
+
+    let mut reader = bioformats::formats::gpl::mias::AliconaReader::new();
+    reader.set_id(&real_quirks).unwrap();
+    let depth_bytes = reader.open_bytes(0).unwrap();
+    let depth_vals: Vec<f32> = depth_bytes
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect();
+    assert_eq!(depth_vals.len(), 6);
+    assert_eq!(depth_vals[0], 1.0);
+    assert!(depth_vals[1].is_nan());
+    assert_eq!(depth_vals[2], 2.0);
+    assert_eq!(depth_vals[3], 3.0);
+    assert_eq!(depth_vals[4], 4.0);
+    assert!(depth_vals[5].is_nan());
+    let _ = std::fs::remove_file(real_quirks);
 }
 
 // NOTE: cellworx_strict_raw_* tests were removed — CellWorxReader is now a real
@@ -6405,7 +6446,8 @@ fn fei_ser_reads_synthetic_2d_image_elements() {
     .unwrap();
 
     let mut reader = bioformats::formats::gpl::mias::FeiSerReader::new();
-    assert!(reader.is_this_type_by_bytes(&[0x97, 0x01, 0, 0]));
+    assert!(reader.is_this_type_by_bytes(&[0x49, 0x49, 0x97, 0x01]));
+    assert!(!reader.is_this_type_by_bytes(&[0x97, 0x01, 0, 0]));
     reader.set_id(&path).unwrap();
     assert_eq!(reader.series_count(), 1);
     assert_eq!(reader.metadata().size_x, 3);
@@ -6429,7 +6471,7 @@ fn fei_ser_reads_synthetic_2d_image_elements() {
 fn fei_ser_rejects_truncated_offset_array_and_payloads() {
     let short_offsets = tmp("short_offsets.ser");
     let mut data = synthetic_fei_ser_u8(1, 1, &[vec![7]]);
-    data.truncate(29);
+    data.truncate(31);
     std::fs::write(&short_offsets, data).unwrap();
     let mut reader = bioformats::formats::gpl::mias::FeiSerReader::new();
     let err = reader.set_id(&short_offsets).unwrap_err();

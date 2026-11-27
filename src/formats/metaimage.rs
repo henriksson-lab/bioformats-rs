@@ -108,13 +108,17 @@ fn parse_mhd(path: &Path) -> Result<MhdHeader> {
     let mut header_size: Option<i64> = None;
     let mut extra: HashMap<String, String> = HashMap::new();
 
+    let mut line_bytes = Vec::new();
     loop {
-        let mut line = String::new();
-        let n = reader.read_line(&mut line).map_err(BioFormatsError::Io)?;
+        line_bytes.clear();
+        let n = reader
+            .read_until(b'\n', &mut line_bytes)
+            .map_err(BioFormatsError::Io)?;
         if n == 0 {
             break;
         }
 
+        let line = String::from_utf8_lossy(&line_bytes);
         let trimmed = line.trim_end_matches(['\r', '\n']);
         if trimmed.is_empty() {
             continue;
@@ -144,7 +148,9 @@ fn parse_mhd(path: &Path) -> Result<MhdHeader> {
                     ));
                 }
                 "BINARYDATABYTEORDERMSB" => little_endian = !val.eq_ignore_ascii_case("true"),
-                "COMPRESSEDDATA" => compressed = val.eq_ignore_ascii_case("true"),
+                "COMPRESSEDDATA" => {
+                    compressed = val.eq_ignore_ascii_case("true") || val == "1";
+                }
                 "HEADERSIZE" => {
                     header_size = Some(parse_meta_scalar::<i64>(val, "HeaderSize")?);
                 }
@@ -158,6 +164,7 @@ fn parse_mhd(path: &Path) -> Result<MhdHeader> {
                     if upper == "LOCAL" {
                         data_offset = reader.stream_position().map_err(BioFormatsError::Io)?;
                         layout = Some(DataLayout::Local);
+                        break;
                     } else if upper == "LIST" || upper.starts_with("LIST ") {
                         // Remaining non-empty lines each name one slice file.
                         let mut files = Vec::new();
@@ -278,6 +285,7 @@ pub struct MetaImageReader {
     path: Option<PathBuf>,
     meta: Option<ImageMetadata>,
     header: Option<MhdHeader>,
+    decompressed: Option<Vec<u8>>,
 }
 
 impl MetaImageReader {
@@ -286,10 +294,11 @@ impl MetaImageReader {
             path: None,
             meta: None,
             header: None,
+            decompressed: None,
         }
     }
 
-    fn read_data(&self, plane_index: u32) -> Result<Vec<u8>> {
+    fn read_data(&mut self, plane_index: u32) -> Result<Vec<u8>> {
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         let hdr = self
             .header
@@ -316,6 +325,7 @@ impl MetaImageReader {
         // and the index of the requested plane within that file. For a single
         // packed file all planes share one file; for per-slice layouts each
         // file holds exactly one plane.
+        let is_per_slice = matches!(&hdr.layout, Some(DataLayout::PerSlice(_)));
         let (data_path, base_offset, planes_in_file, plane_in_file) = match &hdr.layout {
             Some(DataLayout::Local) => (
                 mhd_path.clone(),
@@ -368,27 +378,49 @@ impl MetaImageReader {
                 BioFormatsError::InvalidData("MetaImage: plane offset overflow".into())
             })?;
 
-        let mut f = File::open(&data_path).map_err(BioFormatsError::Io)?;
-
         let buf = if hdr.compressed {
-            f.seek(SeekFrom::Start(base_offset + header_skip))
-                .map_err(BioFormatsError::Io)?;
-            let mut dec = flate2::read::ZlibDecoder::new(f);
-            let mut all = Vec::new();
-            dec.read_to_end(&mut all).map_err(BioFormatsError::Io)?;
             let start = usize::try_from(plane_offset).map_err(|_| {
                 BioFormatsError::InvalidData("MetaImage: plane offset overflow".into())
             })?;
             let end = start.checked_add(plane_bytes).ok_or_else(|| {
                 BioFormatsError::InvalidData("MetaImage: plane range overflow".into())
             })?;
-            if end > all.len() {
-                return Err(BioFormatsError::InvalidData(
-                    "MetaImage: plane out of range".into(),
-                ));
+            if is_per_slice || self.decompressed.is_none() {
+                let mut f = File::open(&data_path).map_err(BioFormatsError::Io)?;
+                f.seek(SeekFrom::Start(base_offset + header_skip))
+                    .map_err(BioFormatsError::Io)?;
+                let mut dec = flate2::read::ZlibDecoder::new(f);
+                let mut all = Vec::new();
+                dec.read_to_end(&mut all).map_err(BioFormatsError::Io)?;
+                if is_per_slice {
+                    if end > all.len() {
+                        return Err(BioFormatsError::InvalidData(
+                            "MetaImage: plane out of range".into(),
+                        ));
+                    }
+                    all[start..end].to_vec()
+                } else {
+                    if end > all.len() {
+                        self.decompressed = Some(all);
+                        return Err(BioFormatsError::InvalidData(
+                            "MetaImage: plane out of range".into(),
+                        ));
+                    }
+                    let slice = all[start..end].to_vec();
+                    self.decompressed = Some(all);
+                    slice
+                }
+            } else {
+                let all = self.decompressed.as_ref().unwrap();
+                if end > all.len() {
+                    return Err(BioFormatsError::InvalidData(
+                        "MetaImage: plane out of range".into(),
+                    ));
+                }
+                all[start..end].to_vec()
             }
-            all[start..end].to_vec()
         } else {
+            let mut f = File::open(&data_path).map_err(BioFormatsError::Io)?;
             let offset = base_offset
                 .checked_add(header_skip)
                 .and_then(|o| o.checked_add(plane_offset))
@@ -462,7 +494,7 @@ impl FormatReader for MetaImageReader {
             is_rgb: hdr.channels > 1,
             is_interleaved: hdr.channels > 1,
             is_indexed: false,
-            is_little_endian: hdr.little_endian,
+            is_little_endian: true,
             resolution_count: 1,
             thumbnail: false,
             series_metadata,
@@ -473,6 +505,7 @@ impl FormatReader for MetaImageReader {
         });
         self.header = Some(hdr);
         self.path = Some(path.to_path_buf());
+        self.decompressed = None;
         Ok(())
     }
 
@@ -480,6 +513,7 @@ impl FormatReader for MetaImageReader {
         self.path = None;
         self.meta = None;
         self.header = None;
+        self.decompressed = None;
         Ok(())
     }
     fn series_count(&self) -> usize {

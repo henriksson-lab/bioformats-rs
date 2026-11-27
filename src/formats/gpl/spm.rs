@@ -83,6 +83,7 @@ const PTU_RECORD_HYDRAHARP2_T2: i64 = 0x0101_0204;
 const PTU_RECORD_HYDRAHARP2_T3: i64 = 0x0101_0304;
 const PTU_T2_SYNC_PERIOD: u64 = 1 << 25;
 const PTU_T3_SYNC_PERIOD: u64 = 1024;
+const PTU_PICOHARP_T3_SYNC_PERIOD: u64 = 1 << 16;
 const PICOQUANT_PTU_MAGIC: &[u8; 6] = b"PQTTTR";
 const PICOQUANT_PHU_MAGIC: &[u8; 8] = b"PQHISTO\0";
 
@@ -220,7 +221,7 @@ impl PicoQuantReader {
                 "tttr_t3",
                 "picoharp",
                 false,
-                false,
+                true,
             ),
             PTU_RECORD_HYDRAHARP_T2 => (
                 "HydraHarp T2",
@@ -389,8 +390,12 @@ impl PicoQuantReader {
                 "ptu.tttr_record_layout".into(),
                 MetadataValue::String(record_kind.record_layout.into()),
             );
-            let layout_provenance = if record_kind.family == "PicoHarp" {
+            let layout_provenance = if !record_kind.marker_raster_layout
+                && record_kind.family == "PicoHarp"
+            {
                 "recognized from TTResultFormat_TTTRRecType metadata; PicoHarp marker-raster pixel reconstruction is disabled pending original-code evidence"
+            } else if record_kind.marker_raster_layout && record_kind.family == "PicoHarp" {
+                "recognized from TTResultFormat_TTTRRecType metadata; marker-raster reconstruction uses the PicoHarp T3 record path"
             } else if record_kind.marker_raster_layout {
                 "recognized from TTResultFormat_TTTRRecType metadata; marker-raster reconstruction uses the supported local HydraHarp-compatible record path"
             } else {
@@ -1248,6 +1253,17 @@ impl PicoQuantReader {
             .and_then(|n| n.checked_mul(detector_channels as usize))
             .and_then(|n| n.checked_mul(lifetime_bins as usize))
             .ok_or_else(|| picoquant_event_stream_unsupported("output image size overflows"))?;
+        let is_picoharp_t3 = record_type == PTU_RECORD_PICOHARP_T3;
+        let line_start_mask = if is_picoharp_t3 && (1..=4).contains(&line_start_marker) {
+            1i64 << (line_start_marker - 1)
+        } else {
+            line_start_marker
+        };
+        let line_stop_mask = if is_picoharp_t3 && (1..=4).contains(&line_stop_marker) {
+            1i64 << (line_stop_marker - 1)
+        } else {
+            line_stop_marker
+        };
         let mut counts = vec![0u32; pixel_count];
         let mut sync_overflow = 0u64;
         let mut line_start_sync: Option<u64> = None;
@@ -1257,44 +1273,71 @@ impl PicoQuantReader {
 
         for record in data[data_offset..records_end].as_chunks::<4>().0 {
             let raw = u32::from_le_bytes([record[0], record[1], record[2], record[3]]);
-            let (nsync, dtime, channel) = if is_t2 {
-                (u64::from(raw & 0x01ff_ffff), 0, ((raw >> 25) & 0x3f) as u8)
+            let (nsync, dtime, channel, special) = if is_picoharp_t3 {
+                let nsync = u64::from(raw & 0xffff);
+                let dtime = (raw >> 16) & 0x0fff;
+                let channel = ((raw >> 28) & 0x0f) as u8;
+                (nsync, dtime, channel, channel == 0x0f)
+            } else if is_t2 {
+                (
+                    u64::from(raw & 0x01ff_ffff),
+                    0,
+                    ((raw >> 25) & 0x3f) as u8,
+                    (raw & 0x8000_0000) != 0,
+                )
             } else {
                 (
                     u64::from(raw & 0x03ff),
                     (raw >> 10) & 0x7fff,
                     ((raw >> 25) & 0x3f) as u8,
+                    (raw & 0x8000_0000) != 0,
                 )
             };
-            let special = (raw & 0x8000_0000) != 0;
             let absolute_sync = sync_overflow
                 .checked_add(nsync)
                 .ok_or_else(|| picoquant_event_stream_unsupported("TTTR sync time overflows"))?;
 
             if special {
-                if channel == 0x3f {
-                    let overflow_count = if nsync == 0 { 1 } else { nsync };
-                    let overflow_period = if is_t2 {
-                        PTU_T2_SYNC_PERIOD
-                    } else {
-                        PTU_T3_SYNC_PERIOD
-                    };
-                    sync_overflow = sync_overflow
-                        .checked_add(overflow_count.checked_mul(overflow_period).ok_or_else(
-                            || picoquant_event_stream_unsupported("TTTR overflow count overflows"),
-                        )?)
-                        .ok_or_else(|| {
-                            picoquant_event_stream_unsupported("TTTR overflow overflows")
-                        })?;
-                    continue;
-                }
+                let marker = if is_picoharp_t3 {
+                    let markers = dtime & 0x0f;
+                    if markers == 0 {
+                        sync_overflow = sync_overflow
+                            .checked_add(PTU_PICOHARP_T3_SYNC_PERIOD)
+                            .ok_or_else(|| {
+                                picoquant_event_stream_unsupported("TTTR overflow overflows")
+                            })?;
+                        continue;
+                    }
+                    i64::from(markers)
+                } else {
+                    if channel == 0x3f {
+                        let overflow_count = if nsync == 0 { 1 } else { nsync };
+                        let overflow_period = if is_t2 {
+                            PTU_T2_SYNC_PERIOD
+                        } else {
+                            PTU_T3_SYNC_PERIOD
+                        };
+                        sync_overflow = sync_overflow
+                            .checked_add(overflow_count.checked_mul(overflow_period).ok_or_else(
+                                || {
+                                    picoquant_event_stream_unsupported(
+                                        "TTTR overflow count overflows",
+                                    )
+                                },
+                            )?)
+                            .ok_or_else(|| {
+                                picoquant_event_stream_unsupported("TTTR overflow overflows")
+                            })?;
+                        continue;
+                    }
+                    i64::from(channel)
+                };
 
-                let marker = i64::from(channel);
-                if marker & line_start_marker != 0 {
+                if marker & line_start_mask != 0 {
                     line_start_sync = Some(absolute_sync);
                     line_photons.clear();
                 }
-                if marker & line_stop_marker != 0 {
+                if marker & line_stop_mask != 0 {
                     let Some(start_sync) = line_start_sync else {
                         return Err(picoquant_event_stream_unsupported(
                             "line-stop marker appeared before a line-start marker",

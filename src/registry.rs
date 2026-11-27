@@ -436,6 +436,13 @@ fn open_reader_with_options_and_metadata(
                 Err(err) => remember_set_id_error(&mut best_error, err),
             }
         }
+        if has_lof_extension(path) {
+            let mut r = boxed_reader(crate::formats::extended::LofReader::new());
+            match set_reader_id(&mut r, path, &options, metadata_options) {
+                Ok(()) => return Ok(r),
+                Err(err) => remember_set_id_error(&mut best_error, err),
+            }
+        }
     }
 
     // Java CanonRawReader byte-detects legacy 300D CRW files solely by exact
@@ -623,6 +630,14 @@ fn has_zvi_extension(path: &Path) -> bool {
 }
 
 #[cfg(feature = "gpl")]
+fn has_lof_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.eq_ignore_ascii_case("lof"))
+        .unwrap_or(false)
+}
+
+#[cfg(feature = "gpl")]
 fn has_wpi_extension(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
@@ -738,6 +753,13 @@ pub(crate) fn detect_reader_without_set_id(path: &Path) -> Result<Box<dyn Format
     if has_zvi_extension(path) {
         return Ok(boxed_reader(
             crate::formats::gpl::zeiss_zvi::ZeissZviReader::new(),
+        ));
+    }
+
+    #[cfg(feature = "gpl")]
+    if has_lof_extension(path) {
+        return Ok(boxed_reader(
+            crate::formats::extended::LofReader::new(),
         ));
     }
 
@@ -965,8 +987,6 @@ fn tiff_wrapper_readers_for_extension(path: &Path, header: &[u8]) -> Vec<Box<dyn
         Some("ims") => vec![boxed_reader(crate::formats::flim2::ImarisTiffReader::new())],
         #[cfg(feature = "gpl")]
         Some("xlef") => vec![boxed_reader(crate::formats::flim2::XlefReader::new())],
-        #[cfg(feature = "gpl")]
-        Some("ctf") => vec![boxed_reader(crate::formats::flim2::MicroCtReader::new())],
         #[cfg(feature = "gpl")]
         Some("ndpis") => vec![boxed_reader(crate::formats::flim2::NdpisReader::new())],
         // Generic .tif/.tiff TIFF wrappers only run early when they can be
