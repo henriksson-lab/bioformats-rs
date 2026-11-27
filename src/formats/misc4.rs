@@ -6067,34 +6067,33 @@ fn obf_apply_description_metadata(
         match reader.read_event() {
             Ok(quick_xml::events::Event::Start(e)) => {
                 parsed_xml = true;
-                stack.push(String::from_utf8_lossy(e.name().as_ref()).into_owned());
+                stack.push(e.name().as_ref().to_owned());
             }
             Ok(quick_xml::events::Event::Empty(e)) => {
                 parsed_xml = true;
-                stack.push(String::from_utf8_lossy(e.name().as_ref()).into_owned());
+                stack.push(e.name().as_ref().to_owned());
                 stack.pop();
             }
             Ok(quick_xml::events::Event::Text(t)) => {
                 if stack.len() >= 3 {
-                    if let Ok(value) = t.xml_content(quick_xml::XmlVersion::Implicit1_0) {
-                        let value = value.trim();
-                        if !value.is_empty() {
-                            let parent = if matches!(
-                                stack.get(stack.len().saturating_sub(2)).map(String::as_str),
-                                Some("doc") | Some("hwr")
-                            ) && stack.len() >= 4
-                            {
-                                &stack[stack.len() - 3]
-                            } else {
-                                &stack[stack.len() - 2]
-                            };
-                            let leaf = &stack[stack.len() - 1];
-                            if leaf != "doc" && leaf != "hwr" {
-                                metadata.insert(
-                                    format!("{parent} {leaf}"),
-                                    MetadataValue::String(value.to_string()),
-                                );
-                            }
+                    let value = t.xml_content(quick_xml::XmlVersion::Implicit1_0);
+                    let value = value.trim();
+                    if !value.is_empty() {
+                        let parent = if matches!(
+                            stack.get(stack.len().saturating_sub(2)).map(String::as_str),
+                            Some("doc") | Some("hwr")
+                        ) && stack.len() >= 4
+                        {
+                            &stack[stack.len() - 3]
+                        } else {
+                            &stack[stack.len() - 2]
+                        };
+                        let leaf = &stack[stack.len() - 1];
+                        if leaf != "doc" && leaf != "hwr" {
+                            metadata.insert(
+                                format!("{parent} {leaf}"),
+                                MetadataValue::String(value.to_string()),
+                            );
                         }
                     }
                 }
@@ -6127,20 +6126,21 @@ fn obf_dimension_order(value: &str) -> Option<DimensionOrder> {
     }
 }
 
-fn obf_local_name(name: &[u8]) -> &[u8] {
-    match name.iter().position(|&b| b == b':') {
-        Some(pos) => &name[pos + 1..],
-        None => name,
-    }
+fn obf_local_name(name: &str) -> &str {
+    name.rsplit_once(':')
+        .map(|(_, local)| local)
+        .unwrap_or(name)
 }
 
 fn obf_xml_event_attr(e: &quick_xml::events::BytesStart<'_>, name: &[u8]) -> Option<String> {
     e.attributes().flatten().find_map(|a| {
-        if obf_local_name(a.key.as_ref()).eq_ignore_ascii_case(name) {
+        if obf_local_name(a.key.as_ref())
+            .eq_ignore_ascii_case(std::str::from_utf8(name).unwrap_or(""))
+        {
             a.normalized_value(quick_xml::XmlVersion::Implicit1_0)
                 .ok()
                 .map(|v| v.into_owned())
-                .or_else(|| Some(String::from_utf8_lossy(&a.value).into_owned()))
+                .or_else(|| Some(a.value.to_string()))
         } else {
             None
         }
@@ -6168,7 +6168,7 @@ fn obf_parse_ome_pixels(ome_xml: &str) -> Vec<ObfOmePixels> {
     loop {
         match reader.read_event() {
             Ok(quick_xml::events::Event::Start(e)) | Ok(quick_xml::events::Event::Empty(e)) => {
-                if obf_local_name(e.name().as_ref()).eq_ignore_ascii_case(b"Pixels") {
+                if obf_local_name(e.name().as_ref()).eq_ignore_ascii_case("Pixels") {
                     if let Some(pixels) = obf_pixels_from_xml_event(&e) {
                         out.push(pixels);
                     }

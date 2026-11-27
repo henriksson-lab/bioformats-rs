@@ -701,9 +701,8 @@ impl FormatReader for BrukerReader {
 // pixel data stored with the origin in the **lower-left** corner.
 //
 // This port lives alongside the Bruker MRI reader because both are Bruker /
-// medical-domain microscopy companion-file readers; it is a separate public
-// type (`MicroCtVffReader`) and does not collide with the unrelated `.ctf`
-// TIFF-delegating `MicroCtReader` in `formats::flim2`.
+// medical-domain microscopy companion-file readers; it is exposed as
+// `MicroCtVffReader` and wrapped by `formats::flim2::MicroCtReader`.
 
 /// `EEE, MMM dd, yyyy HH:mm:ss a` — the Java `MicroCTReader.DATE_FORMAT`.
 /// Mirrored as a named constant for parity; the parse in `format_microct_date`
@@ -925,7 +924,7 @@ impl MicroCtVffReader {
             for file in entries {
                 if !has_suffix(&file, "vff") {
                     let metadata = parent.join(&file);
-                    if !metadata.is_dir() {
+                    if metadata.is_file() {
                         self.metadata_files.push(metadata);
                     }
                 }
@@ -1007,14 +1006,26 @@ impl MicroCtVffReader {
 
         // Parse extra values from metadata files.
         let metadata_files = std::mem::take(&mut self.metadata_files);
-        for file in &metadata_files {
+        let mut retained_metadata_files = Vec::new();
+        for file in metadata_files {
+            if let Ok(meta) = fs::metadata(&file) {
+                if !meta.is_file() || meta.len() > 1_048_576 {
+                    continue;
+                }
+            }
+            let Ok(bytes) = fs::read(&file) else {
+                continue;
+            };
+            if bytes.contains(&0) {
+                continue;
+            }
+            let data = String::from_utf8_lossy(&bytes);
+            let data = data.trim();
             let name = file
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("")
                 .to_string();
-            let data = read_text(file)?;
-            let data = data.trim();
             if has_suffix(&name, "protocol") || has_suffix(&name, "log") || name == "Parameters.txt"
             {
                 // key/value pairs separated by '=' or ':'.
@@ -1030,8 +1041,9 @@ impl MicroCtVffReader {
                 // assume a single value; the file name is the key.
                 self.process_key(&name, data);
             }
+            retained_metadata_files.push(file);
         }
-        self.metadata_files = metadata_files;
+        self.metadata_files = retained_metadata_files;
 
         self.initialized = true;
         Ok(())

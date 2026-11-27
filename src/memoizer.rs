@@ -14,6 +14,8 @@ use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
+const CACHE_MAGIC: &[u8] = b"BFMEMO\x01";
+
 use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{ImageMetadata, MetadataOptions};
 use crate::common::ome_metadata::OmeMetadata;
@@ -188,9 +190,12 @@ impl Memoizer {
     fn try_load_cache(file_path: &Path) -> Option<MemoCache> {
         let cache_path = Self::cache_path(file_path);
         let data = std::fs::read(&cache_path).ok()?;
-        let cache: MemoCache = match bincode::deserialize(&data) {
-            Ok(cache) => cache,
-            Err(_) => {
+        let cache: MemoCache = match data.strip_prefix(CACHE_MAGIC).and_then(|data| {
+            let (cache, remainder) = postcard::take_from_bytes(data).ok()?;
+            remainder.is_empty().then_some(cache)
+        }) {
+            Some(cache) => cache,
+            None => {
                 let _ = std::fs::remove_file(&cache_path);
                 return None;
             }
@@ -221,7 +226,8 @@ impl Memoizer {
             series_metadata: self.cached_meta.clone(),
             ome_metadata: self.cached_ome_metadata.clone(),
         };
-        if let Ok(data) = bincode::serialize(&cache) {
+        if let Ok(mut data) = postcard::to_allocvec(&cache) {
+            data.splice(0..0, CACHE_MAGIC.iter().copied());
             let _ = std::fs::write(Self::cache_path(file_path), data);
         }
     }
@@ -375,6 +381,12 @@ mod tests {
         std::env::temp_dir().join(format!("bioformats_memoizer_{nanos}_{name}"))
     }
 
+    fn memo_cache_bytes(cache: &MemoCache) -> Vec<u8> {
+        let mut data = postcard::to_allocvec(cache).unwrap();
+        data.splice(0..0, super::CACHE_MAGIC.iter().copied());
+        data
+    }
+
     #[cfg(feature = "gpl")]
     fn write_minimal_sbig(path: &Path) {
         let mut bytes = vec![0u8; 2048];
@@ -490,11 +502,7 @@ mod tests {
             series_metadata: vec![cached_meta],
             ome_metadata: None,
         };
-        std::fs::write(
-            Memoizer::cache_path(&path),
-            bincode::serialize(&cache).unwrap(),
-        )
-        .unwrap();
+        std::fs::write(Memoizer::cache_path(&path), memo_cache_bytes(&cache)).unwrap();
 
         let second = Memoizer::open(&path).expect("cached fake open failed");
         assert_eq!(second.metadata().size_x, 123);
@@ -520,11 +528,7 @@ mod tests {
             series_metadata: vec![cached_meta],
             ome_metadata: None,
         };
-        std::fs::write(
-            Memoizer::cache_path(&path),
-            bincode::serialize(&cache).unwrap(),
-        )
-        .unwrap();
+        std::fs::write(Memoizer::cache_path(&path), memo_cache_bytes(&cache)).unwrap();
 
         let mut second = Memoizer::open(&path).expect("cached extension fallback failed");
         assert_eq!(second.metadata().size_x, 321);
@@ -630,11 +634,7 @@ mod tests {
             series_metadata: vec![cached_meta],
             ome_metadata: None,
         };
-        std::fs::write(
-            Memoizer::cache_path(&path),
-            bincode::serialize(&cache).unwrap(),
-        )
-        .unwrap();
+        std::fs::write(Memoizer::cache_path(&path), memo_cache_bytes(&cache)).unwrap();
 
         let second = Memoizer::open(&path).expect("bad-shape cache should be ignored");
         assert_eq!(second.metadata().size_x, 512);
@@ -648,13 +648,13 @@ mod tests {
         let path = temp_path("corrupt_cache.fake");
         std::fs::write(&path, b"fake").unwrap();
         let cache_path = Memoizer::cache_path(&path);
-        std::fs::write(&cache_path, b"not a bincode memo").unwrap();
+        std::fs::write(&cache_path, b"not a postcard memo").unwrap();
 
         let reader = Memoizer::open(&path).expect("corrupt cache should fall back");
 
         assert_eq!(reader.metadata().size_x, 512);
         let regenerated = std::fs::read(&cache_path).expect("cache should be regenerated");
-        assert_ne!(regenerated, b"not a bincode memo");
+        assert_ne!(regenerated, b"not a postcard memo");
 
         let _ = std::fs::remove_file(cache_path);
         let _ = std::fs::remove_file(path);

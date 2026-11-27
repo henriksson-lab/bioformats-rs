@@ -5419,14 +5419,10 @@ mod xmlutil {
     use quick_xml::Reader as XmlReader;
 
     /// Get an attribute value by (case-sensitive) local name.
-    pub fn attr(
-        e: &BytesStart,
-        decoder: quick_xml::encoding::Decoder,
-        name: &str,
-    ) -> Option<String> {
+    pub fn attr(e: &BytesStart, name: &str) -> Option<String> {
         for a in e.attributes().flatten() {
-            if a.key.as_ref() == name.as_bytes() {
-                return crate::common::xml::decode_xml_attr(a, decoder);
+            if a.key.as_ref() == name {
+                return crate::common::xml::decode_xml_attr(a);
             }
         }
         None
@@ -5434,27 +5430,27 @@ mod xmlutil {
 
     /// Anything that exposes a qualified element name (`BytesStart`/`BytesEnd`).
     pub trait HasName {
-        fn qname_bytes(&self) -> Vec<u8>;
+        fn qname(&self) -> String;
     }
     impl HasName for BytesStart<'_> {
-        fn qname_bytes(&self) -> Vec<u8> {
-            self.name().as_ref().to_vec()
+        fn qname(&self) -> String {
+            self.name().as_ref().to_string()
         }
     }
     impl HasName for BytesEnd<'_> {
-        fn qname_bytes(&self) -> Vec<u8> {
-            self.name().as_ref().to_vec()
+        fn qname(&self) -> String {
+            self.name().as_ref().to_string()
         }
     }
 
     /// The local element name (after any namespace prefix) as an owned String.
     pub fn local_name<E: HasName>(e: &E) -> String {
-        let full = e.qname_bytes();
-        let local = match full.iter().position(|&b| b == b':') {
-            Some(i) => &full[i + 1..],
-            None => &full[..],
-        };
-        String::from_utf8_lossy(local).to_string()
+        let qname = e.qname();
+        qname
+            .rsplit_once(':')
+            .map(|(_, local)| local)
+            .unwrap_or(&qname)
+            .to_string()
     }
 
     /// Run a SAX-style callback over an XML string. (Currently unused by the
@@ -5493,7 +5489,7 @@ mod xmlutil {
                     }
                 }
                 Ok(Event::CData(ref t)) => {
-                    buf_text.push_str(&String::from_utf8_lossy(t.as_ref()));
+                    buf_text.push_str(&t.xml_content(quick_xml::XmlVersion::Implicit1_0));
                 }
                 Ok(Event::End(ref e)) => {
                     let ln = local_name(e);
@@ -5667,7 +5663,6 @@ mod operetta {
                     handle_start(
                         &current_name,
                         e,
-                        reader.decoder(),
                         &mut active_plane,
                         &mut active_channel,
                         &mut active_channel_id,
@@ -5680,7 +5675,6 @@ mod operetta {
                     handle_start(
                         &name,
                         e,
-                        reader.decoder(),
                         &mut active_plane,
                         &mut active_channel,
                         &mut active_channel_id,
@@ -5715,7 +5709,7 @@ mod operetta {
                     }
                 }
                 Ok(quick_xml::events::Event::CData(ref t)) => {
-                    text_buf.push_str(&String::from_utf8_lossy(t.as_ref()));
+                    text_buf.push_str(&t.xml_content(quick_xml::XmlVersion::Implicit1_0));
                 }
                 Ok(quick_xml::events::Event::End(ref e)) => {
                     let name = super::xmlutil::local_name(e);
@@ -5960,7 +5954,6 @@ mod operetta {
     fn handle_start(
         name: &str,
         e: &quick_xml::events::BytesStart,
-        decoder: quick_xml::encoding::Decoder,
         active_plane: &mut Option<Plane>,
         active_channel: &mut Option<Channel>,
         active_channel_id: &mut i32,
@@ -5969,12 +5962,12 @@ mod operetta {
     ) {
         match name {
             "Image" => {
-                if super::xmlutil::attr(e, decoder, "id").is_none() {
+                if super::xmlutil::attr(e, "id").is_none() {
                     *active_plane = Some(Plane::default());
                 }
             }
             "Entry" => {
-                if let Some(cid) = super::xmlutil::attr(e, decoder, "ChannelID") {
+                if let Some(cid) = super::xmlutil::attr(e, "ChannelID") {
                     if let Ok(cid) = cid.trim().parse::<i32>() {
                         *active_channel_id = cid;
                         let ch = Channel {
@@ -5988,7 +5981,7 @@ mod operetta {
             }
             "EvaluationInputData" => {
                 // isHarmony = xmlns.indexOf(HARMONY_MAGIC) > 0
-                if let Some(xmlns) = super::xmlutil::attr(e, decoder, "xmlns") {
+                if let Some(xmlns) = super::xmlutil::attr(e, "xmlns") {
                     *is_harmony = xmlns.find("Harmony").map(|i| i > 0).unwrap_or(false);
                 }
             }
@@ -7163,8 +7156,8 @@ mod columbus {
                     text.clear();
                     cur_attrs.clear();
                     for a in e.attributes().flatten() {
-                        let k = String::from_utf8_lossy(a.key.as_ref()).to_string();
-                        if let Some(v) = crate::common::xml::decode_xml_attr(a, reader.decoder()) {
+                        let k = a.key.as_ref().to_string();
+                        if let Some(v) = crate::common::xml::decode_xml_attr(a) {
                             cur_attrs.insert(k, v);
                         }
                     }
@@ -8827,18 +8820,17 @@ mod cellvoyager {
                 let v = a
                     .normalized_value(quick_xml::XmlVersion::Implicit1_0)
                     .map(|c| c.into_owned())
-                    .unwrap_or_else(|_| String::from_utf8_lossy(&a.value).into_owned());
+                    .unwrap_or_else(|_| a.value.to_string());
                 out.push((k, v));
             }
             out
         }
 
-        fn local(name: &[u8]) -> String {
-            let l = match name.iter().position(|&b| b == b':') {
-                Some(i) => &name[i + 1..],
-                None => name,
-            };
-            String::from_utf8_lossy(l).to_string()
+        fn local(name: &str) -> String {
+            name.rsplit_once(':')
+                .map(|(_, local)| local)
+                .unwrap_or(name)
+                .to_string()
         }
 
         pub fn parse(xml: &str) -> Dom {
@@ -8883,7 +8875,8 @@ mod cellvoyager {
                     }
                     Ok(Event::CData(ref t)) => {
                         if let Some(top) = stack.last_mut() {
-                            top.text.push_str(&String::from_utf8_lossy(t.as_ref()));
+                            top.text
+                                .push_str(&t.xml_content(quick_xml::XmlVersion::Implicit1_0));
                         }
                     }
                     Ok(Event::End(_)) => {

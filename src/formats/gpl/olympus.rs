@@ -2103,8 +2103,8 @@ fn parse_dom(xml: &str) -> Option<DomNode> {
     let mut reader = quick_xml::Reader::from_str(xml);
     reader.config_mut().trim_text(false);
 
-    fn qualified(name: &[u8]) -> String {
-        String::from_utf8_lossy(name).to_string()
+    fn qualified(name: &str) -> String {
+        name.to_string()
     }
     fn collect_attrs(e: &quick_xml::events::BytesStart) -> Vec<(String, String)> {
         let mut out = Vec::new();
@@ -2113,7 +2113,7 @@ fn parse_dom(xml: &str) -> Option<DomNode> {
             let v = a
                 .normalized_value(quick_xml::XmlVersion::Implicit1_0)
                 .map(|c| c.into_owned())
-                .unwrap_or_else(|_| String::from_utf8_lossy(&a.value).into_owned());
+                .unwrap_or_else(|_| a.value.to_string());
             out.push((k, v));
         }
         out
@@ -2159,7 +2159,8 @@ fn parse_dom(xml: &str) -> Option<DomNode> {
             }
             Ok(Event::CData(ref t)) => {
                 if let Some(top) = stack.last_mut() {
-                    top.text.push_str(&String::from_utf8_lossy(t.as_ref()));
+                    top.text
+                        .push_str(&t.xml_content(quick_xml::XmlVersion::Implicit1_0));
                 }
             }
             Ok(Event::End(_)) => {

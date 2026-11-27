@@ -747,6 +747,7 @@ fn read_spider_metadata(
 
 fn parse_spider_header(path: &Path) -> Result<(u32, u32, u32, u64, bool, bool)> {
     let mut f = File::open(path).map_err(BioFormatsError::Io)?;
+    let file_len = f.metadata().map_err(BioFormatsError::Io)?.len();
     let mut hdr = [0u8; 256]; // read first 256 bytes = enough for the key fields
     f.read_exact(&mut hdr).map_err(BioFormatsError::Io)?;
 
@@ -781,8 +782,18 @@ fn parse_spider_header(path: &Path) -> Result<(u32, u32, u32, u64, bool, bool)> 
     let header_size = labrec * nsam as u64 * 4;
     let plane_size = width as u64 * height as u64 * 4;
     let plane_size_i64 = plane_size as i64;
-    let one_header_per_slice =
+    let mut one_header_per_slice =
         irec as i64 * nsam as i64 * 4 != plane_size_i64 && (irec - 1) as i64 * 4 != plane_size_i64;
+    if one_header_per_slice && irec == 0 && maxim <= 0.0 {
+        let single_header_total =
+            header_size.saturating_add((image_count as u64).saturating_mul(plane_size));
+        let per_slice_total = header_size.saturating_add(
+            (image_count as u64).saturating_mul(header_size.saturating_add(plane_size)),
+        );
+        if image_count == 1 || (file_len >= single_header_total && file_len < per_slice_total) {
+            one_header_per_slice = false;
+        }
+    }
 
     Ok((
         width,
@@ -1235,6 +1246,46 @@ mod spider_tests {
         assert_eq!(r.metadata().image_count, 2);
         assert_eq!(r.open_bytes(0).unwrap(), 10.0f32.to_le_bytes());
         assert_eq!(r.open_bytes(1).unwrap(), 20.0f32.to_le_bytes());
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn spider_single_image_with_zero_irec_and_maxim_does_not_double_header() {
+        // Mirrors hopper.spi (128x128 float32, LABREC=2 -> 1024-byte header + 65536 payload = 66560 bytes)
+        let mut hdr = vec![0u8; 1024];
+        put_f32(&mut hdr, 0, 1.0); // NSLICE
+        put_f32(&mut hdr, 1, 128.0); // NROW
+        put_f32(&mut hdr, 2, 0.0); // IREC == 0
+        put_f32(&mut hdr, 4, 1.0); // IFORM == 1 (2D image)
+        put_f32(&mut hdr, 11, 128.0); // NSAM
+        put_f32(&mut hdr, 12, 2.0); // LABREC
+        put_f32(&mut hdr, 21, 1024.0); // LABBYT
+        put_f32(&mut hdr, 25, 0.0); // MAXIM == 0
+
+        let path = std::env::temp_dir().join(format!(
+            "spider_hopper_single_{}_{}.spi",
+            std::process::id(),
+            line!()
+        ));
+        {
+            let mut f = File::create(&path).unwrap();
+            f.write_all(&hdr).unwrap();
+            let mut payload = vec![0u8; 128 * 128 * 4];
+            payload[0..4].copy_from_slice(&42.5f32.to_le_bytes());
+            f.write_all(&payload).unwrap();
+            f.flush().unwrap();
+        }
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 66560);
+
+        let mut r = SpiderReader::new();
+        r.set_id(&path).unwrap();
+        assert_eq!(r.metadata().size_x, 128);
+        assert_eq!(r.metadata().size_y, 128);
+        assert_eq!(r.metadata().image_count, 1);
+        let plane = r.open_bytes(0).unwrap();
+        assert_eq!(plane.len(), 65536);
+        assert_eq!(&plane[0..4], &42.5f32.to_le_bytes());
 
         std::fs::remove_file(&path).ok();
     }

@@ -870,25 +870,19 @@ fn parse_acquisition_xml(dir: &Path, meta: &mut HashMap<String, MetadataValue>) 
     loop {
         match reader.read_event() {
             Ok(quick_xml::events::Event::Start(e)) | Ok(quick_xml::events::Event::Empty(e))
-                if e.local_name().as_ref().eq_ignore_ascii_case(b"entry") =>
+                if e.local_name().as_ref().eq_ignore_ascii_case("entry") =>
             {
                 let mut key = None;
                 let mut value = None;
                 for attr in e.attributes().flatten() {
-                    if attr.key.as_ref().eq_ignore_ascii_case(b"key") {
+                    if attr.key.as_ref().eq_ignore_ascii_case("key") {
                         key = attr
-                            .decoded_and_normalized_value(
-                                quick_xml::XmlVersion::Implicit1_0,
-                                reader.decoder(),
-                            )
+                            .normalized_value(quick_xml::XmlVersion::Implicit1_0)
                             .ok()
                             .map(|v| v.into_owned());
-                    } else if attr.key.as_ref().eq_ignore_ascii_case(b"value") {
+                    } else if attr.key.as_ref().eq_ignore_ascii_case("value") {
                         value = attr
-                            .decoded_and_normalized_value(
-                                quick_xml::XmlVersion::Implicit1_0,
-                                reader.decoder(),
-                            )
+                            .normalized_value(quick_xml::XmlVersion::Implicit1_0)
                             .ok()
                             .map(|v| v.into_owned());
                     }

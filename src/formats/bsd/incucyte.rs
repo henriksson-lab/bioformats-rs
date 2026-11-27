@@ -121,17 +121,17 @@ fn xml_fields(xml: &str) -> Result<BTreeMap<String, String>> {
             Event::Start(e) => {
                 if stack.is_empty() {
                     roots += 1;
-                    if e.name().as_ref() != b"ImageInfo" || roots != 1 {
+                    if e.name().as_ref() != "ImageInfo" || roots != 1 {
                         return Err(invalid("expected ImageInfo XML root"));
                     }
                 }
                 if stack.len() >= 64 {
                     return Err(invalid("XML nesting limit"));
                 }
-                stack.push(String::from_utf8_lossy(e.name().as_ref()).into_owned());
+                stack.push(e.name().as_ref().to_owned());
             }
             Event::Text(e) => {
-                let text = e.decode().map_err(|e| invalid(e.to_string()))?;
+                let text = e.xml_content(quick_xml::XmlVersion::Implicit1_0);
                 let text =
                     quick_xml::escape::unescape(&text).map_err(|e| invalid(e.to_string()))?;
                 if !text.trim().is_empty() {
@@ -142,10 +142,10 @@ fn xml_fields(xml: &str) -> Result<BTreeMap<String, String>> {
                 fields
                     .entry(stack.join("/"))
                     .or_default()
-                    .push_str(&e.decode().map_err(|e| invalid(e.to_string()))?);
+                    .push_str(&e.xml_content(quick_xml::XmlVersion::Implicit1_0));
             }
             Event::GeneralRef(e) => {
-                let name = e.decode().map_err(|e| invalid(e.to_string()))?;
+                let name = e.xml_content(quick_xml::XmlVersion::Implicit1_0);
                 let reference = format!("&{name};");
                 let value =
                     quick_xml::escape::unescape(&reference).map_err(|e| invalid(e.to_string()))?;
@@ -196,20 +196,20 @@ fn validate_archive_marker(text: &str) -> Result<()> {
             .map_err(|e| invalid(format!("invalid archive marker: {e}")))?
         {
             Event::Start(e) => {
-                if depth != 0 || e.name().as_ref() != b"incuCyteArchiveHeaderFile" {
+                if depth != 0 || e.name().as_ref() != "incuCyteArchiveHeaderFile" {
                     return Err(invalid("invalid archive marker"));
                 }
                 roots += 1;
                 depth = 1;
             }
             Event::Empty(e) => {
-                if depth != 0 || e.name().as_ref() != b"incuCyteArchiveHeaderFile" {
+                if depth != 0 || e.name().as_ref() != "incuCyteArchiveHeaderFile" {
                     return Err(invalid("invalid archive marker"));
                 }
                 roots += 1;
             }
             Event::End(e) => {
-                if depth != 1 || e.name().as_ref() != b"incuCyteArchiveHeaderFile" {
+                if depth != 1 || e.name().as_ref() != "incuCyteArchiveHeaderFile" {
                     return Err(invalid("invalid archive marker"));
                 }
                 depth = 0;
@@ -217,8 +217,7 @@ fn validate_archive_marker(text: &str) -> Result<()> {
             Event::DocType(_) => return Err(invalid("invalid archive marker document type")),
             Event::Text(e)
                 if !e
-                    .decode()
-                    .map_err(|e| invalid(e.to_string()))?
+                    .xml_content(quick_xml::XmlVersion::Implicit1_0)
                     .trim()
                     .is_empty() =>
             {

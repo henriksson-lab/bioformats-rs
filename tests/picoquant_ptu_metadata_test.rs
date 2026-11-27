@@ -217,47 +217,107 @@ fn indexed_offset_histogram_ptu() -> Vec<u8> {
 }
 
 #[test]
-fn picoquant_ptu_rejects_picoharp_marker_raster_candidates_without_hydraharp_inference() {
-    for (code, label) in [(0x0001_0203, "PicoHarp T2"), (0x0001_0303, "PicoHarp T3")] {
-        let path = tmp(label);
-        std::fs::write(&path, picoharp_marker_raster_candidate(code)).unwrap();
+fn picoquant_ptu_rejects_picoharp_t2_marker_raster_without_hydraharp_inference() {
+    let (code, label) = (0x0001_0203, "PicoHarp T2");
+    let path = tmp(label);
+    std::fs::write(&path, picoharp_marker_raster_candidate(code)).unwrap();
 
-        let mut reader = bioformats::formats::gpl::spm::PicoQuantReader::new();
-        reader.set_id(&path).unwrap();
-        let meta = reader.metadata();
-        assert!(matches!(
-            meta.series_metadata.get("ptu.tttr_record_type"),
-            Some(MetadataValue::String(value)) if value == label
-        ));
-        assert!(matches!(
-            meta.series_metadata.get("ptu.tttr_record_layout"),
-            Some(MetadataValue::String(value)) if value == "picoharp"
-        ));
-        assert!(matches!(
-            meta.series_metadata.get("ptu.tttr_marker_raster_layout"),
-            Some(MetadataValue::Bool(false))
-        ));
-        assert!(matches!(
-            meta.series_metadata.get("ptu.reconstruction_unsupported"),
-            Some(MetadataValue::String(value))
-                if value.contains(label)
-                    && value.contains("not present in the local Bio-Formats Java reader set")
-                    && value.contains("not inferred from HydraHarp-compatible bit packing")
-        ));
+    let mut reader = bioformats::formats::gpl::spm::PicoQuantReader::new();
+    reader.set_id(&path).unwrap();
+    let meta = reader.metadata();
+    assert!(matches!(
+        meta.series_metadata.get("ptu.tttr_record_type"),
+        Some(MetadataValue::String(value)) if value == label
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("ptu.tttr_record_layout"),
+        Some(MetadataValue::String(value)) if value == "picoharp"
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("ptu.tttr_marker_raster_layout"),
+        Some(MetadataValue::Bool(false))
+    ));
+    assert!(matches!(
+        meta.series_metadata.get("ptu.reconstruction_unsupported"),
+        Some(MetadataValue::String(value))
+            if value.contains(label)
+                && value.contains("not present in the local Bio-Formats Java reader set")
+                && value.contains("not inferred from HydraHarp-compatible bit packing")
+    ));
 
-        let err = reader.open_bytes(0).unwrap_err();
-        assert!(
-            matches!(
-                err,
-                BioFormatsError::UnsupportedFormat(ref message)
-                    if message.contains(label)
-                        && message.contains("not inferred from HydraHarp-compatible bit packing")
-            ),
-            "{err:?}"
-        );
+    let err = reader.open_bytes(0).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            BioFormatsError::UnsupportedFormat(ref message)
+                if message.contains(label)
+                    && message.contains("not inferred from HydraHarp-compatible bit packing")
+        ),
+        "{err:?}"
+    );
 
-        let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn picoquant_ptu_reconstructs_picoharp_t3_marker_raster() {
+    let ph_t3_marker = |marker_mask: u32, nsync: u32| -> u32 {
+        (0x0fu32 << 28) | ((marker_mask & 0x0f) << 16) | (nsync & 0xffff)
+    };
+    let ph_t3_photon = |channel: u32, dtime: u32, nsync: u32| -> u32 {
+        ((channel & 0x0f) << 28) | ((dtime & 0x0fff) << 16) | (nsync & 0xffff)
+    };
+    let ph_t3_overflow = || -> u32 { 0x0fu32 << 28 };
+
+    let mut data = Vec::new();
+    data.extend_from_slice(b"PQTTTR\0\0");
+    data.extend_from_slice(b"1.0\0\0\0\0\0");
+    append_ptu_int_tag(&mut data, "ImgHdr_PixX", 2);
+    append_ptu_int_tag(&mut data, "ImgHdr_PixY", 2);
+    append_ptu_int_tag(&mut data, "ImgHdr_Frame", 1);
+    append_ptu_int_tag(&mut data, "TTResult_NumberOfRecords", 9);
+    append_ptu_int_tag(&mut data, "TTResultFormat_TTTRRecType", 0x0001_0303);
+    append_ptu_int_tag(&mut data, "ImgHdr_LineStart", 1);
+    append_ptu_int_tag(&mut data, "ImgHdr_LineStop", 2);
+    append_ptu_tag(&mut data, "Header_End", -1, PTU_TAG_EMPTY8, 0);
+
+    // Line 0: sync 0..4, 1 photon at x=0 (nsync=1), 1 photon at x=1 (nsync=3)
+    for rec in [
+        ph_t3_marker(1, 0),
+        ph_t3_photon(0, 10, 1),
+        ph_t3_photon(0, 20, 3),
+        ph_t3_marker(2, 4),
+        // Line 1 across a 65536-tick overflow: start at 65535, overflow, stop at 65536 + 3 (line_ticks = 4)
+        ph_t3_marker(1, 65535),
+        ph_t3_overflow(),
+        ph_t3_photon(0, 5, 0), // absolute 65536 -> dx=1 -> x=0
+        ph_t3_photon(0, 5, 2), // absolute 65538 -> dx=3 -> x=1
+        ph_t3_marker(2, 3),    // absolute 65539
+    ] {
+        data.extend_from_slice(&rec.to_le_bytes());
     }
+
+    let path = tmp("picoharp_t3_raster.ptu");
+    std::fs::write(&path, data).unwrap();
+
+    let mut reader = bioformats::formats::gpl::spm::PicoQuantReader::new();
+    reader.set_id(&path).unwrap();
+    let meta = reader.metadata();
+    assert_eq!(meta.size_x, 2);
+    assert_eq!(meta.size_y, 2);
+    assert_eq!(meta.image_count, 1);
+    assert!(matches!(
+        meta.series_metadata.get("ptu.tttr_marker_raster_layout"),
+        Some(MetadataValue::Bool(true))
+    ));
+    let plane = reader.open_bytes(0).unwrap();
+    let counts: Vec<u32> = plane
+        .chunks_exact(4)
+        .map(|px| u32::from_le_bytes(px.try_into().unwrap()))
+        .collect();
+    assert_eq!(counts, vec![1, 1, 1, 1]);
+
+    let _ = std::fs::remove_file(path);
 }
 
 #[test]
@@ -345,8 +405,11 @@ fn picoquant_ptu_recognizes_non_hydraharp_tttr_record_metadata_before_marker_rec
             meta.series_metadata.get("ptu.tttr_record_layout_source"),
             Some(MetadataValue::String(value)) if value == "TTResultFormat_TTTRRecType"
         ));
-        let expected_layout_provenance = if family == "PicoHarp" {
+        let is_picoharp_t2 = code == 0x0001_0203;
+        let expected_layout_provenance = if is_picoharp_t2 {
             "PicoHarp marker-raster pixel reconstruction is disabled"
+        } else if family == "PicoHarp" {
+            "PicoHarp T3 record path"
         } else {
             "supported local HydraHarp-compatible record path"
         };
@@ -372,14 +435,14 @@ fn picoquant_ptu_recognizes_non_hydraharp_tttr_record_metadata_before_marker_rec
         ));
         assert!(matches!(
             meta.series_metadata.get("ptu.tttr_marker_raster_layout"),
-            Some(MetadataValue::Bool(value)) if *value == (family != "PicoHarp")
+            Some(MetadataValue::Bool(value)) if *value == !is_picoharp_t2
         ));
         assert!(matches!(
             meta.series_metadata.get("ptu.tttr_record_type_code_hex"),
             Some(MetadataValue::String(value)) if value == &format!("0x{code:08x}")
         ));
 
-        if family == "PicoHarp" {
+        if is_picoharp_t2 {
             assert!(matches!(
                 meta.series_metadata.get("ptu.reconstruction_unsupported"),
                 Some(MetadataValue::String(value))
@@ -397,7 +460,7 @@ fn picoquant_ptu_recognizes_non_hydraharp_tttr_record_metadata_before_marker_rec
         }
 
         let err = reader.open_bytes(0).unwrap_err();
-        let expected_message = if family == "PicoHarp" {
+        let expected_message = if is_picoharp_t2 {
             "recognized for metadata only"
         } else {
             "missing line-start marker"

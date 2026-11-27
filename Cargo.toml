@@ -39,28 +39,28 @@ exclude = ["bench"]
 thiserror    = "2"
 log          = "0.4"
 hdf5-pure-rust = { version = "0.3", features = ["lz4"] }
-zip          = { version = "2", default-features = false, features = ["deflate", "deflate64", "lzma", "aes-crypto", "time"] }
+zip          = { version = "9", default-features = false, features = ["deflate", "deflate64", "lzma", "aes-crypto", "time"] }
 flate2       = "1"
 weezl        = "0.2"
 jpeg-decoder = "0.3"
 zune-jpeg    = "0.5"
 zune-core    = "0.5"
-zstd-pure-rs = "0.1"
-quick-xml    = "0.40"
+zstd-pure-rs = "0.2"
+quick-xml    = "0.42"
 encoding_rs  = "0.8"
-cfb          = "0.14"
+cfb          = "0.16"
 byteorder    = "1"
 image        = { version = "0.25", default-features = false, features = ["png", "bmp", "jpeg", "gif", "tga", "webp", "pnm", "hdr", "exr", "dds", "ff"] }
 openjp2      = { package = "openjpeg2-pure-rs", version = "0.1.1" }
 serde         = { version = "1", features = ["derive"] }
-bincode       = "1"
+postcard      = { version = "1.2", default-features = false, features = ["alloc"] }
 jpegxr = { package = "jpegxr-pure-rs", version = "0.1", optional = true }
 openslide-pure-rs = { git = "https://github.com/henriksson-lab/openslide-pure-rs", optional = true }
 mdbtools      = { package = "mdbtools-pure-rs", version = "0.1" }
 bzip2 = "0.6"
 zarrs         = { version = "0.23", features = ["filesystem"], optional = true }
 serde_json    = { version = "1", features = ["preserve_order"] }
-rusqlite      = { version = "0.40", features = ["bundled"], optional = true }
+rusqlite      = { version = "0.43", features = ["bundled"], optional = true }
 
 # Clippy lints that fight the translation parity rule in CLAUDE.md: the code is
 # deliberately shaped like the upstream Java Bio-Formats source so it can be
@@ -179,5 +179,5 @@ name = "lossless_jpeg_crop"
 path = "examples/lossless_jpeg_crop.rs"
 
 [dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 serde_json = { version = "1", features = ["preserve_order"] }

@@ -1718,7 +1718,7 @@ fn imacon_add_xml_metadata(xml_text: &str, series_metadata: &mut HashMap<String,
     loop {
         match reader.read_event() {
             Ok(quick_xml::events::Event::Start(e)) => {
-                current_element = String::from_utf8_lossy(e.name().as_ref()).into_owned();
+                current_element = e.name().as_ref().to_owned();
             }
             Ok(quick_xml::events::Event::Text(t)) => {
                 let Some(value) = crate::common::xml::decode_xml_text(&t) else {
